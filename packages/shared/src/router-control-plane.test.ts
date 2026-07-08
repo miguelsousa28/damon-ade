@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
+	buildOpenAIModelList,
 	buildRouterDashboardSnapshot,
 	previewRouterTokenSaver,
 	ROUTER_ENDPOINTS,
 	ROUTER_TOKEN_SAVERS,
+	resolveRouterModelTarget,
 } from "./router-control-plane";
 
 describe("router control plane", () => {
@@ -35,5 +37,49 @@ describe("router control plane", () => {
 		expect(preview.mode).toBe("ponytail");
 		expect(preview.result.changed).toBe(true);
 		expect(preview.result.savedBytes).toBeGreaterThan(0);
+	});
+
+	it("exports OpenAI-compatible model and combo names", () => {
+		const list = buildOpenAIModelList({
+			aliases: [{ alias: "fast-code", targetModel: "openrouter/z-ai/glm-5.2" }],
+			customCombos: [{ name: "my-budget-stack", models: ["glm", "minimax"] }],
+		});
+		const ids = list.data.map((model) => model.id);
+
+		expect(list.object).toBe("list");
+		expect(ids).toContain("premium-coding");
+		expect(ids).toContain("glm");
+		expect(ids).toContain("openrouter/z-ai/glm-5.2");
+		expect(ids).toContain("fast-code");
+		expect(ids).toContain("my-budget-stack");
+	});
+
+	it("resolves OpenRouter-backed combos into fallback models", () => {
+		const target = resolveRouterModelTarget("premium-coding");
+
+		expect(target?.provider).toBe("openrouter");
+		expect(target?.source).toBe("combo");
+		expect(target?.fallbackModels).toContain("z-ai/glm-5.2");
+		expect(target?.fallbackModels).toContain("minimax/minimax-m3");
+	});
+
+	it("resolves aliases and custom combos into OpenRouter fallback models", () => {
+		const options = {
+			aliases: [{ alias: "fast-code", targetModel: "openrouter/z-ai/glm-5.2" }],
+			customCombos: [
+				{ name: "my-budget-stack", models: ["fast-code", "minimax"] },
+			],
+		};
+
+		const aliasTarget = resolveRouterModelTarget("fast-code", options);
+		const comboTarget = resolveRouterModelTarget("my-budget-stack", options);
+
+		expect(aliasTarget?.source).toBe("alias");
+		expect(aliasTarget?.model).toBe("z-ai/glm-5.2");
+		expect(comboTarget?.source).toBe("custom-combo");
+		expect(comboTarget?.fallbackModels).toEqual([
+			"z-ai/glm-5.2",
+			"minimax/minimax-m3",
+		]);
 	});
 });

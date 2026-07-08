@@ -60,7 +60,9 @@ describe("provider-keys", () => {
 
 		expect(hasProviderKey("openrouter")).toBe(true);
 		expect(getProviderKey("openrouter")).toBe("sk-or-test-123");
-		expect(getProviderKeyStatus()).toEqual({ openrouter: true });
+		expect(getProviderKeyStatus()).toEqual(
+			expect.objectContaining({ openrouter: true, openai: false }),
+		);
 
 		// Persisted value must be the encrypted blob, never plaintext.
 		expect(settingsRow?.providerApiKeys?.openrouter).not.toContain(
@@ -86,7 +88,9 @@ describe("provider-keys", () => {
 
 		expect(hasProviderKey("openrouter")).toBe(false);
 		expect(getProviderKey("openrouter")).toBeNull();
-		expect(getProviderKeyStatus()).toEqual({ openrouter: false });
+		expect(getProviderKeyStatus()).toEqual(
+			expect.objectContaining({ openrouter: false, openai: false }),
+		);
 	});
 
 	it("degrades gracefully when secure storage is unavailable", () => {

@@ -1,4 +1,8 @@
 import { settings } from "@superset/local-db";
+import {
+	ROUTER_PROVIDER_KEY_IDS,
+	type RouterProviderKeyId,
+} from "@superset/shared/router-control-plane";
 import { safeStorage } from "electron";
 import { localDb } from "./local-db";
 
@@ -14,8 +18,8 @@ import { localDb } from "./local-db";
  * without relying on the user's shell rc.
  */
 
-export const PROVIDER_IDS = ["openrouter"] as const;
-export type ProviderId = (typeof PROVIDER_IDS)[number];
+export const PROVIDER_IDS = ROUTER_PROVIDER_KEY_IDS;
+export type ProviderId = RouterProviderKeyId;
 
 function readKeyMap(): Record<string, string> {
 	const row = localDb.select().from(settings).get();

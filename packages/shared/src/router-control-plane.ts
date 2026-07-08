@@ -3,6 +3,7 @@ import {
 	AGENT_ROUTER_PROFILES,
 	AGENT_TIER_ORDER,
 	type AgentCombo,
+	type AgentComboName,
 	type AgentRoutingTier,
 	FALLBACK_RULES,
 } from "./agent-router";
@@ -32,6 +33,19 @@ export type RouterProviderStatus =
 	| "oauth-ready"
 	| "catalog";
 
+export const ROUTER_PROVIDER_KEY_IDS = [
+	"openrouter",
+	"openai",
+	"anthropic",
+	"gemini",
+	"perplexity",
+	"brave-search",
+	"elevenlabs",
+	"stability-ai",
+] as const;
+
+export type RouterProviderKeyId = (typeof ROUTER_PROVIDER_KEY_IDS)[number];
+
 export interface RouterProviderCatalogItem {
 	id: string;
 	label: string;
@@ -39,7 +53,7 @@ export interface RouterProviderCatalogItem {
 	connection: RouterProviderConnection;
 	status: RouterProviderStatus;
 	auth: "built-in" | "api-key" | "oauth" | "local";
-	keyProvider?: string;
+	keyProvider?: RouterProviderKeyId;
 	capabilities: string[];
 	defaultModels: string[];
 	notes: string;
@@ -50,7 +64,55 @@ export interface RouterEndpoint {
 	method: "GET" | "POST";
 	compatibility: "OpenAI" | "Anthropic" | "Router";
 	capability: string;
-	status: "native-dashboard" | "gateway-catalogued";
+	status: "native-dashboard" | "gateway-live" | "gateway-catalogued";
+}
+
+export interface RouterGatewayStatus {
+	running: boolean;
+	host: string;
+	port: number;
+	url: string;
+	startedAt: string | null;
+	error: string | null;
+}
+
+export interface OpenAIModelEntry {
+	id: string;
+	object: "model";
+	owned_by: string;
+}
+
+export interface OpenAIModelList {
+	object: "list";
+	data: OpenAIModelEntry[];
+}
+
+export interface RouterModelTarget {
+	provider: "openrouter";
+	model: string;
+	source:
+		| "combo"
+		| "custom-combo"
+		| "agent"
+		| "alias"
+		| "provider-model"
+		| "direct";
+	fallbackModels: string[];
+}
+
+export interface RouterModelAlias {
+	alias: string;
+	targetModel: string;
+}
+
+export interface RouterCustomCombo {
+	name: string;
+	models: string[];
+}
+
+export interface RouterModelResolutionOptions {
+	aliases?: RouterModelAlias[];
+	customCombos?: RouterCustomCombo[];
 }
 
 export type RouterTokenSaverMode = "rtk" | "headroom" | "caveman" | "ponytail";
@@ -85,6 +147,7 @@ export interface RouterProviderSnapshot extends RouterProviderCatalogItem {
 
 export interface RouterDashboardSnapshot {
 	generatedAt: string;
+	gateway?: RouterGatewayStatus;
 	stats: {
 		providers: number;
 		nativeAgents: number;
@@ -194,6 +257,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "openai-compatible",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "anthropic",
 		capabilities: ["chat", "messages", "tool-use", "vision"],
 		defaultModels: ["claude-sonnet-4.5", "claude-opus-4.5"],
 		notes: "Catalogued for the OpenAI/Anthropic translator layer.",
@@ -205,6 +269,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "openai-compatible",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "openai",
 		capabilities: ["responses", "chat", "images", "audio", "embeddings"],
 		defaultModels: ["gpt-5.2", "gpt-5.2-codex"],
 		notes: "Catalogued for Responses and Chat Completions compatibility.",
@@ -227,6 +292,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "search",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "perplexity",
 		capabilities: ["search", "research", "citations"],
 		defaultModels: ["sonar"],
 		notes: "Search-backed research provider.",
@@ -238,6 +304,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "search",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "brave-search",
 		capabilities: ["web-search"],
 		defaultModels: ["brave-search"],
 		notes: "Search provider for router-side web lookup tools.",
@@ -249,6 +316,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "media",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "elevenlabs",
 		capabilities: ["tts", "speech"],
 		defaultModels: ["elevenlabs-tts"],
 		notes: "Media provider catalogued for audio generation.",
@@ -260,6 +328,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		connection: "media",
 		status: "catalog",
 		auth: "api-key",
+		keyProvider: "stability-ai",
 		capabilities: ["image-generation"],
 		defaultModels: ["stable-image"],
 		notes: "Media provider catalogued for image generation routes.",
@@ -272,70 +341,84 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		method: "GET",
 		compatibility: "OpenAI",
 		capability: "Model catalogue",
-		status: "native-dashboard",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/chat/completions",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Chat and coding proxy",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/responses",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Responses API proxy",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/messages",
 		method: "POST",
 		compatibility: "Anthropic",
 		capability: "Claude Messages proxy",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/messages/count_tokens",
 		method: "POST",
 		compatibility: "Anthropic",
 		capability: "Token counting",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/images/generations",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Image generation",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/audio/speech",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Text to speech",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/audio/transcriptions",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Speech to text",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/embeddings",
 		method: "POST",
 		compatibility: "OpenAI",
 		capability: "Embeddings",
-		status: "gateway-catalogued",
+		status: "gateway-live",
 	},
 	{
 		path: "/v1/compress",
 		method: "POST",
 		compatibility: "Router",
 		capability: "Token saver compression",
-		status: "native-dashboard",
+		status: "gateway-live",
+	},
+	{
+		path: "/v1/search",
+		method: "POST",
+		compatibility: "Router",
+		capability: "Search provider proxy",
+		status: "gateway-live",
+	},
+	{
+		path: "/v1/web/fetch",
+		method: "POST",
+		compatibility: "Router",
+		capability: "URL fetch helper",
+		status: "gateway-live",
 	},
 ];
 
@@ -432,9 +515,11 @@ const PROVIDER_TO_AGENT: Record<string, SpecialistAgentType | undefined> = {
 
 export function buildRouterDashboardSnapshot({
 	providerKeyStatus = {},
+	gateway,
 	now = new Date(),
 }: {
 	providerKeyStatus?: Record<string, boolean | undefined>;
+	gateway?: RouterGatewayStatus;
 	now?: Date;
 } = {}): RouterDashboardSnapshot {
 	const providers = ROUTER_PROVIDER_CATALOG.map((provider) => {
@@ -456,6 +541,7 @@ export function buildRouterDashboardSnapshot({
 
 	return {
 		generatedAt: now.toISOString(),
+		gateway,
 		stats: {
 			providers: providers.length,
 			nativeAgents: Object.keys(AGENT_ROUTER_PROFILES).length,
@@ -479,6 +565,123 @@ export function buildRouterDashboardSnapshot({
 		features: ROUTER_FEATURES,
 		tierOrder: AGENT_TIER_ORDER,
 	};
+}
+
+export function buildOpenAIModelList({
+	aliases = [],
+	customCombos = [],
+}: RouterModelResolutionOptions = {}): OpenAIModelList {
+	const entries: OpenAIModelEntry[] = [];
+	const add = (id: string, ownedBy: string) => {
+		if (entries.some((entry) => entry.id === id)) return;
+		entries.push({ id, object: "model", owned_by: ownedBy });
+	};
+
+	for (const combo of Object.values(AGENT_COMBOS)) {
+		add(combo.name, "combo");
+	}
+
+	for (const [agent, profile] of Object.entries(AGENT_ROUTER_PROFILES) as [
+		SpecialistAgentType,
+		(typeof AGENT_ROUTER_PROFILES)[SpecialistAgentType],
+	][]) {
+		add(agent, profile.provider);
+		add(profile.modelId, profile.provider);
+		if (profile.provider.startsWith("OpenRouter/")) {
+			add(`openrouter/${profile.modelId}`, "openrouter");
+		}
+	}
+
+	for (const provider of ROUTER_PROVIDER_CATALOG) {
+		for (const model of provider.defaultModels) {
+			add(`${provider.id}/${model}`, provider.id);
+		}
+	}
+
+	for (const alias of aliases) {
+		add(alias.alias, "alias");
+	}
+
+	for (const combo of customCombos) {
+		add(combo.name, "custom-combo");
+	}
+
+	return {
+		object: "list",
+		data: entries.sort((a, b) => a.id.localeCompare(b.id)),
+	};
+}
+
+export function resolveRouterModelTarget(
+	model: string | undefined,
+	options: RouterModelResolutionOptions = {},
+): RouterModelTarget | null {
+	const requestedModel = resolveAlias(model?.trim(), options.aliases);
+	if (!requestedModel) return null;
+
+	const customCombo = options.customCombos?.find(
+		(combo) => combo.name === requestedModel,
+	);
+	if (customCombo) {
+		const fallbackModels = openRouterModelsForModelIds(
+			customCombo.models,
+			options,
+		);
+		const [primary] = fallbackModels;
+		if (!primary) return null;
+		return {
+			provider: "openrouter",
+			model: primary,
+			source: "custom-combo",
+			fallbackModels,
+		};
+	}
+
+	if (isComboName(requestedModel)) {
+		const fallbackModels = openRouterModelsForAgents(
+			AGENT_COMBOS[requestedModel].agents,
+		);
+		const [primary] = fallbackModels;
+		if (!primary) return null;
+		return {
+			provider: "openrouter",
+			model: primary,
+			source: "combo",
+			fallbackModels,
+		};
+	}
+
+	if (isSpecialistAgent(requestedModel)) {
+		const profile = AGENT_ROUTER_PROFILES[requestedModel];
+		if (!profile.provider.startsWith("OpenRouter/")) return null;
+		return {
+			provider: "openrouter",
+			model: profile.modelId,
+			source: "agent",
+			fallbackModels: [profile.modelId],
+		};
+	}
+
+	if (requestedModel.startsWith("openrouter/")) {
+		const openRouterModel = requestedModel.slice("openrouter/".length);
+		return {
+			provider: "openrouter",
+			model: openRouterModel,
+			source: model?.trim() === requestedModel ? "provider-model" : "alias",
+			fallbackModels: [openRouterModel],
+		};
+	}
+
+	if (requestedModel.includes("/")) {
+		return {
+			provider: "openrouter",
+			model: requestedModel,
+			source: model?.trim() === requestedModel ? "direct" : "alias",
+			fallbackModels: [requestedModel],
+		};
+	}
+
+	return null;
 }
 
 export function previewRouterTokenSaver({
@@ -593,4 +796,58 @@ function toResult(
 		bytesAfter: next.length,
 		savedBytes: original.length - next.length,
 	};
+}
+
+function isComboName(model: string): model is AgentComboName {
+	return model in AGENT_COMBOS;
+}
+
+function isSpecialistAgent(model: string): model is SpecialistAgentType {
+	return model in AGENT_ROUTER_PROFILES;
+}
+
+function resolveAlias(
+	model: string | undefined,
+	aliases: RouterModelAlias[] | undefined,
+): string | undefined {
+	let current = model;
+	if (!current || !aliases?.length) return current;
+
+	const aliasMap = new Map(
+		aliases.map((alias) => [alias.alias, alias.targetModel]),
+	);
+	for (let index = 0; index < 8; index++) {
+		const next = aliasMap.get(current);
+		if (!next || next === current) return current;
+		current = next;
+	}
+	return current;
+}
+
+function openRouterModelsForAgents(agents: SpecialistAgentType[]): string[] {
+	return Array.from(
+		new Set(
+			agents
+				.map((agent) => AGENT_ROUTER_PROFILES[agent])
+				.filter((profile) => profile.provider.startsWith("OpenRouter/"))
+				.map((profile) => profile.modelId),
+		),
+	);
+}
+
+function openRouterModelsForModelIds(
+	models: string[],
+	options: RouterModelResolutionOptions,
+): string[] {
+	return Array.from(
+		new Set(
+			models.flatMap(
+				(model) =>
+					resolveRouterModelTarget(model, {
+						aliases: options.aliases,
+						customCombos: [],
+					})?.fallbackModels ?? [],
+			),
+		),
+	);
 }

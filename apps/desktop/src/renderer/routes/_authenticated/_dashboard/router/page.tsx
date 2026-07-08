@@ -1,13 +1,14 @@
 import {
 	previewRouterTokenSaver,
 	type RouterDashboardSnapshot,
+	type RouterProviderKeyId,
 	type RouterTokenSaverMode,
 } from "@superset/shared/router-control-plane";
 import { cn } from "@superset/ui/utils";
 import { createFileRoute } from "@tanstack/react-router";
 import { type ReactNode, useMemo, useState } from "react";
 import {
-	type LuActivity,
+	LuActivity,
 	LuAudioLines,
 	LuBadgeCheck,
 	LuBrainCircuit,
@@ -34,7 +35,9 @@ type TabId =
 	| "combos"
 	| "endpoints"
 	| "token-savers"
-	| "fallback";
+	| "fallback"
+	| "usage"
+	| "aliases";
 
 const TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Overview" },
@@ -43,6 +46,8 @@ const TABS: { id: TabId; label: string }[] = [
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
 	{ id: "fallback", label: "Fallback" },
+	{ id: "usage", label: "Usage" },
+	{ id: "aliases", label: "Aliases" },
 ];
 
 const SAMPLE_TOKEN_INPUT = [
@@ -61,10 +66,29 @@ const SAMPLE_TOKEN_INPUT = [
 
 function RouterDashboardPage() {
 	const [activeTab, setActiveTab] = useState<TabId>("overview");
+	const utils = electronTrpc.useUtils();
 	const { data, isLoading, error } =
 		electronTrpc.agentRouter.dashboard.useQuery(undefined, {
 			refetchInterval: 15_000,
 		});
+	const invalidateDashboard = () => utils.agentRouter.dashboard.invalidate();
+	const startGateway = electronTrpc.agentRouter.startGateway.useMutation({
+		onSuccess: invalidateDashboard,
+	});
+	const stopGateway = electronTrpc.agentRouter.stopGateway.useMutation({
+		onSuccess: invalidateDashboard,
+	});
+	const restartGateway = electronTrpc.agentRouter.restartGateway.useMutation({
+		onSuccess: invalidateDashboard,
+	});
+	const setProviderKey = electronTrpc.settings.providerKeys.set.useMutation({
+		onSuccess: invalidateDashboard,
+	});
+	const clearProviderKey = electronTrpc.settings.providerKeys.clear.useMutation(
+		{
+			onSuccess: invalidateDashboard,
+		},
+	);
 
 	if (isLoading) {
 		return (
@@ -103,8 +127,54 @@ function RouterDashboardPage() {
 							now live inside ADE. No localhost dashboard needed.
 						</p>
 					</div>
-					<div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-						Updated {new Date(data.generatedAt).toLocaleTimeString()}
+					<div className="flex min-w-72 flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-xs">
+						<div className="flex items-center justify-between gap-3">
+							<span className="font-medium text-foreground">
+								Gateway {data.gateway?.running ? "running" : "stopped"}
+							</span>
+							<span
+								className={cn(
+									"rounded px-1.5 py-0.5",
+									data.gateway?.running
+										? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+										: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+								)}
+							>
+								{data.gateway?.running ? "live" : "offline"}
+							</span>
+						</div>
+						<div className="truncate font-mono text-muted-foreground">
+							{data.gateway?.url ?? "http://127.0.0.1:20128"}
+						</div>
+						<div className="flex gap-2">
+							<button
+								type="button"
+								onClick={() => startGateway.mutate()}
+								disabled={data.gateway?.running || startGateway.isPending}
+								className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Start
+							</button>
+							<button
+								type="button"
+								onClick={() => restartGateway.mutate()}
+								disabled={restartGateway.isPending}
+								className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Restart
+							</button>
+							<button
+								type="button"
+								onClick={() => stopGateway.mutate()}
+								disabled={!data.gateway?.running || stopGateway.isPending}
+								className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Stop
+							</button>
+						</div>
+						<div className="text-muted-foreground">
+							Updated {new Date(data.generatedAt).toLocaleTimeString()}
+						</div>
 					</div>
 				</header>
 
@@ -127,11 +197,24 @@ function RouterDashboardPage() {
 				</nav>
 
 				{activeTab === "overview" && <OverviewTab data={data} />}
-				{activeTab === "providers" && <ProvidersTab data={data} />}
+				{activeTab === "providers" && (
+					<ProvidersTab
+						data={data}
+						clearProviderKey={(provider) =>
+							clearProviderKey.mutateAsync({ provider })
+						}
+						isSavingKey={setProviderKey.isPending || clearProviderKey.isPending}
+						setProviderKey={(provider, key) =>
+							setProviderKey.mutateAsync({ provider, key })
+						}
+					/>
+				)}
 				{activeTab === "combos" && <CombosTab data={data} />}
 				{activeTab === "endpoints" && <EndpointsTab data={data} />}
 				{activeTab === "token-savers" && <TokenSaversTab data={data} />}
 				{activeTab === "fallback" && <FallbackTab data={data} />}
+				{activeTab === "usage" && <UsageTab />}
+				{activeTab === "aliases" && <AliasesTab />}
 			</div>
 		</main>
 	);
@@ -220,7 +303,44 @@ function OverviewTab({ data }: { data: RouterDashboardSnapshot }) {
 	);
 }
 
-function ProvidersTab({ data }: { data: RouterDashboardSnapshot }) {
+function ProvidersTab({
+	data,
+	clearProviderKey,
+	isSavingKey,
+	setProviderKey,
+}: {
+	data: RouterDashboardSnapshot;
+	clearProviderKey: (provider: RouterProviderKeyId) => Promise<unknown>;
+	isSavingKey: boolean;
+	setProviderKey: (
+		provider: RouterProviderKeyId,
+		key: string,
+	) => Promise<unknown>;
+}) {
+	const [inputs, setInputs] = useState<Record<string, string>>({});
+	const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+
+	const saveKey = async (provider: RouterProviderKeyId) => {
+		const key = inputs[provider]?.trim();
+		if (!key) return;
+		setPendingProvider(provider);
+		try {
+			await setProviderKey(provider, key);
+			setInputs((current) => ({ ...current, [provider]: "" }));
+		} finally {
+			setPendingProvider(null);
+		}
+	};
+
+	const clearKey = async (provider: RouterProviderKeyId) => {
+		setPendingProvider(provider);
+		try {
+			await clearProviderKey(provider);
+		} finally {
+			setPendingProvider(null);
+		}
+	};
+
 	return (
 		<section className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
 			{data.providers.map((provider) => (
@@ -263,6 +383,51 @@ function ProvidersTab({ data }: { data: RouterDashboardSnapshot }) {
 							</span>
 						)}
 					</div>
+
+					{provider.keyProvider && (
+						<div className="mt-3 grid grid-cols-[1fr_auto_auto] gap-2">
+							<input
+								type="password"
+								value={inputs[provider.keyProvider] ?? ""}
+								onChange={(event) =>
+									setInputs((current) => ({
+										...current,
+										[provider.keyProvider as string]: event.target.value,
+									}))
+								}
+								placeholder={`${provider.keyProvider} key`}
+								className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+							/>
+							<button
+								type="button"
+								onClick={() =>
+									saveKey(provider.keyProvider as RouterProviderKeyId)
+								}
+								disabled={
+									isSavingKey ||
+									pendingProvider === provider.keyProvider ||
+									!inputs[provider.keyProvider]?.trim()
+								}
+								className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Save
+							</button>
+							<button
+								type="button"
+								onClick={() =>
+									clearKey(provider.keyProvider as RouterProviderKeyId)
+								}
+								disabled={
+									isSavingKey ||
+									pendingProvider === provider.keyProvider ||
+									!provider.keyConfigured
+								}
+								className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Clear
+							</button>
+						</div>
+					)}
 				</div>
 			))}
 		</section>
@@ -427,6 +592,298 @@ function TokenSaversTab({ data }: { data: RouterDashboardSnapshot }) {
 	);
 }
 
+function UsageTab() {
+	const utils = electronTrpc.useUtils();
+	const { data, isLoading } = electronTrpc.agentRouter.usageStats.useQuery(
+		undefined,
+		{ refetchInterval: 15_000 },
+	);
+	const clearUsage = electronTrpc.agentRouter.clearUsage.useMutation({
+		onSuccess: () => utils.agentRouter.usageStats.invalidate(),
+	});
+
+	if (isLoading || !data) {
+		return (
+			<div className="rounded-lg border bg-card p-4 text-sm text-muted-foreground">
+				Loading usage...
+			</div>
+		);
+	}
+
+	return (
+		<section className="flex flex-col gap-4">
+			<div className="flex flex-wrap items-center justify-between gap-3">
+				<div className="grid flex-1 gap-3 md:grid-cols-4">
+					<StatCard
+						icon={LuActivity}
+						label="Requests"
+						value={data.totalRequests}
+					/>
+					<StatCard
+						icon={LuBadgeCheck}
+						label="Succeeded"
+						value={data.successfulRequests}
+					/>
+					<StatCard
+						icon={LuShieldAlert}
+						label="Failed"
+						value={data.failedRequests}
+					/>
+					<StatCard icon={LuGauge} label="Tokens" value={data.totalTokens} />
+				</div>
+				<button
+					type="button"
+					onClick={() => clearUsage.mutate()}
+					disabled={clearUsage.isPending || data.totalRequests === 0}
+					className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+				>
+					Clear usage
+				</button>
+			</div>
+
+			<div className="rounded-lg border bg-card p-4">
+				<div className="flex items-center justify-between gap-3">
+					<h2 className="text-sm font-semibold">Provider totals</h2>
+					<Pill>${data.estimatedCostUsd.toFixed(4)} estimated</Pill>
+				</div>
+				<div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+					{data.byProvider.length === 0 ? (
+						<p className="text-sm text-muted-foreground">No usage yet.</p>
+					) : (
+						data.byProvider.map((provider) => (
+							<div
+								key={provider.provider}
+								className="rounded-md border bg-background px-3 py-2"
+							>
+								<div className="flex items-center justify-between gap-3">
+									<span className="text-sm font-medium">
+										{provider.provider}
+									</span>
+									<Pill>{provider.requests} req</Pill>
+								</div>
+								<div className="mt-2 flex justify-between text-xs text-muted-foreground">
+									<span>{provider.totalTokens.toLocaleString()} tokens</span>
+									<span>${provider.estimatedCostUsd.toFixed(4)}</span>
+								</div>
+							</div>
+						))
+					)}
+				</div>
+			</div>
+
+			<div className="rounded-lg border bg-card">
+				<div className="grid grid-cols-[150px_90px_1fr_90px_90px] gap-3 border-b px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+					<span>Time</span>
+					<span>Status</span>
+					<span>Endpoint</span>
+					<span>Model</span>
+					<span>Tokens</span>
+				</div>
+				<div className="divide-y">
+					{data.recentRequests.map((request) => (
+						<div
+							key={request.id}
+							className="grid grid-cols-[150px_90px_1fr_90px_90px] gap-3 px-4 py-3 text-xs"
+						>
+							<span className="text-muted-foreground">
+								{new Date(request.timestamp).toLocaleTimeString()}
+							</span>
+							<span
+								className={cn(
+									request.success
+										? "text-emerald-600 dark:text-emerald-400"
+										: "text-amber-600 dark:text-amber-400",
+								)}
+							>
+								{request.status}
+							</span>
+							<span className="truncate font-mono">{request.endpoint}</span>
+							<span className="truncate">{request.model}</span>
+							<span>{request.totalTokens.toLocaleString()}</span>
+						</div>
+					))}
+				</div>
+			</div>
+		</section>
+	);
+}
+
+function AliasesTab() {
+	const utils = electronTrpc.useUtils();
+	const aliases = electronTrpc.agentRouter.aliases.useQuery();
+	const customCombos = electronTrpc.agentRouter.customCombos.useQuery();
+	const [alias, setAlias] = useState("");
+	const [targetModel, setTargetModel] = useState("");
+	const [comboName, setComboName] = useState("");
+	const [comboModels, setComboModels] = useState("");
+	const invalidate = () => {
+		utils.agentRouter.aliases.invalidate();
+		utils.agentRouter.customCombos.invalidate();
+		utils.agentRouter.dashboard.invalidate();
+	};
+	const upsertAlias = electronTrpc.agentRouter.upsertAlias.useMutation({
+		onSuccess: invalidate,
+	});
+	const deleteAlias = electronTrpc.agentRouter.deleteAlias.useMutation({
+		onSuccess: invalidate,
+	});
+	const upsertCustomCombo =
+		electronTrpc.agentRouter.upsertCustomCombo.useMutation({
+			onSuccess: invalidate,
+		});
+	const deleteCustomCombo =
+		electronTrpc.agentRouter.deleteCustomCombo.useMutation({
+			onSuccess: invalidate,
+		});
+
+	const saveAlias = async () => {
+		if (!alias.trim() || !targetModel.trim()) return;
+		await upsertAlias.mutateAsync({
+			alias: alias.trim(),
+			targetModel: targetModel.trim(),
+		});
+		setAlias("");
+		setTargetModel("");
+	};
+
+	const saveCombo = async () => {
+		const models = comboModels
+			.split(/[\n,]+/)
+			.map((model) => model.trim())
+			.filter(Boolean);
+		if (!comboName.trim() || models.length === 0) return;
+		await upsertCustomCombo.mutateAsync({
+			name: comboName.trim(),
+			models,
+		});
+		setComboName("");
+		setComboModels("");
+	};
+
+	return (
+		<section className="grid gap-4 lg:grid-cols-2">
+			<div className="rounded-lg border bg-card p-4">
+				<h2 className="text-sm font-semibold">Model aliases</h2>
+				<div className="mt-4 grid gap-2 md:grid-cols-[1fr_1fr_auto]">
+					<input
+						value={alias}
+						onChange={(event) => setAlias(event.target.value)}
+						placeholder="alias, e.g. fast-code"
+						className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<input
+						value={targetModel}
+						onChange={(event) => setTargetModel(event.target.value)}
+						placeholder="target, e.g. openrouter/z-ai/glm-5.2"
+						className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<button
+						type="button"
+						onClick={saveAlias}
+						disabled={
+							upsertAlias.isPending || !alias.trim() || !targetModel.trim()
+						}
+						className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Save
+					</button>
+				</div>
+
+				<div className="mt-4 flex flex-col gap-2">
+					{(aliases.data ?? []).length === 0 ? (
+						<p className="text-sm text-muted-foreground">No aliases yet.</p>
+					) : (
+						(aliases.data ?? []).map((entry) => (
+							<div
+								key={entry.alias}
+								className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2 text-sm"
+							>
+								<span className="min-w-0 truncate">
+									<span className="font-mono">{entry.alias}</span>
+									<span className="text-muted-foreground"> {"->"} </span>
+									<span className="font-mono text-muted-foreground">
+										{entry.targetModel}
+									</span>
+								</span>
+								<button
+									type="button"
+									onClick={() => deleteAlias.mutate({ alias: entry.alias })}
+									className="rounded border px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+								>
+									Delete
+								</button>
+							</div>
+						))
+					)}
+				</div>
+			</div>
+
+			<div className="rounded-lg border bg-card p-4">
+				<h2 className="text-sm font-semibold">Custom combos</h2>
+				<div className="mt-4 grid gap-2">
+					<input
+						value={comboName}
+						onChange={(event) => setComboName(event.target.value)}
+						placeholder="combo name, e.g. my-budget-stack"
+						className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<textarea
+						value={comboModels}
+						onChange={(event) => setComboModels(event.target.value)}
+						placeholder="models, comma or newline separated"
+						className="min-h-24 rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<button
+						type="button"
+						onClick={saveCombo}
+						disabled={
+							upsertCustomCombo.isPending ||
+							!comboName.trim() ||
+							!comboModels.trim()
+						}
+						className="w-fit rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Save combo
+					</button>
+				</div>
+
+				<div className="mt-4 flex flex-col gap-2">
+					{(customCombos.data ?? []).length === 0 ? (
+						<p className="text-sm text-muted-foreground">
+							No custom combos yet.
+						</p>
+					) : (
+						(customCombos.data ?? []).map((combo) => (
+							<div
+								key={combo.name}
+								className="rounded-md border bg-background px-3 py-2"
+							>
+								<div className="flex items-center justify-between gap-3">
+									<span className="font-mono text-sm">{combo.name}</span>
+									<button
+										type="button"
+										onClick={() =>
+											deleteCustomCombo.mutate({ name: combo.name })
+										}
+										className="rounded border px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+									>
+										Delete
+									</button>
+								</div>
+								<div className="mt-2 flex flex-wrap gap-1.5">
+									{combo.models.map((model) => (
+										<Pill key={`${combo.name}-${model}`}>{model}</Pill>
+									))}
+								</div>
+							</div>
+						))
+					)}
+				</div>
+			</div>
+		</section>
+	);
+}
+
 function FallbackTab({ data }: { data: RouterDashboardSnapshot }) {
 	return (
 		<section className="grid gap-4 lg:grid-cols-[0.7fr_1.3fr]">
@@ -538,10 +995,10 @@ function StatusBadge({ status }: { status: string }) {
 function EndpointBadge({
 	status,
 }: {
-	status: "native-dashboard" | "gateway-catalogued";
+	status: "native-dashboard" | "gateway-live" | "gateway-catalogued";
 }) {
 	const Icon =
-		status === "native-dashboard"
+		status === "native-dashboard" || status === "gateway-live"
 			? LuGauge
 			: status.includes("image")
 				? LuImage
@@ -555,7 +1012,7 @@ function EndpointBadge({
 		<span
 			className={cn(
 				"inline-flex w-fit items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium",
-				status === "native-dashboard"
+				status === "native-dashboard" || status === "gateway-live"
 					? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
 					: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
 			)}
