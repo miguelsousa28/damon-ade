@@ -12,9 +12,11 @@ import {
 	updateRouterProviderAccount,
 } from "main/lib/agent-router-accounts";
 import {
+	discoverRouterProviderNodeModels,
 	getAgentRouterGatewayStatus,
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
+	validateRouterProviderNode,
 } from "main/lib/agent-router-gateway";
 import {
 	clearRouterUsage,
@@ -43,6 +45,7 @@ const providerNodeTypeSchema = z.enum([
 ]);
 const providerNodeApiTypeSchema = z.enum(["chat", "responses"]);
 const providerNodeInputSchema = z.object({
+	apiKey: z.string().optional(),
 	apiKeyAccountId: z.string().nullable().optional(),
 	apiKeyProvider: providerKeySchema.optional(),
 	apiType: providerNodeApiTypeSchema.optional(),
@@ -52,6 +55,11 @@ const providerNodeInputSchema = z.object({
 	name: z.string().min(1).optional(),
 	prefix: z.string().min(1).optional(),
 	type: providerNodeTypeSchema.optional(),
+});
+const providerNodeValidationInputSchema = providerNodeInputSchema.extend({
+	apply: z.boolean().optional(),
+	id: z.string().min(1).optional(),
+	modelId: z.string().optional(),
 });
 
 export const createAgentRouterRouter = () => {
@@ -156,6 +164,14 @@ export const createAgentRouterRouter = () => {
 		deleteProviderNode: publicProcedure
 			.input(z.object({ id: z.string().min(1) }))
 			.mutation(({ input }) => deleteRouterProviderNode(input.id)),
+
+		validateProviderNode: publicProcedure
+			.input(providerNodeValidationInputSchema)
+			.mutation(({ input }) => validateRouterProviderNode(input)),
+
+		discoverProviderNodeModels: publicProcedure
+			.input(providerNodeValidationInputSchema)
+			.mutation(({ input }) => discoverRouterProviderNodeModels(input)),
 
 		upsertCustomCombo: publicProcedure
 			.input(

@@ -81,6 +81,39 @@ interface ProviderNodeSuccess {
 	model: string;
 }
 
+export interface RouterDiscoveredProviderNodeModel {
+	id: string;
+	name: string;
+}
+
+export interface RouterProviderNodeValidationInput {
+	apiKey?: string;
+	apiKeyAccountId?: string | null;
+	apiKeyProvider?: RouterProviderKeyId;
+	apiType?: "chat" | "responses";
+	baseUrl?: string;
+	id?: string;
+	modelId?: string;
+	type?: RouterProviderNodeType;
+}
+
+export interface RouterProviderNodeValidationResult {
+	valid: boolean;
+	error?: string;
+	method?: "models" | "chat" | "responses" | "messages" | "embeddings";
+	status?: number;
+	dimensions?: number | null;
+	models?: RouterDiscoveredProviderNodeModel[];
+}
+
+export interface RouterProviderNodeDiscoveryResult {
+	ok: boolean;
+	error?: string;
+	status?: number;
+	models: RouterDiscoveredProviderNodeModel[];
+	applied?: boolean;
+}
+
 interface GatewayFailure {
 	ok: false;
 	status: number;
@@ -273,9 +306,37 @@ function createAgentRouterGatewayApp() {
 	app.get("/api/provider-nodes", (_req, res) => {
 		res.json({ nodes: getRouterProviderNodes() });
 	});
+	app.post("/api/provider-nodes/validate", async (req, res) => {
+		res.json(
+			await validateRouterProviderNode(
+				parseProviderNodeValidationBody(req.body),
+			),
+		);
+	});
 	app.post("/api/provider-nodes", (req, res) => {
 		const node = createRouterProviderNode(parseProviderNodeBody(req.body));
 		res.status(201).json({ node });
+	});
+	app.get("/api/provider-nodes/:id/models", async (req, res) => {
+		const result = await discoverRouterProviderNodeModels({
+			id: req.params.id,
+		});
+		res.status(result.ok ? 200 : (result.status ?? 502)).json(result);
+	});
+	app.post("/api/provider-nodes/:id/import-models", async (req, res) => {
+		const result = await discoverRouterProviderNodeModels({
+			apply: true,
+			id: req.params.id,
+		});
+		res.status(result.ok ? 200 : (result.status ?? 502)).json(result);
+	});
+	app.post("/api/provider-nodes/:id/validate", async (req, res) => {
+		res.json(
+			await validateRouterProviderNode({
+				...parseProviderNodeValidationBody(req.body),
+				id: req.params.id,
+			}),
+		);
 	});
 	app.put("/api/provider-nodes/:id", (req, res) => {
 		res.json({
@@ -869,6 +930,248 @@ async function handleWebFetch(req: Request, res: ExpressResponse) {
 	});
 }
 
+export async function validateRouterProviderNode(
+	input: RouterProviderNodeValidationInput,
+): Promise<RouterProviderNodeValidationResult> {
+	try {
+		const candidate = resolveProviderNodeValidationCandidate(input);
+		if (!candidate.ok) return { valid: false, ...candidate.error };
+
+		const { node } = candidate;
+		if (!isValidHttpUrl(node.baseUrl)) {
+			return { valid: false, error: "Invalid URL format", status: 400 };
+		}
+
+		if (node.apiKeyAccountId && candidate.credentials.length === 0) {
+			return {
+				valid: false,
+				error: "Selected provider account is not available.",
+				status: 401,
+			};
+		}
+
+		if (node.type === "custom-embedding") {
+			return validateProviderNodeEmbedding(candidate, input.modelId);
+		}
+
+		const modelsAttempt = await fetchProviderNodeModels(candidate);
+		if (modelsAttempt.ok) {
+			return {
+				valid: true,
+				method: "models",
+				models: modelsAttempt.models,
+			};
+		}
+
+		if (modelsAttempt.status === 401 || modelsAttempt.status === 403) {
+			return {
+				valid: false,
+				error: "API key unauthorized",
+				status: modelsAttempt.status,
+			};
+		}
+
+		const modelId = input.modelId?.trim();
+		if (!modelId) {
+			return {
+				valid: false,
+				error: getModelsErrorMessage(modelsAttempt.status),
+				status: modelsAttempt.status,
+			};
+		}
+
+		return validateProviderNodeInference(candidate, modelId);
+	} catch (error) {
+		return {
+			valid: false,
+			error: getProviderNodeNetworkErrorMessage(error),
+			status: 500,
+		};
+	}
+}
+
+export async function discoverRouterProviderNodeModels(
+	input: RouterProviderNodeValidationInput & { apply?: boolean },
+): Promise<RouterProviderNodeDiscoveryResult> {
+	try {
+		const candidate = resolveProviderNodeValidationCandidate(input);
+		if (!candidate.ok) {
+			return {
+				ok: false,
+				error: candidate.error.error,
+				status: candidate.error.status,
+				models: [],
+			};
+		}
+
+		if (!isValidHttpUrl(candidate.node.baseUrl)) {
+			return {
+				ok: false,
+				error: "Invalid URL format",
+				status: 400,
+				models: [],
+			};
+		}
+
+		if (candidate.node.apiKeyAccountId && candidate.credentials.length === 0) {
+			return {
+				ok: false,
+				error: "Selected provider account is not available.",
+				status: 401,
+				models: [],
+			};
+		}
+
+		const result = await fetchProviderNodeModels(candidate);
+		if (!result.ok) {
+			return {
+				ok: false,
+				error: getModelsErrorMessage(result.status),
+				status: result.status,
+				models: [],
+			};
+		}
+
+		const models = result.models;
+		if (input.apply && input.id) {
+			updateRouterProviderNode(input.id, {
+				models: models.map((model) => model.id),
+			});
+		}
+
+		return {
+			ok: true,
+			models,
+			applied: Boolean(input.apply && input.id),
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			error: getProviderNodeNetworkErrorMessage(error),
+			status: 500,
+			models: [],
+		};
+	}
+}
+
+async function validateProviderNodeEmbedding(
+	candidate: ProviderNodeValidationCandidate,
+	modelId: string | undefined,
+): Promise<RouterProviderNodeValidationResult> {
+	const model = modelId?.trim();
+	if (!model) {
+		return {
+			valid: false,
+			error: "Model ID required for embedding validation",
+			status: 400,
+		};
+	}
+
+	const attempts = providerNodeValidationAttempts(candidate);
+	for (const account of attempts) {
+		const upstream = await fetchWithTimeout(
+			providerNodeUrl(candidate.node, "/embeddings"),
+			{
+				method: "POST",
+				headers: providerNodeHeadersForVersion(candidate.node, account),
+				body: JSON.stringify({ model, input: "ping" }),
+			},
+		);
+		if (upstream.ok) {
+			const data = await readJson(upstream);
+			const embedding = (
+				(data.data as unknown[])?.[0] as JsonObject | undefined
+			)?.embedding;
+			return {
+				valid: true,
+				method: "embeddings",
+				dimensions: Array.isArray(embedding) ? embedding.length : null,
+			};
+		}
+		if (upstream.status === 401 || upstream.status === 403) {
+			return {
+				valid: false,
+				error: "API key unauthorized",
+				status: upstream.status,
+			};
+		}
+		const text = await upstream.text().catch(() => upstream.statusText);
+		return {
+			valid: false,
+			error: `Embeddings request failed (${upstream.status})${text ? `: ${text.slice(0, 200)}` : ""}`,
+			method: "embeddings",
+			status: upstream.status,
+		};
+	}
+
+	return {
+		valid: false,
+		error: "No validation attempt was available.",
+		status: 401,
+	};
+}
+
+async function validateProviderNodeInference(
+	candidate: ProviderNodeValidationCandidate,
+	modelId: string,
+): Promise<RouterProviderNodeValidationResult> {
+	const { node } = candidate;
+	const isResponses =
+		node.type === "openai-compatible" && node.apiType === "responses";
+	const path =
+		node.type === "anthropic-compatible"
+			? "/messages"
+			: isResponses
+				? "/responses"
+				: "/chat/completions";
+	const body =
+		node.type === "anthropic-compatible"
+			? {
+					model: modelId,
+					messages: [{ role: "user", content: "ping" }],
+					max_tokens: 1,
+				}
+			: isResponses
+				? {
+						model: modelId,
+						input: "ping",
+						max_output_tokens: 1,
+						stream: false,
+					}
+				: {
+						model: modelId,
+						messages: [{ role: "user", content: "ping" }],
+						max_tokens: 1,
+					};
+	const method =
+		node.type === "anthropic-compatible"
+			? "messages"
+			: isResponses
+				? "responses"
+				: "chat";
+
+	for (const account of providerNodeValidationAttempts(candidate)) {
+		const upstream = await fetchWithTimeout(providerNodeUrl(node, path), {
+			method: "POST",
+			headers: providerNodeHeadersForVersion(node, account),
+			body: JSON.stringify(body),
+		});
+		if (upstream.ok) return { valid: true, method };
+		return {
+			valid: false,
+			error: getChatErrorMessage(upstream.status),
+			method,
+			status: upstream.status,
+		};
+	}
+
+	return {
+		valid: false,
+		error: "No validation attempt was available.",
+		status: 401,
+	};
+}
+
 async function fetchProviderNodeWithFallback({
 	body,
 	nodeTarget,
@@ -948,6 +1251,138 @@ async function fetchProviderNodeWithFallback({
 	};
 }
 
+interface ProviderNodeValidationCandidate {
+	node: RouterProviderNode;
+	credentials: RouterProviderCredential[];
+}
+
+type ProviderNodeCandidateResolution =
+	| {
+			ok: true;
+			node: RouterProviderNode;
+			credentials: RouterProviderCredential[];
+	  }
+	| {
+			ok: false;
+			error: {
+				error: string;
+				status: number;
+			};
+	  };
+
+async function fetchProviderNodeModels(
+	candidate: ProviderNodeValidationCandidate,
+): Promise<
+	| { ok: true; models: RouterDiscoveredProviderNodeModel[] }
+	| { ok: false; status: number }
+> {
+	for (const account of providerNodeValidationAttempts(candidate)) {
+		const upstream = await fetchWithTimeout(
+			providerNodeUrl(candidate.node, "/models"),
+			{
+				method: "GET",
+				headers: providerNodeHeadersForVersion(candidate.node, account),
+			},
+		);
+		if (upstream.ok) {
+			return {
+				ok: true,
+				models: parseDiscoveredProviderNodeModels(await readJson(upstream)),
+			};
+		}
+		return { ok: false, status: upstream.status };
+	}
+
+	return { ok: false, status: 401 };
+}
+
+function resolveProviderNodeValidationCandidate(
+	input: RouterProviderNodeValidationInput,
+): ProviderNodeCandidateResolution {
+	const existing = input.id
+		? getRouterProviderNodes().find((node) => node.id === input.id)
+		: undefined;
+	if (input.id && !existing) {
+		return {
+			ok: false,
+			error: { error: "Provider node not found", status: 404 },
+		};
+	}
+
+	const type = input.type ?? existing?.type ?? "openai-compatible";
+	const baseUrl = sanitizeProviderNodeBaseUrlForRequest(
+		input.baseUrl ?? existing?.baseUrl ?? defaultProviderNodeBaseUrl(type),
+		type,
+	);
+	const node: RouterProviderNode = {
+		id: existing?.id ?? "draft-provider-node",
+		type,
+		name: existing?.name ?? "Draft provider node",
+		prefix: existing?.prefix ?? "draft",
+		baseUrl,
+		apiType:
+			type === "openai-compatible"
+				? (input.apiType ?? existing?.apiType ?? "chat")
+				: undefined,
+		apiKeyProvider:
+			input.apiKeyProvider ??
+			existing?.apiKeyProvider ??
+			defaultProviderNodeKeyProvider(type),
+		apiKeyAccountId:
+			input.apiKeyAccountId === undefined
+				? (existing?.apiKeyAccountId ?? null)
+				: input.apiKeyAccountId,
+		models: existing?.models ?? [],
+		isActive: existing?.isActive ?? true,
+		createdAt: existing?.createdAt ?? new Date().toISOString(),
+		updatedAt: existing?.updatedAt ?? new Date().toISOString(),
+	};
+
+	return {
+		ok: true,
+		node,
+		credentials: getProviderNodeValidationCredentials(node, input),
+	};
+}
+
+function getProviderNodeValidationCredentials(
+	node: RouterProviderNode,
+	input: RouterProviderNodeValidationInput,
+): RouterProviderCredential[] {
+	const directKey = input.apiKey?.trim();
+	if (directKey) {
+		const provider =
+			input.apiKeyProvider ??
+			node.apiKeyProvider ??
+			defaultProviderNodeKeyProvider(node.type) ??
+			"openai";
+		return [
+			{
+				id: "direct-validation-key",
+				name: "Direct validation key",
+				provider,
+				key: directKey,
+				legacy: true,
+			},
+		];
+	}
+
+	if (!node.apiKeyProvider) return [];
+	const credentials = getProviderAccountCredentials(node.apiKeyProvider);
+	if (!node.apiKeyAccountId) return credentials;
+	return credentials.filter(
+		(credential) => credential.id === node.apiKeyAccountId,
+	);
+}
+
+function providerNodeValidationAttempts({
+	credentials,
+}: ProviderNodeValidationCandidate): Array<
+	RouterProviderCredential | undefined
+> {
+	return credentials.length > 0 ? credentials : [undefined];
+}
+
 function resolveProviderNodeTarget(
 	model: unknown,
 	allowedTypes: RouterProviderNodeType[],
@@ -1009,6 +1444,18 @@ function providerNodeHeaders(
 	account: RouterProviderCredential | undefined,
 	req: Request,
 ): Record<string, string> {
+	return providerNodeHeadersForVersion(
+		node,
+		account,
+		req.header("anthropic-version") ?? "2023-06-01",
+	);
+}
+
+function providerNodeHeadersForVersion(
+	node: RouterProviderNode,
+	account: RouterProviderCredential | undefined,
+	anthropicVersion = "2023-06-01",
+): Record<string, string> {
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
 	};
@@ -1017,8 +1464,7 @@ function providerNodeHeaders(
 	if (node.type === "anthropic-compatible") {
 		headers["x-api-key"] = account.key;
 		headers.Authorization = `Bearer ${account.key}`;
-		headers["anthropic-version"] =
-			req.header("anthropic-version") ?? "2023-06-01";
+		headers["anthropic-version"] = anthropicVersion;
 		return headers;
 	}
 
@@ -1029,6 +1475,34 @@ function providerNodeHeaders(
 function providerNodeUrl(node: RouterProviderNode, path: string): string {
 	const baseUrl = node.baseUrl.replace(/\/+$/g, "");
 	return baseUrl.endsWith(path) ? baseUrl : `${baseUrl}${path}`;
+}
+
+function sanitizeProviderNodeBaseUrlForRequest(
+	baseUrl: string,
+	type: RouterProviderNodeType,
+): string {
+	let sanitized = baseUrl.trim().replace(/\/+$/g, "");
+	if (type === "anthropic-compatible" && sanitized.endsWith("/messages")) {
+		sanitized = sanitized.slice(0, -"/messages".length);
+	}
+	if (type === "custom-embedding" && sanitized.endsWith("/embeddings")) {
+		sanitized = sanitized.slice(0, -"/embeddings".length);
+	}
+	return sanitized;
+}
+
+function defaultProviderNodeBaseUrl(type: RouterProviderNodeType): string {
+	if (type === "anthropic-compatible") return "https://api.anthropic.com/v1";
+	return "https://api.openai.com/v1";
+}
+
+function defaultProviderNodeKeyProvider(
+	type: RouterProviderNodeType,
+): RouterProviderKeyId | undefined {
+	if (type === "anthropic-compatible") return "anthropic";
+	if (type === "openai-compatible" || type === "custom-embedding")
+		return "openai";
+	return undefined;
 }
 
 function setProviderNodeUsageLocals(
@@ -1069,6 +1543,18 @@ function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {
 	};
 }
 
+function parseProviderNodeValidationBody(
+	value: unknown,
+): RouterProviderNodeValidationInput {
+	const body = toJsonObject(value);
+	return {
+		...parseProviderNodeBody(value),
+		apiKey: typeof body.apiKey === "string" ? body.apiKey : undefined,
+		id: typeof body.id === "string" ? body.id : undefined,
+		modelId: typeof body.modelId === "string" ? body.modelId : undefined,
+	};
+}
+
 function parseModelList(value: unknown): string[] | undefined {
 	if (Array.isArray(value)) return value.map(String);
 	if (typeof value === "string") {
@@ -1091,6 +1577,108 @@ function parseProviderNodeType(
 		return value;
 	}
 	return undefined;
+}
+
+function parseDiscoveredProviderNodeModels(
+	data: JsonObject,
+): RouterDiscoveredProviderNodeModel[] {
+	const rawModels = extractRawModelList(data);
+	const models = new Map<string, RouterDiscoveredProviderNodeModel>();
+	for (const item of rawModels) {
+		const value = toJsonObject(item);
+		const id =
+			stringValue(value.id) ??
+			stringValue(value.model) ??
+			stringValue(value.slug) ??
+			stringValue(value.name);
+		if (!id) continue;
+		models.set(id, {
+			id,
+			name:
+				stringValue(value.display_name) ??
+				stringValue(value.displayName) ??
+				stringValue(value.name) ??
+				id,
+		});
+	}
+	return Array.from(models.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function extractRawModelList(data: JsonObject): unknown[] {
+	if (Array.isArray(data)) return data;
+	if (Array.isArray(data.data)) return data.data;
+	if (Array.isArray(data.models)) return data.models;
+	if (Array.isArray(data.results)) return data.results;
+	if (data.models && typeof data.models === "object") {
+		return Object.entries(data.models as Record<string, unknown>).map(
+			([id, value]) => ({
+				...toJsonObject(value),
+				id,
+			}),
+		);
+	}
+	return [];
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function fetchWithTimeout(
+	url: string,
+	init: RequestInit,
+	timeoutMs = 10_000,
+): Promise<globalThis.Response> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function isValidHttpUrl(value: string): boolean {
+	try {
+		const url = new URL(value);
+		return url.protocol === "http:" || url.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+function getModelsErrorMessage(status: number): string {
+	if (status === 401 || status === 403) return "API key unauthorized";
+	if (status === 404)
+		return "/models endpoint not found - enter a model ID to validate via inference.";
+	if (status >= 500) return "Server error - try again later";
+	return `Unexpected response (${status})`;
+}
+
+function getChatErrorMessage(status: number): string {
+	if (status === 401 || status === 403) return "API key unauthorized";
+	if (status === 400) return "Invalid model or bad request";
+	if (status === 404) return "Inference endpoint not found";
+	if (status >= 500) return "Server error - try again later";
+	return `Inference request failed (${status})`;
+}
+
+function getProviderNodeNetworkErrorMessage(error: unknown): string {
+	const value = error as { cause?: { code?: string }; message?: string };
+	if (value.cause?.code === "ECONNREFUSED")
+		return "Connection refused - provider node offline or unreachable";
+	if (value.cause?.code === "ENOTFOUND")
+		return "DNS lookup failed - invalid domain or network issue";
+	if (value.cause?.code === "ETIMEDOUT")
+		return "Connection timeout - provider node too slow";
+	if (value.message?.includes("abort") || value.message?.includes("timeout"))
+		return "Request timeout (>10s) - provider node not responding";
+	if (value.cause?.code === "CERT_HAS_EXPIRED")
+		return "SSL certificate expired";
+	if (value.cause?.code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE")
+		return "SSL certificate verification failed";
+	if (value.cause?.code) return `Network error: ${value.cause.code}`;
+	return "Network connection failed - check URL and network connectivity";
 }
 
 function withModel(body: JsonObject, model: string): JsonObject {

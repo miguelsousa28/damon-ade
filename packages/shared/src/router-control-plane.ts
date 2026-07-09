@@ -452,6 +452,13 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		status: "gateway-live",
 	},
 	{
+		path: "/api/provider-nodes/validate",
+		method: "POST",
+		compatibility: "Router",
+		capability: "Provider node validation and model discovery",
+		status: "gateway-live",
+	},
+	{
 		path: "/v1/compress",
 		method: "POST",
 		compatibility: "Router",
@@ -544,7 +551,7 @@ export const ROUTER_FEATURES: RouterFeature[] = [
 		label: "Provider nodes",
 		status: "active",
 		description:
-			"Custom OpenAI-compatible, Anthropic-compatible, and embedding nodes route by prefix.",
+			"Custom OpenAI-compatible, Anthropic-compatible, and embedding nodes route by prefix with validation and model import.",
 	},
 	{
 		id: "fallback-classifier",

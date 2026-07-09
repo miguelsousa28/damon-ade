@@ -45,6 +45,17 @@ type TabId =
 	| "aliases";
 
 type ProviderAccountView = RouterProviderAccount & { hasKey: boolean };
+type ProviderNodeValidationState = {
+	valid: boolean;
+	error?: string;
+	method?: string;
+	models?: Array<{ id: string; name: string }>;
+} | null;
+type ProviderNodeDiscoveryState = {
+	ok: boolean;
+	error?: string;
+	models: Array<{ id: string; name: string }>;
+} | null;
 
 const TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Overview" },
@@ -671,6 +682,14 @@ function NodesTab() {
 		electronTrpc.agentRouter.deleteProviderNode.useMutation({
 			onSuccess: invalidate,
 		});
+	const validateProviderNode =
+		electronTrpc.agentRouter.validateProviderNode.useMutation();
+	const discoverProviderNodeModels =
+		electronTrpc.agentRouter.discoverProviderNodeModels.useMutation({
+			onSuccess: (result) => {
+				if (result.applied) invalidate();
+			},
+		});
 
 	const [type, setType] = useState<RouterProviderNodeType>("openai-compatible");
 	const [name, setName] = useState("");
@@ -681,6 +700,11 @@ function NodesTab() {
 		useState<RouterProviderKeyId>("openai");
 	const [apiKeyAccountId, setApiKeyAccountId] = useState("");
 	const [models, setModels] = useState("");
+	const [checkModelId, setCheckModelId] = useState("");
+	const [validationResult, setValidationResult] =
+		useState<ProviderNodeValidationState>(null);
+	const [discoveryResult, setDiscoveryResult] =
+		useState<ProviderNodeDiscoveryState>(null);
 
 	const accounts = providerAccounts.data ?? [];
 	const matchingAccounts = accounts.filter(
@@ -713,6 +737,35 @@ function NodesTab() {
 		setPrefix("");
 		setModels("");
 		setApiKeyAccountId("");
+		setCheckModelId("");
+		setValidationResult(null);
+		setDiscoveryResult(null);
+	};
+
+	const draftNodeInput = () => ({
+		apiKeyAccountId: apiKeyAccountId || null,
+		apiKeyProvider,
+		apiType: type === "openai-compatible" ? apiType : undefined,
+		baseUrl: baseUrl.trim(),
+		modelId: checkModelId.trim() || undefined,
+		type,
+	});
+
+	const checkDraftNode = async () => {
+		if (!baseUrl.trim()) return;
+		const result = await validateProviderNode.mutateAsync(draftNodeInput());
+		setValidationResult(result);
+	};
+
+	const importDraftModels = async () => {
+		if (!baseUrl.trim()) return;
+		const result = await discoverProviderNodeModels.mutateAsync(
+			draftNodeInput(),
+		);
+		setDiscoveryResult(result);
+		if (result.ok && result.models.length > 0) {
+			setModels(result.models.map((model) => model.id).join("\n"));
+		}
 	};
 
 	return (
@@ -817,6 +870,51 @@ function NodesTab() {
 						</label>
 					)}
 
+					<div className="grid gap-3 md:grid-cols-[1fr_auto_auto]">
+						<label className="grid gap-1.5 text-xs font-medium">
+							Model ID for check
+							<input
+								value={checkModelId}
+								onChange={(event) => setCheckModelId(event.target.value)}
+								placeholder={
+									type === "custom-embedding"
+										? "text-embedding-3-small"
+										: "optional fallback model"
+								}
+								className="rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+							/>
+						</label>
+						<button
+							type="button"
+							onClick={checkDraftNode}
+							disabled={
+								validateProviderNode.isPending ||
+								!baseUrl.trim() ||
+								(type === "custom-embedding" && !checkModelId.trim())
+							}
+							className="self-end rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+						>
+							{validateProviderNode.isPending ? "Checking..." : "Check"}
+						</button>
+						<button
+							type="button"
+							onClick={importDraftModels}
+							disabled={discoverProviderNodeModels.isPending || !baseUrl.trim()}
+							className="self-end rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+						>
+							{discoverProviderNodeModels.isPending
+								? "Importing..."
+								: "Import /models"}
+						</button>
+					</div>
+
+					{validationResult && (
+						<ProviderNodeValidationNotice result={validationResult} />
+					)}
+					{discoveryResult && (
+						<ProviderNodeDiscoveryNotice result={discoveryResult} />
+					)}
+
 					<label className="grid gap-1.5 text-xs font-medium">
 						Models
 						<textarea
@@ -859,12 +957,27 @@ function NodesTab() {
 								key={node.id}
 								accounts={accounts}
 								deleteNode={(id) => deleteProviderNode.mutate({ id })}
+								discoverModels={(id) =>
+									discoverProviderNodeModels.mutateAsync({
+										apply: true,
+										id,
+									})
+								}
 								isBusy={
-									updateProviderNode.isPending || deleteProviderNode.isPending
+									updateProviderNode.isPending ||
+									deleteProviderNode.isPending ||
+									discoverProviderNodeModels.isPending ||
+									validateProviderNode.isPending
 								}
 								node={node}
 								toggleNode={(id, isActive) =>
 									updateProviderNode.mutate({ id, isActive })
+								}
+								validateNode={(id, modelId) =>
+									validateProviderNode.mutateAsync({
+										id,
+										modelId,
+									})
 								}
 							/>
 						))
@@ -878,19 +991,41 @@ function NodesTab() {
 function ProviderNodeRow({
 	accounts,
 	deleteNode,
+	discoverModels,
 	isBusy,
 	node,
 	toggleNode,
+	validateNode,
 }: {
 	accounts: ProviderAccountView[];
 	deleteNode: (id: string) => void;
+	discoverModels: (id: string) => Promise<ProviderNodeDiscoveryState>;
 	isBusy: boolean;
 	node: RouterProviderNode;
 	toggleNode: (id: string, isActive: boolean) => void;
+	validateNode: (
+		id: string,
+		modelId: string | undefined,
+	) => Promise<ProviderNodeValidationState>;
 }) {
+	const [validationResult, setValidationResult] =
+		useState<ProviderNodeValidationState>(null);
+	const [discoveryResult, setDiscoveryResult] =
+		useState<ProviderNodeDiscoveryState>(null);
 	const accountName =
 		accounts.find((account) => account.id === node.apiKeyAccountId)?.name ??
 		(node.apiKeyAccountId ? "selected account" : "auto / no key");
+	const firstModel = node.models[0];
+
+	const checkNode = async () => {
+		const result = await validateNode(node.id, firstModel);
+		setValidationResult(result);
+	};
+
+	const importModels = async () => {
+		const result = await discoverModels(node.id);
+		setDiscoveryResult(result);
+	};
 
 	return (
 		<div className="rounded-md border bg-background px-3 py-3">
@@ -907,6 +1042,25 @@ function ProviderNodeRow({
 					</div>
 				</div>
 				<div className="flex shrink-0 gap-2">
+					<button
+						type="button"
+						onClick={checkNode}
+						disabled={
+							isBusy ||
+							(node.type === "custom-embedding" && node.models.length === 0)
+						}
+						className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Check
+					</button>
+					<button
+						type="button"
+						onClick={importModels}
+						disabled={isBusy}
+						className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Import /models
+					</button>
 					<button
 						type="button"
 						onClick={() => toggleNode(node.id, !node.isActive)}
@@ -939,6 +1093,65 @@ function ProviderNodeRow({
 					))
 				)}
 			</div>
+			{validationResult && (
+				<div className="mt-3">
+					<ProviderNodeValidationNotice result={validationResult} />
+				</div>
+			)}
+			{discoveryResult && (
+				<div className="mt-3">
+					<ProviderNodeDiscoveryNotice result={discoveryResult} />
+				</div>
+			)}
+		</div>
+	);
+}
+
+function ProviderNodeValidationNotice({
+	result,
+}: {
+	result: ProviderNodeValidationState;
+}) {
+	if (!result) return null;
+	if (result.valid) {
+		return (
+			<div className="flex flex-wrap items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs">
+				<span className="font-medium text-emerald-700 dark:text-emerald-300">
+					Valid
+				</span>
+				{result.method && <Pill>via {result.method}</Pill>}
+				{result.models && result.models.length > 0 && (
+					<Pill>{result.models.length} models found</Pill>
+				)}
+			</div>
+		);
+	}
+	return (
+		<div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+			{result.error ?? "Validation failed"}
+		</div>
+	);
+}
+
+function ProviderNodeDiscoveryNotice({
+	result,
+}: {
+	result: ProviderNodeDiscoveryState;
+}) {
+	if (!result) return null;
+	if (result.ok) {
+		return (
+			<div className="flex flex-wrap items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs">
+				<span className="font-medium text-emerald-700 dark:text-emerald-300">
+					Imported
+				</span>
+				<Pill>{result.models.length} models</Pill>
+			</div>
+		);
+	}
+	return (
+		<div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+			{result.error ?? "Model discovery failed"}
 		</div>
 	);
 }
