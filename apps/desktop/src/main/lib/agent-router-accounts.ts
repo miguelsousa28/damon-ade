@@ -223,6 +223,30 @@ export function getProviderAccountCredentials(
 		: [];
 }
 
+export function getProviderAccountCredentialById(
+	provider: RouterProviderKeyId,
+	accountId: string,
+): RouterProviderCredential | null {
+	const account = getRouterProviderAccounts(provider).find(
+		(candidate) => candidate.id === accountId,
+	);
+	if (!account) return null;
+	const key = getProviderAccountKey(provider, account.id);
+	if (!key) return null;
+	return {
+		id: account.id,
+		name: account.name,
+		provider,
+		authType: account.authType,
+		key,
+		refreshToken: getProviderAccountSecret(provider, account.id, "refresh"),
+		idToken: getProviderAccountSecret(provider, account.id, "id"),
+		expiresAt: account.expiresAt ?? null,
+		providerSpecificData: account.providerSpecificData ?? {},
+		legacy: false,
+	};
+}
+
 export function markProviderAccountSuccess(
 	credential: RouterProviderCredential,
 ): void {

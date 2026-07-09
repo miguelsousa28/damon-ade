@@ -49,6 +49,7 @@ import express, {
 import {
 	createRouterProviderAccount,
 	deleteRouterProviderAccount,
+	getProviderAccountCredentialById,
 	getProviderAccountCredentials,
 	listRouterProviderAccountViews,
 	markProviderAccountFailure,
@@ -224,6 +225,18 @@ type OAuthRefreshCredentialResult =
 			status: number | null;
 	  };
 
+interface RouterTtsVoice {
+	id: string;
+	name: string;
+	locale: string;
+	lang: string;
+	country: string;
+	countryName: string;
+	langName: string;
+	gender?: string;
+	category?: string;
+}
+
 const OAUTH_REFRESH_CONFIGS: Record<
 	OAuthRefreshProviderId,
 	OAuthRefreshConfig
@@ -290,6 +303,12 @@ const OAUTH_REFRESH_CONFIGS: Record<
 const oauthRefreshLocks = new Map<
 	string,
 	Promise<OAuthRefreshCredentialResult>
+>();
+let edgeTtsVoicesCache: { time: number; voices: JsonObject[] } | null = null;
+let localDeviceVoicesCache: RouterTtsVoice[] | null = null;
+const elevenLabsVoicesCache = new Map<
+	string,
+	{ time: number; voices: JsonObject[] }
 >();
 
 export interface RouterDiscoveredProviderNodeModel {
@@ -780,6 +799,14 @@ function createAgentRouterGatewayApp() {
 	app.post("/v1/audio/speech", (req, res) =>
 		handleOpenAIProxy(req, res, "/audio/speech"),
 	);
+	app.get("/v1/audio/voices", async (req, res) => {
+		const result = await listRouterTtsVoices({
+			apiKey: stringQuery(req.query.apiKey),
+			lang: stringQuery(req.query.lang),
+			provider: stringQuery(req.query.provider) ?? "openai",
+		});
+		res.status(result.status).json(result.body);
+	});
 	app.post("/v1/search", handleSearch);
 	app.post("/v1/web/fetch", handleWebFetch);
 
@@ -1051,6 +1078,26 @@ function createAgentRouterGatewayApp() {
 		}
 		res.json({ connection });
 	});
+	app.get("/api/providers/:id/models", async (req, res) => {
+		const result = await listProviderAccountModels(req.params.id);
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/providers/:id/test", async (req, res) => {
+		const result = await testProviderAccount(req.params.id);
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/providers/:id/test-models", async (req, res) => {
+		const result = await testProviderAccountModels({
+			connectionId: req.params.id,
+			limit:
+				typeof req.body?.limit === "number"
+					? req.body.limit
+					: typeof req.query.limit === "string"
+						? Number(req.query.limit)
+						: undefined,
+		});
+		res.status(result.status).json(result.body);
+	});
 	app.put("/api/providers/:id", (req, res) => {
 		const existing = listRouterProviderAccountViews().find(
 			(account) => account.id === req.params.id,
@@ -1115,6 +1162,14 @@ function createAgentRouterGatewayApp() {
 				).filter((account) => account.authType !== "api-key").length,
 			})),
 		});
+	});
+	app.get("/api/media-providers/tts/voices", async (req, res) => {
+		const result = await listRouterTtsVoices({
+			apiKey: stringQuery(req.query.apiKey),
+			lang: stringQuery(req.query.lang),
+			provider: stringQuery(req.query.provider) ?? "edge-tts",
+		});
+		res.status(result.status).json(result.body);
 	});
 	app.get("/api/oauth/:provider/authorize", (req, res) => {
 		const result = buildOAuthAuthorizeResponse(req.params.provider, req.query);
@@ -3033,6 +3088,642 @@ function errorTextFromBody(body: JsonObject): string | null {
 		return stringValue(value.message) ?? stringValue(value.error) ?? null;
 	}
 	return stringValue(body.message) ?? stringValue(body.msg) ?? null;
+}
+
+async function listProviderAccountModels(
+	connectionId: string,
+): Promise<{ body: JsonObject; status: number }> {
+	const account = listRouterProviderAccountViews().find(
+		(candidate) => candidate.id === connectionId,
+	);
+	if (!account) return { status: 404, body: { error: "Connection not found" } };
+	const credential = getProviderAccountCredentialById(
+		account.provider,
+		account.id,
+	);
+	if (!credential) {
+		return {
+			status: 401,
+			body: { error: "No valid token found", provider: account.provider },
+		};
+	}
+
+	const activeCredential = await refreshProviderCredentialIfNeeded(credential);
+	const live = await fetchProviderAccountModels(activeCredential);
+	const fallback = staticProviderAccountModels(account.provider);
+	if (live.ok && live.models.length > 0) {
+		return {
+			status: 200,
+			body: {
+				provider: account.provider,
+				connectionId,
+				models: live.models,
+			},
+		};
+	}
+	if (fallback.length > 0) {
+		return {
+			status: 200,
+			body: {
+				provider: account.provider,
+				connectionId,
+				models: fallback,
+				warning:
+					live.warning ??
+					`Provider ${account.provider} does not support live model listing in ADE yet; returned static catalogue.`,
+			},
+		};
+	}
+	return {
+		status: live.status ?? 400,
+		body: {
+			error:
+				live.warning ??
+				`Provider ${account.provider} does not support models listing`,
+			provider: account.provider,
+			connectionId,
+		},
+	};
+}
+
+async function testProviderAccount(
+	connectionId: string,
+): Promise<{ body: JsonObject; status: number }> {
+	const account = listRouterProviderAccountViews().find(
+		(candidate) => candidate.id === connectionId,
+	);
+	if (!account) return { status: 404, body: { error: "Connection not found" } };
+	const credential = getProviderAccountCredentialById(
+		account.provider,
+		account.id,
+	);
+	if (!credential) {
+		return {
+			status: 401,
+			body: {
+				valid: false,
+				error: "No API key or access token stored for this account.",
+				refreshed: false,
+			},
+		};
+	}
+
+	const refreshResult = await refreshProviderCredential({
+		credential,
+		force: false,
+	});
+	const credentialForTest = refreshResult.ok
+		? refreshResult.credential
+		: credential;
+	const test = await validateRouterProviderKey(
+		credentialForTest.provider,
+		credentialForTest.key,
+	);
+	if (test.valid) {
+		markProviderAccountSuccess(credentialForTest);
+	} else {
+		markProviderAccountFailure({
+			credential: credentialForTest,
+			status: test.statusCode ?? undefined,
+			text: test.error ?? undefined,
+		});
+	}
+	return {
+		status: 200,
+		body: {
+			valid: test.valid,
+			error: test.error,
+			refreshed: refreshResult.ok ? refreshResult.refreshed : false,
+			statusCode: test.statusCode,
+			latencyMs: test.latencyMs,
+			testedAt: test.testedAt,
+		},
+	};
+}
+
+async function testProviderAccountModels({
+	connectionId,
+	limit,
+}: {
+	connectionId: string;
+	limit?: number;
+}): Promise<{ body: JsonObject; status: number }> {
+	const account = listRouterProviderAccountViews().find(
+		(candidate) => candidate.id === connectionId,
+	);
+	if (!account) return { status: 404, body: { error: "Connection not found" } };
+	const credential = getProviderAccountCredentialById(
+		account.provider,
+		account.id,
+	);
+	if (!credential) {
+		return {
+			status: 401,
+			body: { error: "No API key or access token stored for this account." },
+		};
+	}
+	const modelsResult = await listProviderAccountModels(connectionId);
+	if (modelsResult.status >= 400) return modelsResult;
+	const rawModels = Array.isArray(modelsResult.body.models)
+		? modelsResult.body.models
+		: [];
+	const requestedLimit =
+		typeof limit === "number" && Number.isFinite(limit) && limit > 0
+			? Math.min(Math.round(limit), 100)
+			: 100;
+	const models = rawModels.slice(0, requestedLimit).map((item) => {
+		const value = toJsonObject(item);
+		const id =
+			stringValue(value.id) ??
+			stringValue(value.model) ??
+			stringValue(value.name) ??
+			"";
+		return {
+			id,
+			name: stringValue(value.name) ?? id,
+			kind: parseModelKind(value.kind ?? value.type),
+		};
+	});
+
+	const activeCredential = await refreshProviderCredentialIfNeeded(credential);
+	const results = [];
+	for (const model of models) {
+		if (!model.id) continue;
+		const test = await pingProviderAccountModel(activeCredential, model.id);
+		results.push({
+			modelId: model.id,
+			name: model.name,
+			...test,
+		});
+	}
+	return {
+		status: 200,
+		body: {
+			provider: account.provider,
+			connectionId,
+			results,
+			truncated: rawModels.length > models.length,
+		},
+	};
+}
+
+async function fetchProviderAccountModels(
+	credential: RouterProviderCredential,
+): Promise<{
+	ok: boolean;
+	models: RouterDiscoveredProviderNodeModel[];
+	status?: number;
+	warning?: string;
+}> {
+	const request = providerAccountModelsRequest(credential);
+	if (!request) {
+		return {
+			ok: false,
+			models: [],
+			warning: `Provider ${credential.provider} has no live model list endpoint configured.`,
+		};
+	}
+	let response = await fetchWithTimeout(request.url, request.init, 12_000);
+	if (isAuthFailureStatus(response.status) && credential.refreshToken) {
+		const refreshed =
+			await refreshProviderCredentialAfterAuthFailure(credential);
+		const retryRequest = refreshed
+			? providerAccountModelsRequest(refreshed)
+			: null;
+		if (retryRequest) {
+			response = await fetchWithTimeout(
+				retryRequest.url,
+				retryRequest.init,
+				12_000,
+			);
+		}
+	}
+	if (!response.ok) {
+		const text = await response.text().catch(() => response.statusText);
+		return {
+			ok: false,
+			models: [],
+			status: response.status,
+			warning: `Failed to fetch models: ${response.status}${text ? ` ${text.slice(0, 160)}` : ""}`,
+		};
+	}
+	return {
+		ok: true,
+		models: parseDiscoveredProviderNodeModels(await readJson(response)),
+	};
+}
+
+function providerAccountModelsRequest(
+	credential: RouterProviderCredential,
+): { init: RequestInit; url: string } | null {
+	const headers: Record<string, string> = {
+		Accept: "application/json",
+		"Content-Type": "application/json",
+	};
+	if (credential.provider === "openrouter") {
+		headers.Authorization = `Bearer ${credential.key}`;
+		return {
+			url: "https://openrouter.ai/api/v1/models",
+			init: { headers, method: "GET" },
+		};
+	}
+	if (credential.provider === "openai") {
+		headers.Authorization = `Bearer ${credential.key}`;
+		return {
+			url: `${OPENAI_BASE_URL}/models`,
+			init: { headers, method: "GET" },
+		};
+	}
+	if (credential.provider === "anthropic") {
+		headers["anthropic-version"] = "2023-06-01";
+		headers["x-api-key"] = credential.key;
+		return {
+			url: "https://api.anthropic.com/v1/models",
+			init: { headers, method: "GET" },
+		};
+	}
+	if (credential.provider === "gemini") {
+		return {
+			url: `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(credential.key)}`,
+			init: { headers, method: "GET" },
+		};
+	}
+	return null;
+}
+
+function staticProviderAccountModels(
+	provider: RouterProviderKeyId,
+): RouterDiscoveredProviderNodeModel[] {
+	const catalog = ROUTER_PROVIDER_CATALOG.find(
+		(candidate) =>
+			candidate.keyProvider === provider || candidate.id === provider,
+	);
+	const custom = getRouterCustomModels()
+		.filter(
+			(model) =>
+				model.providerAlias === provider ||
+				model.providerAlias === catalog?.id ||
+				model.providerAlias === catalog?.keyProvider,
+		)
+		.map((model) => ({ id: model.id, name: model.name }));
+	const defaults =
+		catalog?.defaultModels.map((id) => ({
+			id,
+			name: id,
+		})) ?? [];
+	return [...custom, ...defaults].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function pingProviderAccountModel(
+	credential: RouterProviderCredential,
+	modelId: string,
+): Promise<JsonObject> {
+	const startedAt = Date.now();
+	try {
+		const response = await fetchProviderAccountModelProbe(credential, modelId);
+		const text = await response.text().catch(() => "");
+		return {
+			valid: response.ok,
+			error: response.ok
+				? null
+				: `Model probe failed (${response.status})${text ? `: ${text.slice(0, 160)}` : ""}`,
+			statusCode: response.status,
+			latencyMs: Date.now() - startedAt,
+			testedAt: new Date().toISOString(),
+		};
+	} catch (error) {
+		return {
+			valid: false,
+			error: errorMessage(error),
+			statusCode: null,
+			latencyMs: Date.now() - startedAt,
+			testedAt: new Date().toISOString(),
+		};
+	}
+}
+
+function fetchProviderAccountModelProbe(
+	credential: RouterProviderCredential,
+	modelId: string,
+): Promise<globalThis.Response> {
+	if (credential.provider === "anthropic") {
+		return fetchWithTimeout(
+			"https://api.anthropic.com/v1/messages",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"anthropic-version": "2023-06-01",
+					"x-api-key": credential.key,
+				},
+				body: JSON.stringify({
+					model: modelId,
+					max_tokens: 1,
+					messages: [{ role: "user", content: "ping" }],
+				}),
+			},
+			12_000,
+		);
+	}
+	if (
+		credential.provider === "openai" ||
+		credential.provider === "openrouter" ||
+		credential.provider === "perplexity"
+	) {
+		const url =
+			credential.provider === "openrouter"
+				? OPENROUTER_CHAT_COMPLETIONS_URL
+				: credential.provider === "perplexity"
+					? PERPLEXITY_CHAT_COMPLETIONS_URL
+					: `${OPENAI_BASE_URL}/chat/completions`;
+		return fetchWithTimeout(
+			url,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${credential.key}`,
+				},
+				body: JSON.stringify({
+					model: modelId,
+					messages: [{ role: "user", content: "ping" }],
+					max_tokens: 1,
+				}),
+			},
+			12_000,
+		);
+	}
+	return Promise.resolve(
+		new Response(
+			JSON.stringify({
+				error: `Model probe is not implemented for ${credential.provider}`,
+			}),
+			{ status: 501, headers: { "Content-Type": "application/json" } },
+		),
+	);
+}
+
+async function listRouterTtsVoices({
+	apiKey,
+	lang,
+	provider,
+}: {
+	apiKey?: string | null;
+	lang?: string | null;
+	provider: string;
+}): Promise<{ body: JsonObject; status: number }> {
+	try {
+		const normalizedProvider = provider.trim().toLowerCase() || "edge-tts";
+		let voices: RouterTtsVoice[];
+		if (normalizedProvider === "edge-tts") {
+			voices = normalizeEdgeTtsVoices(await fetchEdgeTtsVoices());
+		} else if (normalizedProvider === "local-device") {
+			voices = await fetchLocalDeviceTtsVoices();
+		} else if (normalizedProvider === "elevenlabs") {
+			const key =
+				apiKey?.trim() || getProviderAccountCredentials("elevenlabs")[0]?.key;
+			if (!key) {
+				return {
+					status: 401,
+					body: { error: "ElevenLabs API key required" },
+				};
+			}
+			voices = normalizeElevenLabsVoices(await fetchElevenLabsVoices(key));
+		} else if (normalizedProvider === "openai") {
+			voices = openAiTtsVoices();
+		} else {
+			return {
+				status: 400,
+				body: {
+					error: `Provider '${provider}' does not support voice listing`,
+				},
+			};
+		}
+
+		const filtered = lang
+			? voices.filter((voice) => voice.lang === lang)
+			: voices;
+		return {
+			status: 200,
+			body: {
+				voices: filtered,
+				languages: groupTtsVoicesByLanguage(filtered),
+				byLang: Object.fromEntries(
+					groupTtsVoicesByLanguage(filtered).map((group) => [
+						group.code,
+						group,
+					]),
+				),
+			},
+		};
+	} catch (error) {
+		return {
+			status: 502,
+			body: { error: errorMessage(error) || "Failed to fetch voices" },
+		};
+	}
+}
+
+async function fetchEdgeTtsVoices(): Promise<JsonObject[]> {
+	const now = Date.now();
+	if (
+		edgeTtsVoicesCache &&
+		now - edgeTtsVoicesCache.time < 24 * 60 * 60 * 1000
+	) {
+		return edgeTtsVoicesCache.voices;
+	}
+	const response = await fetchWithTimeout(
+		"https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4",
+		{ headers: { "User-Agent": "ADE-router" } },
+		12_000,
+	);
+	if (!response.ok)
+		throw new Error(`Edge TTS voices fetch failed: ${response.status}`);
+	const voices = (await readJson(response)) as unknown;
+	const list = Array.isArray(voices) ? (voices as JsonObject[]) : [];
+	edgeTtsVoicesCache = { time: now, voices: list };
+	return list;
+}
+
+async function fetchElevenLabsVoices(apiKey: string): Promise<JsonObject[]> {
+	const now = Date.now();
+	const cached = elevenLabsVoicesCache.get(apiKey);
+	if (cached && now - cached.time < 24 * 60 * 60 * 1000) return cached.voices;
+	const response = await fetchWithTimeout(
+		"https://api.elevenlabs.io/v1/voices",
+		{
+			headers: {
+				"Content-Type": "application/json",
+				"xi-api-key": apiKey,
+			},
+		},
+		12_000,
+	);
+	if (!response.ok)
+		throw new Error(`ElevenLabs voices fetch failed: ${response.status}`);
+	const data = await readJson(response);
+	const voices = Array.isArray(data.voices)
+		? (data.voices as JsonObject[])
+		: [];
+	elevenLabsVoicesCache.set(apiKey, { time: now, voices });
+	return voices;
+}
+
+async function fetchLocalDeviceTtsVoices(): Promise<RouterTtsVoice[]> {
+	if (localDeviceVoicesCache) return localDeviceVoicesCache;
+	if (process.platform !== "win32") {
+		localDeviceVoicesCache = [];
+		return localDeviceVoicesCache;
+	}
+	const script = [
+		"Add-Type -AssemblyName System.Speech;",
+		"$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;",
+		"$s.GetInstalledVoices() | ForEach-Object { $v = $_.VoiceInfo;",
+		"[PSCustomObject]@{ Name=$v.Name; Culture=$v.Culture.Name; Gender=$v.Gender.ToString() } }",
+		"| ConvertTo-Json -Compress",
+	].join(" ");
+	const stdout = execFileSync(
+		"powershell.exe",
+		[
+			"-NoProfile",
+			"-NonInteractive",
+			"-WindowStyle",
+			"Hidden",
+			"-Command",
+			script,
+		],
+		{ encoding: "utf8", timeout: 8_000, windowsHide: true },
+	);
+	const raw = JSON.parse(stdout.trim() || "[]") as unknown;
+	const list = Array.isArray(raw) ? raw : [raw];
+	localDeviceVoicesCache = list
+		.map((item) => {
+			const value = toJsonObject(item);
+			const name = stringValue(value.Name) ?? "";
+			const culture = stringValue(value.Culture) ?? "en-US";
+			const [voiceLang, country = ""] = culture.split("-");
+			return {
+				id: name,
+				name,
+				locale: culture,
+				lang: voiceLang,
+				country,
+				countryName: ttsCountryName(country || voiceLang),
+				langName: ttsLangName(voiceLang),
+				gender: stringValue(value.Gender) ?? "",
+			};
+		})
+		.filter((voice) => voice.id);
+	return localDeviceVoicesCache;
+}
+
+function normalizeEdgeTtsVoices(voices: JsonObject[]): RouterTtsVoice[] {
+	return voices
+		.map((voice) => {
+			const locale = stringValue(voice.Locale) ?? "en-US";
+			const [voiceLang, country = ""] = locale.split("-");
+			const id = stringValue(voice.ShortName) ?? stringValue(voice.Name) ?? "";
+			return {
+				id,
+				name:
+					(stringValue(voice.FriendlyName) ?? id)
+						.replace(/^Microsoft\s+/i, "")
+						.replace(/ Online \(Natural\) - /g, " (") || id,
+				locale,
+				lang: voiceLang,
+				country,
+				countryName: ttsCountryName(country || voiceLang),
+				langName: ttsLangName(voiceLang),
+				gender: stringValue(voice.Gender) ?? "",
+			};
+		})
+		.filter((voice) => voice.id);
+}
+
+function normalizeElevenLabsVoices(voices: JsonObject[]): RouterTtsVoice[] {
+	return voices
+		.map((voice) => {
+			const labels = jsonObjectValue(voice.labels);
+			const locale = stringValue(labels.language) ?? "en";
+			const [voiceLang, country = ""] = locale.split("-");
+			const id = stringValue(voice.voice_id) ?? stringValue(voice.id) ?? "";
+			return {
+				id,
+				name: stringValue(voice.name) ?? id,
+				locale,
+				lang: voiceLang,
+				country,
+				countryName: country ? ttsCountryName(country) : "",
+				langName: ttsLangName(voiceLang),
+				gender: stringValue(labels.gender) ?? "",
+				category: stringValue(voice.category) ?? "",
+			};
+		})
+		.filter((voice) => voice.id);
+}
+
+function openAiTtsVoices(): RouterTtsVoice[] {
+	return [
+		"alloy",
+		"ash",
+		"ballad",
+		"coral",
+		"echo",
+		"fable",
+		"nova",
+		"onyx",
+		"sage",
+		"shimmer",
+	].map((id) => ({
+		id,
+		name: id,
+		locale: "en",
+		lang: "en",
+		country: "",
+		countryName: "",
+		langName: "English",
+	}));
+}
+
+function groupTtsVoicesByLanguage(voices: RouterTtsVoice[]): Array<{
+	code: string;
+	name: string;
+	voices: RouterTtsVoice[];
+}> {
+	const byLang = new Map<
+		string,
+		{ code: string; name: string; voices: RouterTtsVoice[] }
+	>();
+	for (const voice of voices) {
+		const existing = byLang.get(voice.lang) ?? {
+			code: voice.lang,
+			name: voice.langName,
+			voices: [],
+		};
+		existing.voices.push(voice);
+		byLang.set(voice.lang, existing);
+	}
+	return Array.from(byLang.values()).sort((a, b) =>
+		a.name.localeCompare(b.name),
+	);
+}
+
+function ttsCountryName(code: string): string {
+	if (!code) return "";
+	try {
+		return new Intl.DisplayNames(["en"], { type: "region" }).of(code) ?? code;
+	} catch {
+		return code;
+	}
+}
+
+function ttsLangName(code: string): string {
+	if (!code) return "";
+	try {
+		return new Intl.DisplayNames(["en"], { type: "language" }).of(code) ?? code;
+	} catch {
+		return code;
+	}
 }
 
 interface OAuthProviderCompatibility {
