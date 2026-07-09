@@ -5,8 +5,10 @@ import {
 	buildOpenAIModelList,
 	previewRouterTokenSaver,
 	type RouterGatewayStatus,
+	type RouterModelKind,
 	type RouterModelResolutionOptions,
 	type RouterModelTarget,
+	type RouterModelTestResult,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
@@ -30,16 +32,26 @@ import {
 	createRouterProviderNode,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
+	deleteRouterCustomModel,
 	deleteRouterProviderNode,
+	disableRouterModels,
+	enableRouterModels,
 	estimateTokens,
 	getRouterAliases,
 	getRouterCustomCombos,
+	getRouterCustomModels,
+	getRouterDisabledModelMap,
+	getRouterDisabledModels,
+	getRouterModelAvailability,
 	getRouterProviderNodes,
 	getRouterUsageStats,
+	isRouterModelDisabled,
+	recordRouterModelAvailability,
 	recordRouterUsage,
 	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
+	upsertRouterCustomModel,
 } from "./agent-router-store";
 
 export const DEFAULT_AGENT_ROUTER_GATEWAY_PORT = 20128;
@@ -286,6 +298,83 @@ function createAgentRouterGatewayApp() {
 	app.delete("/api/models/alias/:alias", (req, res) => {
 		res.json({ aliases: deleteRouterAlias(req.params.alias) });
 	});
+	app.get("/api/models/custom", (_req, res) => {
+		res.json({ models: getRouterCustomModels() });
+	});
+	app.post("/api/models/custom", (req, res) => {
+		const result = upsertRouterCustomModel(parseCustomModelBody(req.body));
+		res.status(result.added ? 201 : 200).json({
+			success: true,
+			added: result.added,
+			models: result.models,
+		});
+	});
+	app.delete("/api/models/custom", (req, res) => {
+		const providerAlias = String(req.query.providerAlias ?? "");
+		const id = String(req.query.id ?? "");
+		const type = parseModelKind(req.query.type);
+		res.json({
+			success: true,
+			models: deleteRouterCustomModel({ providerAlias, id, type }),
+		});
+	});
+	app.get("/api/models/disabled", (req, res) => {
+		const providerAlias =
+			typeof req.query.providerAlias === "string"
+				? req.query.providerAlias
+				: undefined;
+		const models = getRouterDisabledModels(providerAlias);
+		if (providerAlias) {
+			res.json({ ids: models.map((model) => model.id), models });
+			return;
+		}
+		res.json({ disabled: getRouterDisabledModelMap(), models });
+	});
+	app.post("/api/models/disabled", (req, res) => {
+		res.json({
+			success: true,
+			models: disableRouterModels({
+				ids: parseModelList(req.body?.ids) ?? [],
+				providerAlias: String(req.body?.providerAlias ?? ""),
+				reason:
+					typeof req.body?.reason === "string" ? req.body.reason : undefined,
+			}),
+		});
+	});
+	app.delete("/api/models/disabled", (req, res) => {
+		const providerAlias = String(req.query.providerAlias ?? "");
+		const id = typeof req.query.id === "string" ? req.query.id : undefined;
+		res.json({
+			success: true,
+			models: enableRouterModels({
+				ids: id ? [id] : undefined,
+				providerAlias,
+			}),
+		});
+	});
+	app.get("/api/models/availability", (_req, res) => {
+		const models = getRouterModelAvailability();
+		res.json({
+			models,
+			recent: models,
+			unavailableCount: models.filter((model) => model.status !== "available")
+				.length,
+		});
+	});
+	app.post("/api/models/availability", (req, res) => {
+		if (req.body?.action !== "clearCooldown") {
+			res.status(400).json({ error: "Invalid request" });
+			return;
+		}
+		res.json({ ok: true });
+	});
+	app.post("/api/models/test", async (req, res) => {
+		const result = await testRouterModel({
+			kind: parseModelKind(req.body?.kind),
+			model: String(req.body?.model ?? ""),
+		});
+		res.status(result.ok ? 200 : (result.status ?? 502)).json(result);
+	});
 	app.get("/api/combos", (_req, res) => {
 		res.json({
 			defaultCombos: Object.values(AGENT_COMBOS),
@@ -372,6 +461,7 @@ async function handleChatCompletions(req: Request, res: ExpressResponse) {
 		"anthropic-compatible",
 	]);
 	if (nodeTarget) {
+		if (writeDisabledModelError(res, nodeTarget)) return;
 		await handleProviderNodeChat(nodeTarget, body, req, res);
 		return;
 	}
@@ -397,6 +487,7 @@ async function handleResponses(req: Request, res: ExpressResponse) {
 		"anthropic-compatible",
 	]);
 	if (nodeTarget) {
+		if (writeDisabledModelError(res, nodeTarget)) return;
 		await handleProviderNodeResponses(nodeTarget, body, req, res);
 		return;
 	}
@@ -464,6 +555,7 @@ async function handleAnthropicMessages(req: Request, res: ExpressResponse) {
 		"anthropic-compatible",
 	]);
 	if (nodeTarget) {
+		if (writeDisabledModelError(res, nodeTarget)) return;
 		await handleProviderNodeAnthropicMessages(nodeTarget, body, req, res);
 		return;
 	}
@@ -526,6 +618,7 @@ async function handleEmbeddings(req: Request, res: ExpressResponse) {
 		await handleOpenAIProxy(req, res, "/embeddings");
 		return;
 	}
+	if (writeDisabledModelError(res, nodeTarget)) return;
 
 	const result = await fetchProviderNodeWithFallback({
 		body: withModel(body, nodeTarget.model),
@@ -928,6 +1021,187 @@ async function handleWebFetch(req: Request, res: ExpressResponse) {
 		text: text.slice(0, Number.isFinite(maxBytes) ? maxBytes : 1_000_000),
 		truncated: text.length > maxBytes,
 	});
+}
+
+export async function testRouterModel({
+	kind = "llm",
+	model,
+}: {
+	kind?: RouterModelKind;
+	model: string;
+}): Promise<RouterModelTestResult> {
+	const requestedModel = model.trim();
+	const modelKind = parseModelKind(kind);
+	const startedAtMs = Date.now();
+	const provider = inferProviderFromModel(requestedModel);
+	let method = "chat";
+
+	const finish = (result: Omit<RouterModelTestResult, "latencyMs">) => {
+		const latencyMs = Date.now() - startedAtMs;
+		recordRouterModelAvailability({
+			error: result.error,
+			httpStatus: result.status,
+			kind: result.kind,
+			latencyMs,
+			method: result.method,
+			model: result.model,
+			provider: result.provider,
+			status: result.ok ? "available" : "unavailable",
+		});
+		return { ...result, latencyMs };
+	};
+
+	if (!requestedModel) {
+		return finish({
+			ok: false,
+			model: requestedModel,
+			kind: modelKind,
+			provider,
+			status: 400,
+			error: "Model required",
+			method,
+		});
+	}
+
+	if (isModelPathDisabled(requestedModel)) {
+		return finish({
+			ok: false,
+			model: requestedModel,
+			kind: modelKind,
+			provider,
+			status: 403,
+			error: "Model is disabled in the router registry",
+			method,
+		});
+	}
+
+	try {
+		const baseUrl = `http://${GATEWAY_HOST}:${activePort}`;
+		let response: globalThis.Response;
+
+		if (modelKind === "embedding") {
+			method = "embeddings";
+			response = await fetchWithTimeout(
+				`${baseUrl}/v1/embeddings`,
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ model: requestedModel, input: "test" }),
+				},
+				15_000,
+			);
+			return finish(
+				await modelTestResultFromResponse({
+					response,
+					model: requestedModel,
+					kind: modelKind,
+					provider,
+					method,
+					validate: (data) => {
+						const embedding = (
+							(data.data as unknown[])?.[0] as JsonObject | undefined
+						)?.embedding;
+						return Array.isArray(embedding)
+							? null
+							: "Provider returned no embedding data";
+					},
+				}),
+			);
+		}
+
+		if (modelKind === "image") {
+			method = "images";
+			response = await fetchWithTimeout(
+				`${baseUrl}/v1/images/generations`,
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ model: requestedModel, prompt: "test" }),
+				},
+				15_000,
+			);
+			return finish(
+				await modelTestResultFromResponse({
+					response,
+					model: requestedModel,
+					kind: modelKind,
+					provider,
+					method,
+					validate: (data) =>
+						Array.isArray(data.data) && data.data.length > 0
+							? null
+							: "Provider returned no image data",
+				}),
+			);
+		}
+
+		if (modelKind === "stt") {
+			method = "transcriptions";
+			const form = new FormData();
+			form.append("file", createSilentWavFile(), "test.wav");
+			form.append("model", requestedModel);
+			response = await fetchWithTimeout(
+				`${baseUrl}/v1/audio/transcriptions`,
+				{
+					method: "POST",
+					body: form,
+				},
+				15_000,
+			);
+			return finish(
+				await modelTestResultFromResponse({
+					response,
+					model: requestedModel,
+					kind: modelKind,
+					provider,
+					method,
+					validate: (data) =>
+						typeof data.text === "string" && data.text.trim()
+							? null
+							: "Provider returned no transcription text",
+				}),
+			);
+		}
+
+		method = "chat";
+		response = await fetchWithTimeout(
+			`${baseUrl}/v1/chat/completions`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: requestedModel,
+					max_tokens: 16,
+					messages: [{ role: "user", content: "hi" }],
+					stream: false,
+				}),
+			},
+			15_000,
+		);
+		return finish(
+			await modelTestResultFromResponse({
+				response,
+				model: requestedModel,
+				kind: modelKind,
+				provider,
+				method,
+				validate: (data) =>
+					Array.isArray(data.choices) && data.choices.length > 0
+						? null
+						: "Provider returned no completion choices",
+			}),
+		);
+	} catch (error) {
+		return finish({
+			ok: false,
+			model: requestedModel,
+			kind: modelKind,
+			provider,
+			status: null,
+			error: getProviderNodeNetworkErrorMessage(error),
+			method,
+		});
+	}
 }
 
 export async function validateRouterProviderNode(
@@ -1517,6 +1791,221 @@ function setProviderNodeUsageLocals(
 	}
 }
 
+async function modelTestResultFromResponse({
+	kind,
+	method,
+	model,
+	provider,
+	response,
+	validate,
+}: {
+	kind: RouterModelKind;
+	method: string;
+	model: string;
+	provider: string;
+	response: globalThis.Response;
+	validate: (data: JsonObject) => string | null;
+}): Promise<Omit<RouterModelTestResult, "latencyMs">> {
+	const rawText = await response.text().catch(() => "");
+	let parsed: JsonObject = {};
+	try {
+		parsed = rawText ? (JSON.parse(rawText) as JsonObject) : {};
+	} catch {
+		parsed = {};
+	}
+
+	if (!response.ok) {
+		const detail = errorTextFromBody(parsed) || rawText;
+		return {
+			ok: false,
+			model,
+			kind,
+			provider,
+			status: response.status,
+			error: `HTTP ${response.status}${detail ? `: ${detail.slice(0, 240)}` : ""}`,
+			method,
+		};
+	}
+
+	const providerStatus = parsed.status;
+	const providerMessage =
+		stringValue(parsed.msg) ??
+		stringValue(parsed.message) ??
+		errorTextFromBody(parsed);
+	if (
+		providerStatus !== undefined &&
+		providerStatus !== null &&
+		String(providerStatus) !== "200" &&
+		String(providerStatus) !== "0" &&
+		providerMessage
+	) {
+		return {
+			ok: false,
+			model,
+			kind,
+			provider,
+			status: response.status,
+			error: `Provider status ${providerStatus}: ${providerMessage.slice(0, 240)}`,
+			method,
+		};
+	}
+
+	if (parsed.error) {
+		return {
+			ok: false,
+			model,
+			kind,
+			provider,
+			status: response.status,
+			error: (errorTextFromBody(parsed) ?? "Provider returned an error").slice(
+				0,
+				240,
+			),
+			method,
+		};
+	}
+
+	const validationError = validate(parsed);
+	return {
+		ok: !validationError,
+		model,
+		kind,
+		provider,
+		status: response.status,
+		error: validationError,
+		method,
+	};
+}
+
+function createSilentWavFile(): Blob {
+	const sampleRate = 16_000;
+	const channels = 1;
+	const bitsPerSample = 16;
+	const durationMs = 250;
+	const sampleCount = Math.max(1, Math.floor((sampleRate * durationMs) / 1000));
+	const dataSize = sampleCount * channels * (bitsPerSample / 8);
+	const buffer = new ArrayBuffer(44 + dataSize);
+	const view = new DataView(buffer);
+	const writeAscii = (offset: number, value: string) => {
+		for (let index = 0; index < value.length; index++) {
+			view.setUint8(offset + index, value.charCodeAt(index));
+		}
+	};
+
+	writeAscii(0, "RIFF");
+	view.setUint32(4, 36 + dataSize, true);
+	writeAscii(8, "WAVE");
+	writeAscii(12, "fmt ");
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, channels, true);
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true);
+	view.setUint16(32, channels * (bitsPerSample / 8), true);
+	view.setUint16(34, bitsPerSample, true);
+	writeAscii(36, "data");
+	view.setUint32(40, dataSize, true);
+
+	return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeDisabledModelError(
+	res: ExpressResponse,
+	nodeTarget: ProviderNodeTarget,
+): boolean {
+	if (!isProviderNodeTargetDisabled(nodeTarget)) return false;
+	res.status(403).json({
+		error: {
+			message: `Model ${nodeTarget.requestedModel} is disabled in the router registry.`,
+			type: "model_disabled",
+		},
+	});
+	return true;
+}
+
+function isProviderNodeTargetDisabled(nodeTarget: ProviderNodeTarget): boolean {
+	return (
+		isRouterModelDisabled(nodeTarget.node.prefix, nodeTarget.model) ||
+		isRouterModelDisabled(nodeTarget.node.id, nodeTarget.model)
+	);
+}
+
+function isModelPathDisabled(model: string): boolean {
+	const requestedModel = resolveRequestedModel(model) ?? model;
+	const nodeTarget = resolveProviderNodeTarget(requestedModel, [
+		"openai-compatible",
+		"anthropic-compatible",
+		"custom-embedding",
+	]);
+	if (nodeTarget && isProviderNodeTargetDisabled(nodeTarget)) return true;
+	return isRouterModelDisabledForModelPath(requestedModel);
+}
+
+function isRouterModelDisabledForModelPath(model: string): boolean {
+	const slashIndex = model.indexOf("/");
+	if (slashIndex <= 0 || slashIndex === model.length - 1) return false;
+	return isRouterModelDisabled(
+		model.slice(0, slashIndex),
+		model.slice(slashIndex + 1),
+	);
+}
+
+function inferProviderFromModel(model: string): string {
+	const requestedModel = resolveRequestedModel(model) ?? model;
+	const nodeTarget = resolveProviderNodeTarget(requestedModel, [
+		"openai-compatible",
+		"anthropic-compatible",
+		"custom-embedding",
+	]);
+	if (nodeTarget) return nodeTarget.node.prefix;
+	const slashIndex = requestedModel.indexOf("/");
+	if (slashIndex > 0) return requestedModel.slice(0, slashIndex);
+	const target = resolveRouterModelTarget(
+		requestedModel,
+		getResolutionOptions(),
+	);
+	return target?.provider ?? "router";
+}
+
+function errorTextFromBody(body: JsonObject): string | null {
+	const error = body.error;
+	if (typeof error === "string") return error;
+	if (error && typeof error === "object") {
+		const value = error as JsonObject;
+		return stringValue(value.message) ?? stringValue(value.error) ?? null;
+	}
+	return stringValue(body.message) ?? stringValue(body.msg) ?? null;
+}
+
+function parseCustomModelBody(value: unknown) {
+	const body = toJsonObject(value);
+	return {
+		id: typeof body.id === "string" ? body.id : "",
+		name: typeof body.name === "string" ? body.name : undefined,
+		providerAlias:
+			typeof body.providerAlias === "string" ? body.providerAlias : "",
+		type: parseModelKind(body.type),
+	};
+}
+
+function parseModelKind(value: unknown): RouterModelKind {
+	if (
+		value === "embedding" ||
+		value === "image" ||
+		value === "tts" ||
+		value === "stt" ||
+		value === "imageToText" ||
+		value === "webSearch" ||
+		value === "webFetch" ||
+		value === "video" ||
+		value === "search" ||
+		value === "other"
+	) {
+		return value;
+	}
+	return "llm";
+}
+
 function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {
 	const body = toJsonObject(value);
 	return {
@@ -2064,6 +2553,26 @@ async function fetchOpenRouterWithFallback(
 		};
 	}
 
+	const fallbackModels = target.fallbackModels.filter(
+		(model) =>
+			!isRouterModelDisabled("openrouter", model) &&
+			!isRouterModelDisabledForModelPath(model),
+	);
+	if (fallbackModels.length === 0) {
+		return {
+			ok: false,
+			status: 403,
+			body: {
+				error: {
+					message:
+						"All fallback models for this route are disabled in the router registry.",
+					type: "model_disabled",
+					models: target.fallbackModels,
+				},
+			},
+		};
+	}
+
 	const accounts = getProviderAccountCredentials("openrouter");
 	if (accounts.length === 0) {
 		return {
@@ -2085,7 +2594,7 @@ async function fetchOpenRouterWithFallback(
 		status: number;
 		text: string;
 	} | null = null;
-	for (const model of target.fallbackModels) {
+	for (const model of fallbackModels) {
 		for (const account of accounts) {
 			const upstreamBody = { ...body, model };
 			const upstream = await fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
@@ -2133,7 +2642,7 @@ async function fetchOpenRouterWithFallback(
 				message: "All OpenRouter fallback models failed.",
 				type: "upstream_error",
 				details: lastFailure,
-				models: target.fallbackModels,
+				models: fallbackModels,
 			},
 		},
 	};
@@ -2204,6 +2713,8 @@ function getResolutionOptions(): RouterModelResolutionOptions {
 	return {
 		aliases: getRouterAliases(),
 		customCombos: getRouterCustomCombos(),
+		customModels: getRouterCustomModels(),
+		disabledModels: getRouterDisabledModels(),
 		providerNodes: getRouterProviderNodes(),
 	};
 }

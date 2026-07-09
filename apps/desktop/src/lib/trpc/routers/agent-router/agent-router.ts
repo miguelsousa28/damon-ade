@@ -2,6 +2,7 @@ import { classifyFallbackError } from "@superset/shared/agent-router";
 import {
 	buildRouterDashboardSnapshot,
 	previewRouterTokenSaver,
+	ROUTER_MODEL_KINDS,
 	ROUTER_PROVIDER_KEY_IDS,
 	TOKEN_SAVER_MODES,
 } from "@superset/shared/router-control-plane";
@@ -16,6 +17,7 @@ import {
 	getAgentRouterGatewayStatus,
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
+	testRouterModel,
 	validateRouterProviderNode,
 } from "main/lib/agent-router-gateway";
 import {
@@ -23,20 +25,28 @@ import {
 	createRouterProviderNode,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
+	deleteRouterCustomModel,
 	deleteRouterProviderNode,
+	disableRouterModels,
+	enableRouterModels,
 	getRouterAliases,
 	getRouterCustomCombos,
+	getRouterCustomModels,
+	getRouterDisabledModels,
+	getRouterModelAvailability,
 	getRouterProviderNodes,
 	getRouterUsageStats,
 	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
+	upsertRouterCustomModel,
 } from "main/lib/agent-router-store";
 import { getProviderKeyStatus } from "main/lib/provider-keys";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 
 const tokenSaverModeSchema = z.enum(TOKEN_SAVER_MODES);
+const routerModelKindSchema = z.enum(ROUTER_MODEL_KINDS);
 const providerKeySchema = z.enum(ROUTER_PROVIDER_KEY_IDS);
 const providerNodeTypeSchema = z.enum([
 	"openai-compatible",
@@ -135,6 +145,65 @@ export const createAgentRouterRouter = () => {
 			.mutation(({ input }) => deleteRouterAlias(input.alias)),
 
 		customCombos: publicProcedure.query(() => getRouterCustomCombos()),
+
+		customModels: publicProcedure.query(() => getRouterCustomModels()),
+
+		upsertCustomModel: publicProcedure
+			.input(
+				z.object({
+					providerAlias: z.string().min(1),
+					id: z.string().min(1),
+					type: routerModelKindSchema.default("llm"),
+					name: z.string().optional(),
+				}),
+			)
+			.mutation(({ input }) => upsertRouterCustomModel(input)),
+
+		deleteCustomModel: publicProcedure
+			.input(
+				z.object({
+					providerAlias: z.string().min(1),
+					id: z.string().min(1),
+					type: routerModelKindSchema.default("llm"),
+				}),
+			)
+			.mutation(({ input }) => deleteRouterCustomModel(input)),
+
+		disabledModels: publicProcedure
+			.input(z.object({ providerAlias: z.string().optional() }).optional())
+			.query(({ input }) => getRouterDisabledModels(input?.providerAlias)),
+
+		disableModels: publicProcedure
+			.input(
+				z.object({
+					providerAlias: z.string().min(1),
+					ids: z.array(z.string().min(1)).min(1),
+					reason: z.string().optional(),
+				}),
+			)
+			.mutation(({ input }) => disableRouterModels(input)),
+
+		enableModels: publicProcedure
+			.input(
+				z.object({
+					providerAlias: z.string().min(1),
+					ids: z.array(z.string().min(1)).optional(),
+				}),
+			)
+			.mutation(({ input }) => enableRouterModels(input)),
+
+		modelAvailability: publicProcedure.query(() =>
+			getRouterModelAvailability(),
+		),
+
+		testModel: publicProcedure
+			.input(
+				z.object({
+					model: z.string().min(1),
+					kind: routerModelKindSchema.default("llm"),
+				}),
+			)
+			.mutation(({ input }) => testRouterModel(input)),
 
 		providerNodes: publicProcedure
 			.input(z.object({ type: providerNodeTypeSchema.optional() }).optional())

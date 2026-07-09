@@ -1,7 +1,13 @@
 import {
 	previewRouterTokenSaver,
+	ROUTER_MODEL_KINDS,
 	ROUTER_PROVIDER_KEY_IDS,
+	type RouterCustomModel,
 	type RouterDashboardSnapshot,
+	type RouterDisabledModel,
+	type RouterModelAvailabilityEntry,
+	type RouterModelKind,
+	type RouterModelTestResult,
 	type RouterProviderAccount,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
@@ -37,6 +43,7 @@ type TabId =
 	| "overview"
 	| "providers"
 	| "nodes"
+	| "models"
 	| "combos"
 	| "endpoints"
 	| "token-savers"
@@ -61,6 +68,7 @@ const TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Overview" },
 	{ id: "providers", label: "Providers" },
 	{ id: "nodes", label: "Nodes" },
+	{ id: "models", label: "Models" },
 	{ id: "combos", label: "Combos" },
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
@@ -266,6 +274,7 @@ function RouterDashboardPage() {
 					/>
 				)}
 				{activeTab === "nodes" && <NodesTab />}
+				{activeTab === "models" && <ModelsTab />}
 				{activeTab === "combos" && <CombosTab data={data} />}
 				{activeTab === "endpoints" && <EndpointsTab data={data} />}
 				{activeTab === "token-savers" && <TokenSaversTab data={data} />}
@@ -1153,6 +1162,441 @@ function ProviderNodeDiscoveryNotice({
 		<div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
 			{result.error ?? "Model discovery failed"}
 		</div>
+	);
+}
+
+function ModelsTab() {
+	const utils = electronTrpc.useUtils();
+	const customModels = electronTrpc.agentRouter.customModels.useQuery(
+		undefined,
+		{ refetchInterval: 15_000 },
+	);
+	const disabledModels = electronTrpc.agentRouter.disabledModels.useQuery(
+		undefined,
+		{ refetchInterval: 15_000 },
+	);
+	const availability = electronTrpc.agentRouter.modelAvailability.useQuery(
+		undefined,
+		{ refetchInterval: 15_000 },
+	);
+	const invalidate = () => {
+		utils.agentRouter.customModels.invalidate();
+		utils.agentRouter.disabledModels.invalidate();
+		utils.agentRouter.modelAvailability.invalidate();
+		utils.agentRouter.dashboard.invalidate();
+	};
+	const testModel = electronTrpc.agentRouter.testModel.useMutation({
+		onSuccess: () => utils.agentRouter.modelAvailability.invalidate(),
+	});
+	const upsertCustomModel =
+		electronTrpc.agentRouter.upsertCustomModel.useMutation({
+			onSuccess: invalidate,
+		});
+	const deleteCustomModel =
+		electronTrpc.agentRouter.deleteCustomModel.useMutation({
+			onSuccess: invalidate,
+		});
+	const disableModels = electronTrpc.agentRouter.disableModels.useMutation({
+		onSuccess: invalidate,
+	});
+	const enableModels = electronTrpc.agentRouter.enableModels.useMutation({
+		onSuccess: invalidate,
+	});
+
+	const [testModelId, setTestModelId] = useState("premium-coding");
+	const [testKind, setTestKind] = useState<RouterModelKind>("llm");
+	const [testResult, setTestResult] = useState<RouterModelTestResult | null>(
+		null,
+	);
+	const [customProvider, setCustomProvider] = useState("");
+	const [customId, setCustomId] = useState("");
+	const [customName, setCustomName] = useState("");
+	const [customType, setCustomType] = useState<RouterModelKind>("llm");
+	const [disabledProvider, setDisabledProvider] = useState("");
+	const [disabledIds, setDisabledIds] = useState("");
+	const [disabledReason, setDisabledReason] = useState("");
+
+	const saveCustomModel = async () => {
+		if (!customProvider.trim() || !customId.trim()) return;
+		await upsertCustomModel.mutateAsync({
+			providerAlias: customProvider.trim(),
+			id: customId.trim(),
+			type: customType,
+			name: customName.trim() || undefined,
+		});
+		setCustomProvider("");
+		setCustomId("");
+		setCustomName("");
+	};
+
+	const saveDisabledModels = async () => {
+		const ids = parseDashboardModels(disabledIds);
+		if (!disabledProvider.trim() || ids.length === 0) return;
+		await disableModels.mutateAsync({
+			providerAlias: disabledProvider.trim(),
+			ids,
+			reason: disabledReason.trim() || undefined,
+		});
+		setDisabledIds("");
+		setDisabledReason("");
+	};
+
+	const runModelTest = async () => {
+		if (!testModelId.trim()) return;
+		const result = await testModel.mutateAsync({
+			model: testModelId.trim(),
+			kind: testKind,
+		});
+		setTestResult(result);
+	};
+
+	return (
+		<section className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
+			<div className="flex flex-col gap-4">
+				<div className="rounded-lg border bg-card p-4">
+					<h2 className="text-sm font-semibold">Model test</h2>
+					<div className="mt-4 grid gap-3 md:grid-cols-[1fr_150px_auto]">
+						<input
+							value={testModelId}
+							onChange={(event) => setTestModelId(event.target.value)}
+							placeholder="premium-coding or local/qwen3-coder"
+							className="rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+						/>
+						<ModelKindSelect value={testKind} onChange={setTestKind} />
+						<button
+							type="button"
+							onClick={runModelTest}
+							disabled={testModel.isPending || !testModelId.trim()}
+							className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+						>
+							{testModel.isPending ? "Testing..." : "Test"}
+						</button>
+					</div>
+					{testResult && (
+						<div
+							className={cn(
+								"mt-3 rounded-md border px-3 py-2 text-xs",
+								testResult.ok
+									? "border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+									: "border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-300",
+							)}
+						>
+							<div className="flex flex-wrap items-center gap-2">
+								<span className="font-medium">
+									{testResult.ok ? "Available" : "Unavailable"}
+								</span>
+								<Pill>{testResult.method}</Pill>
+								<Pill>{testResult.latencyMs}ms</Pill>
+								{testResult.status && <Pill>HTTP {testResult.status}</Pill>}
+							</div>
+							{testResult.error && (
+								<div className="mt-2 text-xs">{testResult.error}</div>
+							)}
+						</div>
+					)}
+				</div>
+
+				<CustomModelsPanel
+					customId={customId}
+					customModels={customModels.data ?? []}
+					customName={customName}
+					customProvider={customProvider}
+					customType={customType}
+					deleteCustomModel={(model) =>
+						deleteCustomModel.mutate({
+							providerAlias: model.providerAlias,
+							id: model.id,
+							type: model.type,
+						})
+					}
+					isBusy={upsertCustomModel.isPending || deleteCustomModel.isPending}
+					saveCustomModel={saveCustomModel}
+					setCustomId={setCustomId}
+					setCustomName={setCustomName}
+					setCustomProvider={setCustomProvider}
+					setCustomType={setCustomType}
+				/>
+			</div>
+
+			<div className="flex flex-col gap-4">
+				<DisabledModelsPanel
+					disabledIds={disabledIds}
+					disabledModels={disabledModels.data ?? []}
+					disabledProvider={disabledProvider}
+					disabledReason={disabledReason}
+					enableModels={(providerAlias, ids) =>
+						enableModels.mutate({ providerAlias, ids })
+					}
+					isBusy={disableModels.isPending || enableModels.isPending}
+					saveDisabledModels={saveDisabledModels}
+					setDisabledIds={setDisabledIds}
+					setDisabledProvider={setDisabledProvider}
+					setDisabledReason={setDisabledReason}
+				/>
+				<ModelAvailabilityPanel availability={availability.data ?? []} />
+			</div>
+		</section>
+	);
+}
+
+function CustomModelsPanel({
+	customId,
+	customModels,
+	customName,
+	customProvider,
+	customType,
+	deleteCustomModel,
+	isBusy,
+	saveCustomModel,
+	setCustomId,
+	setCustomName,
+	setCustomProvider,
+	setCustomType,
+}: {
+	customId: string;
+	customModels: RouterCustomModel[];
+	customName: string;
+	customProvider: string;
+	customType: RouterModelKind;
+	deleteCustomModel: (model: RouterCustomModel) => void;
+	isBusy: boolean;
+	saveCustomModel: () => Promise<void>;
+	setCustomId: (value: string) => void;
+	setCustomName: (value: string) => void;
+	setCustomProvider: (value: string) => void;
+	setCustomType: (value: RouterModelKind) => void;
+}) {
+	return (
+		<div className="rounded-lg border bg-card p-4">
+			<div className="flex items-center justify-between gap-3">
+				<h2 className="text-sm font-semibold">Custom models</h2>
+				<Pill>{customModels.length} models</Pill>
+			</div>
+			<div className="mt-4 grid gap-2 md:grid-cols-[1fr_1fr_140px]">
+				<input
+					value={customProvider}
+					onChange={(event) => setCustomProvider(event.target.value)}
+					placeholder="provider alias, e.g. local"
+					className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<input
+					value={customId}
+					onChange={(event) => setCustomId(event.target.value)}
+					placeholder="model id"
+					className="rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<ModelKindSelect value={customType} onChange={setCustomType} />
+			</div>
+			<div className="mt-2 grid gap-2 md:grid-cols-[1fr_auto]">
+				<input
+					value={customName}
+					onChange={(event) => setCustomName(event.target.value)}
+					placeholder="display name"
+					className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<button
+					type="button"
+					onClick={saveCustomModel}
+					disabled={isBusy || !customProvider.trim() || !customId.trim()}
+					className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+				>
+					Save model
+				</button>
+			</div>
+			<div className="mt-4 flex flex-col gap-2">
+				{customModels.length === 0 ? (
+					<p className="text-sm text-muted-foreground">No custom models yet.</p>
+				) : (
+					customModels.map((model) => (
+						<div
+							key={`${model.providerAlias}-${model.id}-${model.type}`}
+							className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2 text-sm"
+						>
+							<div className="min-w-0">
+								<div className="truncate font-mono">
+									{model.providerAlias}/{model.id}
+								</div>
+								<div className="truncate text-xs text-muted-foreground">
+									{model.name} / {model.type}
+								</div>
+							</div>
+							<button
+								type="button"
+								onClick={() => deleteCustomModel(model)}
+								disabled={isBusy}
+								className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Delete
+							</button>
+						</div>
+					))
+				)}
+			</div>
+		</div>
+	);
+}
+
+function DisabledModelsPanel({
+	disabledIds,
+	disabledModels,
+	disabledProvider,
+	disabledReason,
+	enableModels,
+	isBusy,
+	saveDisabledModels,
+	setDisabledIds,
+	setDisabledProvider,
+	setDisabledReason,
+}: {
+	disabledIds: string;
+	disabledModels: RouterDisabledModel[];
+	disabledProvider: string;
+	disabledReason: string;
+	enableModels: (providerAlias: string, ids?: string[]) => void;
+	isBusy: boolean;
+	saveDisabledModels: () => Promise<void>;
+	setDisabledIds: (value: string) => void;
+	setDisabledProvider: (value: string) => void;
+	setDisabledReason: (value: string) => void;
+}) {
+	return (
+		<div className="rounded-lg border bg-card p-4">
+			<div className="flex items-center justify-between gap-3">
+				<h2 className="text-sm font-semibold">Disabled models</h2>
+				<Pill>{disabledModels.length} disabled</Pill>
+			</div>
+			<div className="mt-4 grid gap-2 md:grid-cols-[1fr_1fr]">
+				<input
+					value={disabledProvider}
+					onChange={(event) => setDisabledProvider(event.target.value)}
+					placeholder="provider alias or node prefix"
+					className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<input
+					value={disabledReason}
+					onChange={(event) => setDisabledReason(event.target.value)}
+					placeholder="reason"
+					className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+			</div>
+			<div className="mt-2 grid gap-2 md:grid-cols-[1fr_auto]">
+				<textarea
+					value={disabledIds}
+					onChange={(event) => setDisabledIds(event.target.value)}
+					placeholder="model ids, comma or newline separated"
+					className="min-h-20 rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<button
+					type="button"
+					onClick={saveDisabledModels}
+					disabled={isBusy || !disabledProvider.trim() || !disabledIds.trim()}
+					className="self-start rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+				>
+					Disable
+				</button>
+			</div>
+			<div className="mt-4 flex flex-col gap-2">
+				{disabledModels.length === 0 ? (
+					<p className="text-sm text-muted-foreground">No disabled models.</p>
+				) : (
+					disabledModels.map((model) => (
+						<div
+							key={`${model.providerAlias}-${model.id}`}
+							className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2 text-sm"
+						>
+							<div className="min-w-0">
+								<div className="truncate font-mono">
+									{model.providerAlias}/{model.id}
+								</div>
+								<div className="truncate text-xs text-muted-foreground">
+									{model.reason ?? "no reason"} /{" "}
+									{new Date(model.disabledAt).toLocaleString()}
+								</div>
+							</div>
+							<button
+								type="button"
+								onClick={() => enableModels(model.providerAlias, [model.id])}
+								disabled={isBusy}
+								className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+							>
+								Enable
+							</button>
+						</div>
+					))
+				)}
+			</div>
+		</div>
+	);
+}
+
+function ModelAvailabilityPanel({
+	availability,
+}: {
+	availability: RouterModelAvailabilityEntry[];
+}) {
+	return (
+		<div className="rounded-lg border bg-card">
+			<div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+				<h2 className="text-sm font-semibold">Availability history</h2>
+				<Pill>{availability.length} recent checks</Pill>
+			</div>
+			<div className="divide-y">
+				{availability.length === 0 ? (
+					<p className="p-4 text-sm text-muted-foreground">
+						No model checks yet.
+					</p>
+				) : (
+					availability.slice(0, 12).map((entry) => (
+						<div
+							key={entry.id}
+							className="grid grid-cols-[95px_1fr_90px_70px] gap-3 px-4 py-3 text-xs"
+						>
+							<span
+								className={cn(
+									entry.status === "available"
+										? "text-emerald-600 dark:text-emerald-400"
+										: "text-amber-600 dark:text-amber-400",
+								)}
+							>
+								{entry.status}
+							</span>
+							<span className="min-w-0 truncate font-mono">{entry.model}</span>
+							<span className="text-muted-foreground">{entry.method}</span>
+							<span className="text-muted-foreground">
+								{entry.latencyMs ?? 0}ms
+							</span>
+							{entry.error && (
+								<span className="col-span-4 truncate text-muted-foreground">
+									{entry.error}
+								</span>
+							)}
+						</div>
+					))
+				)}
+			</div>
+		</div>
+	);
+}
+
+function ModelKindSelect({
+	onChange,
+	value,
+}: {
+	onChange: (value: RouterModelKind) => void;
+	value: RouterModelKind;
+}) {
+	return (
+		<select
+			value={value}
+			onChange={(event) => onChange(event.target.value as RouterModelKind)}
+			className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+		>
+			{ROUTER_MODEL_KINDS.map((kind) => (
+				<option key={kind} value={kind}>
+					{kind}
+				</option>
+			))}
+		</select>
 	);
 }
 

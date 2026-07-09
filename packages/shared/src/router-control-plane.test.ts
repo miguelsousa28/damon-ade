@@ -43,6 +43,24 @@ describe("router control plane", () => {
 		const list = buildOpenAIModelList({
 			aliases: [{ alias: "fast-code", targetModel: "openrouter/z-ai/glm-5.2" }],
 			customCombos: [{ name: "my-budget-stack", models: ["glm", "minimax"] }],
+			customModels: [
+				{
+					providerAlias: "local",
+					id: "manual-model",
+					type: "llm",
+					name: "Manual Model",
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
+			disabledModels: [
+				{
+					providerAlias: "local",
+					id: "qwen3-coder",
+					reason: "cooldown",
+					disabledAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
 			providerNodes: [
 				{
 					id: "openai-compatible-chat-local",
@@ -81,7 +99,8 @@ describe("router control plane", () => {
 		expect(ids).toContain("openrouter/z-ai/glm-5.2");
 		expect(ids).toContain("fast-code");
 		expect(ids).toContain("my-budget-stack");
-		expect(ids).toContain("local/qwen3-coder");
+		expect(ids).toContain("local/manual-model");
+		expect(ids).not.toContain("local/qwen3-coder");
 		expect(ids).not.toContain("paused/claude-local");
 	});
 

@@ -7,7 +7,11 @@ import {
 } from "@superset/shared/agent-router";
 import type {
 	RouterCustomCombo,
+	RouterCustomModel,
+	RouterDisabledModel,
 	RouterModelAlias,
+	RouterModelAvailabilityEntry,
+	RouterModelKind,
 	RouterProviderAccount,
 	RouterProviderKeyId,
 	RouterProviderNode,
@@ -18,6 +22,7 @@ import { ROUTER_PROVIDER_KEY_IDS } from "@superset/shared/router-control-plane";
 import { app } from "electron";
 
 const MAX_USAGE_ENTRIES = 2000;
+const MAX_AVAILABILITY_ENTRIES = 500;
 
 export interface RouterUsageRecordInput {
 	endpoint: string;
@@ -71,6 +76,9 @@ export interface RouterUsageStats {
 export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
+	customModels: RouterCustomModel[];
+	disabledModels: RouterDisabledModel[];
+	modelAvailability: RouterModelAvailabilityEntry[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	usage: RouterUsageEntry[];
@@ -79,6 +87,9 @@ export interface RouterStoreSnapshot {
 interface RouterStoreFile {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
+	customModels: RouterCustomModel[];
+	disabledModels: RouterDisabledModel[];
+	modelAvailability: RouterModelAvailabilityEntry[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
@@ -90,6 +101,9 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 	return {
 		aliases: data.aliases,
 		customCombos: data.customCombos,
+		customModels: data.customModels,
+		disabledModels: data.disabledModels,
+		modelAvailability: data.modelAvailability,
 		providerAccounts: data.providerAccounts,
 		providerNodes: data.providerNodes,
 		usage: data.usage,
@@ -140,6 +154,202 @@ export function deleteRouterCustomCombo(name: string): RouterCustomCombo[] {
 	const next = data.customCombos.filter((entry) => entry.name !== name);
 	writeStore({ ...data, customCombos: next });
 	return next;
+}
+
+export function getRouterCustomModels(): RouterCustomModel[] {
+	return sortCustomModels(readStore().customModels);
+}
+
+export function upsertRouterCustomModel(
+	model: Partial<RouterCustomModel> & {
+		id?: string;
+		providerAlias?: string;
+		type?: RouterModelKind;
+	},
+): { added: boolean; models: RouterCustomModel[] } {
+	const data = readStore();
+	const providerAlias = model.providerAlias?.trim() ?? "";
+	const id = normalizeModelIdForProvider(providerAlias, model.id ?? "");
+	const type = normalizeModelKind(model.type);
+	const existing = data.customModels.find(
+		(entry) =>
+			entry.providerAlias === providerAlias &&
+			entry.id === id &&
+			entry.type === type,
+	);
+	const normalized = normalizeCustomModel(
+		{
+			...model,
+			id,
+			providerAlias,
+			type,
+		},
+		existing,
+	);
+	if (!normalized) throw new Error("providerAlias and id are required");
+	const next = [
+		...data.customModels.filter(
+			(entry) =>
+				!(
+					entry.providerAlias === normalized.providerAlias &&
+					entry.id === normalized.id &&
+					entry.type === normalized.type
+				),
+		),
+		normalized,
+	];
+	writeStore({ ...data, customModels: sortCustomModels(next) });
+	return { added: !existing, models: getRouterCustomModels() };
+}
+
+export function deleteRouterCustomModel({
+	id,
+	providerAlias,
+	type = "llm",
+}: {
+	id: string;
+	providerAlias: string;
+	type?: RouterModelKind;
+}): RouterCustomModel[] {
+	const provider = providerAlias.trim();
+	const normalizedId = normalizeModelIdForProvider(provider, id);
+	const data = readStore();
+	const next = data.customModels.filter(
+		(entry) =>
+			!(
+				entry.providerAlias === provider &&
+				entry.id === normalizedId &&
+				entry.type === type
+			),
+	);
+	writeStore({ ...data, customModels: sortCustomModels(next) });
+	return getRouterCustomModels();
+}
+
+export function getRouterDisabledModels(
+	providerAlias?: string,
+): RouterDisabledModel[] {
+	const disabled = readStore().disabledModels;
+	return sortDisabledModels(
+		providerAlias
+			? disabled.filter((entry) => entry.providerAlias === providerAlias)
+			: disabled,
+	);
+}
+
+export function getRouterDisabledModelMap(): Record<string, string[]> {
+	const disabled: Record<string, string[]> = {};
+	for (const entry of getRouterDisabledModels()) {
+		disabled[entry.providerAlias] = [
+			...(disabled[entry.providerAlias] ?? []),
+			entry.id,
+		];
+	}
+	return disabled;
+}
+
+export function disableRouterModels({
+	ids,
+	providerAlias,
+	reason,
+}: {
+	ids: string[];
+	providerAlias: string;
+	reason?: string | null;
+}): RouterDisabledModel[] {
+	const provider = providerAlias.trim();
+	const modelIds = Array.from(
+		new Set(
+			ids
+				.map((id) => normalizeModelIdForProvider(provider, id))
+				.filter(Boolean),
+		),
+	);
+	if (!provider || modelIds.length === 0) {
+		throw new Error("providerAlias and ids are required");
+	}
+
+	const data = readStore();
+	const now = new Date().toISOString();
+	const next = [...data.disabledModels];
+	for (const id of modelIds) {
+		const index = next.findIndex(
+			(entry) => entry.providerAlias === provider && entry.id === id,
+		);
+		if (index >= 0) {
+			next[index] = {
+				...next[index],
+				reason: reason?.trim() || next[index].reason,
+			};
+			continue;
+		}
+		next.push({
+			providerAlias: provider,
+			id,
+			reason: reason?.trim() || null,
+			disabledAt: now,
+		});
+	}
+
+	writeStore({ ...data, disabledModels: sortDisabledModels(next) });
+	return getRouterDisabledModels();
+}
+
+export function enableRouterModels({
+	ids,
+	providerAlias,
+}: {
+	ids?: string[];
+	providerAlias: string;
+}): RouterDisabledModel[] {
+	const provider = providerAlias.trim();
+	if (!provider) throw new Error("providerAlias is required");
+	const data = readStore();
+	const normalizedIds = new Set(
+		(ids ?? [])
+			.map((id) => normalizeModelIdForProvider(provider, id))
+			.filter(Boolean),
+	);
+	const removeAll = normalizedIds.size === 0;
+	const next = data.disabledModels.filter((entry) => {
+		if (entry.providerAlias !== provider) return true;
+		return !removeAll && !normalizedIds.has(entry.id);
+	});
+	writeStore({ ...data, disabledModels: sortDisabledModels(next) });
+	return getRouterDisabledModels();
+}
+
+export function isRouterModelDisabled(
+	providerAlias: string,
+	modelId: string,
+): boolean {
+	const provider = providerAlias.trim();
+	const id = normalizeModelIdForProvider(provider, modelId);
+	return readStore().disabledModels.some(
+		(entry) => entry.providerAlias === provider && entry.id === id,
+	);
+}
+
+export function getRouterModelAvailability(
+	limit = 100,
+): RouterModelAvailabilityEntry[] {
+	return readStore().modelAvailability.slice(0, Math.max(0, limit));
+}
+
+export function recordRouterModelAvailability(
+	input: Omit<RouterModelAvailabilityEntry, "id" | "checkedAt"> &
+		Partial<Pick<RouterModelAvailabilityEntry, "checkedAt" | "id">>,
+): RouterModelAvailabilityEntry {
+	const data = readStore();
+	const entry = normalizeAvailabilityEntry(input);
+	writeStore({
+		...data,
+		modelAvailability: [entry, ...data.modelAvailability].slice(
+			0,
+			MAX_AVAILABILITY_ENTRIES,
+		),
+	});
+	return entry;
 }
 
 export function getRouterProviderNodes(
@@ -511,6 +721,100 @@ function normalizeCustomCombo(combo: RouterCustomCombo): RouterCustomCombo {
 	return normalized;
 }
 
+function normalizeCustomModel(
+	model: Partial<RouterCustomModel>,
+	existing?: RouterCustomModel,
+): RouterCustomModel | null {
+	const providerAlias = model.providerAlias?.trim() ?? "";
+	const id = normalizeModelIdForProvider(providerAlias, model.id ?? "");
+	const type = normalizeModelKind(model.type);
+	if (!providerAlias || !id) return null;
+	const now = new Date().toISOString();
+	return {
+		providerAlias,
+		id,
+		type,
+		name: model.name?.trim() || existing?.name || id,
+		createdAt: existing?.createdAt ?? model.createdAt ?? now,
+		updatedAt: now,
+	};
+}
+
+function normalizeDisabledModel(
+	model: Partial<RouterDisabledModel>,
+): RouterDisabledModel | null {
+	const providerAlias = model.providerAlias?.trim() ?? "";
+	const id = normalizeModelIdForProvider(providerAlias, model.id ?? "");
+	if (!providerAlias || !id) return null;
+	return {
+		providerAlias,
+		id,
+		reason: model.reason?.trim() || null,
+		disabledAt: model.disabledAt ?? new Date().toISOString(),
+	};
+}
+
+function normalizeAvailabilityEntry(
+	entry: Partial<RouterModelAvailabilityEntry>,
+): RouterModelAvailabilityEntry {
+	const model = entry.model?.trim() || "unknown";
+	const provider = entry.provider?.trim() || inferProvider(model) || "router";
+	return {
+		id: entry.id ?? randomUUID(),
+		provider,
+		model,
+		kind: normalizeModelKind(entry.kind),
+		status:
+			entry.status === "available" ||
+			entry.status === "unavailable" ||
+			entry.status === "cooldown"
+				? entry.status
+				: "unavailable",
+		checkedAt: entry.checkedAt ?? new Date().toISOString(),
+		latencyMs:
+			typeof entry.latencyMs === "number" && Number.isFinite(entry.latencyMs)
+				? Math.max(0, Math.round(entry.latencyMs))
+				: null,
+		httpStatus:
+			typeof entry.httpStatus === "number" && Number.isFinite(entry.httpStatus)
+				? Math.round(entry.httpStatus)
+				: null,
+		error: entry.error?.trim() || null,
+		method: entry.method?.trim() || null,
+	};
+}
+
+function normalizeModelKind(value: unknown): RouterModelKind {
+	if (
+		value === "llm" ||
+		value === "embedding" ||
+		value === "image" ||
+		value === "tts" ||
+		value === "stt" ||
+		value === "imageToText" ||
+		value === "webSearch" ||
+		value === "webFetch" ||
+		value === "video" ||
+		value === "search" ||
+		value === "other"
+	) {
+		return value;
+	}
+	return "llm";
+}
+
+function normalizeModelIdForProvider(
+	providerAlias: string,
+	modelId: string,
+): string {
+	let id = modelId.trim();
+	const provider = providerAlias.trim();
+	if (provider && id.startsWith(`${provider}/`)) {
+		id = id.slice(provider.length + 1);
+	}
+	return id;
+}
+
 function normalizeProviderNode(node: RouterProviderNode): RouterProviderNode {
 	const type = isProviderNodeType(node.type) ? node.type : "openai-compatible";
 	const prefix = node.prefix.trim().replace(/^\/+|\/+$/g, "");
@@ -634,6 +938,34 @@ function readStore(): RouterStoreFile {
 			customCombos: Array.isArray(parsed.customCombos)
 				? parsed.customCombos
 				: [],
+			customModels: Array.isArray(parsed.customModels)
+				? sortCustomModels(
+						parsed.customModels
+							.map((model) =>
+								normalizeCustomModel(model as Partial<RouterCustomModel>),
+							)
+							.filter((model): model is RouterCustomModel => Boolean(model)),
+					)
+				: [],
+			disabledModels: Array.isArray(parsed.disabledModels)
+				? sortDisabledModels(
+						parsed.disabledModels
+							.map((model) =>
+								normalizeDisabledModel(model as Partial<RouterDisabledModel>),
+							)
+							.filter((model): model is RouterDisabledModel => Boolean(model)),
+					)
+				: [],
+			modelAvailability: Array.isArray(parsed.modelAvailability)
+				? parsed.modelAvailability
+						.map((entry) =>
+							normalizeAvailabilityEntry(
+								entry as Partial<RouterModelAvailabilityEntry>,
+							),
+						)
+						.filter(Boolean)
+						.slice(0, MAX_AVAILABILITY_ENTRIES)
+				: [],
 			providerAccounts: Array.isArray(parsed.providerAccounts)
 				? parsed.providerAccounts
 				: [],
@@ -666,6 +998,9 @@ function emptyStore(): RouterStoreFile {
 	return {
 		aliases: [],
 		customCombos: [],
+		customModels: [],
+		disabledModels: [],
+		modelAvailability: [],
 		providerAccounts: [],
 		providerNodes: [],
 		accountCursor: {},
@@ -743,6 +1078,25 @@ function sortAccounts(
 ): RouterProviderAccount[] {
 	return [...accounts].sort(
 		(a, b) => a.priority - b.priority || a.name.localeCompare(b.name),
+	);
+}
+
+function sortCustomModels(models: RouterCustomModel[]): RouterCustomModel[] {
+	return [...models].sort(
+		(a, b) =>
+			a.providerAlias.localeCompare(b.providerAlias) ||
+			a.id.localeCompare(b.id) ||
+			a.type.localeCompare(b.type),
+	);
+}
+
+function sortDisabledModels(
+	models: RouterDisabledModel[],
+): RouterDisabledModel[] {
+	return [...models].sort(
+		(a, b) =>
+			a.providerAlias.localeCompare(b.providerAlias) ||
+			a.id.localeCompare(b.id),
 	);
 }
 

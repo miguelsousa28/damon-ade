@@ -102,6 +102,8 @@ export interface OpenAIModelEntry {
 	id: string;
 	object: "model";
 	owned_by: string;
+	kind?: RouterModelKind;
+	name?: string;
 }
 
 export interface OpenAIModelList {
@@ -132,6 +134,67 @@ export interface RouterCustomCombo {
 	models: string[];
 }
 
+export const ROUTER_MODEL_KINDS = [
+	"llm",
+	"embedding",
+	"image",
+	"tts",
+	"stt",
+	"imageToText",
+	"webSearch",
+	"webFetch",
+	"video",
+	"search",
+	"other",
+] as const;
+
+export type RouterModelKind = (typeof ROUTER_MODEL_KINDS)[number];
+
+export interface RouterCustomModel {
+	providerAlias: string;
+	id: string;
+	type: RouterModelKind;
+	name: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface RouterDisabledModel {
+	providerAlias: string;
+	id: string;
+	reason: string | null;
+	disabledAt: string;
+}
+
+export type RouterModelAvailabilityStatus =
+	| "available"
+	| "unavailable"
+	| "cooldown";
+
+export interface RouterModelAvailabilityEntry {
+	id: string;
+	provider: string;
+	model: string;
+	kind: RouterModelKind;
+	status: RouterModelAvailabilityStatus;
+	checkedAt: string;
+	latencyMs: number | null;
+	httpStatus: number | null;
+	error: string | null;
+	method: string | null;
+}
+
+export interface RouterModelTestResult {
+	ok: boolean;
+	model: string;
+	kind: RouterModelKind;
+	provider: string;
+	status: number | null;
+	latencyMs: number;
+	error: string | null;
+	method: string;
+}
+
 export type RouterProviderNodeType =
 	| "openai-compatible"
 	| "anthropic-compatible"
@@ -157,6 +220,8 @@ export interface RouterProviderNode {
 export interface RouterModelResolutionOptions {
 	aliases?: RouterModelAlias[];
 	customCombos?: RouterCustomCombo[];
+	customModels?: RouterCustomModel[];
+	disabledModels?: RouterDisabledModel[];
 	providerNodes?: RouterProviderNode[];
 }
 
@@ -459,6 +524,34 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		status: "gateway-live",
 	},
 	{
+		path: "/api/models/test",
+		method: "POST",
+		compatibility: "Router",
+		capability: "Per-model ping checks",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/models/availability",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Recent model availability history",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/models/custom",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Custom model registry",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/models/disabled",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Disabled model registry",
+		status: "gateway-live",
+	},
+	{
 		path: "/v1/compress",
 		method: "POST",
 		compatibility: "Router",
@@ -554,6 +647,13 @@ export const ROUTER_FEATURES: RouterFeature[] = [
 			"Custom OpenAI-compatible, Anthropic-compatible, and embedding nodes route by prefix with validation and model import.",
 	},
 	{
+		id: "model-registry",
+		label: "Model registry",
+		status: "active",
+		description:
+			"9router-style custom models, disabled models, per-model pings, and availability history.",
+	},
+	{
 		id: "fallback-classifier",
 		label: "Fallback classifier",
 		status: "router-core",
@@ -636,12 +736,18 @@ export function buildRouterDashboardSnapshot({
 export function buildOpenAIModelList({
 	aliases = [],
 	customCombos = [],
+	customModels = [],
+	disabledModels = [],
 	providerNodes = [],
 }: RouterModelResolutionOptions = {}): OpenAIModelList {
 	const entries: OpenAIModelEntry[] = [];
-	const add = (id: string, ownedBy: string) => {
+	const add = (
+		id: string,
+		ownedBy: string,
+		metadata: Partial<Pick<OpenAIModelEntry, "kind" | "name">> = {},
+	) => {
 		if (entries.some((entry) => entry.id === id)) return;
-		entries.push({ id, object: "model", owned_by: ownedBy });
+		entries.push({ id, object: "model", owned_by: ownedBy, ...metadata });
 	};
 
 	for (const combo of Object.values(AGENT_COMBOS)) {
@@ -661,6 +767,7 @@ export function buildOpenAIModelList({
 
 	for (const provider of ROUTER_PROVIDER_CATALOG) {
 		for (const model of provider.defaultModels) {
+			if (isRouterModelDisabled(disabledModels, provider.id, model)) continue;
 			add(`${provider.id}/${model}`, provider.id);
 		}
 	}
@@ -673,9 +780,25 @@ export function buildOpenAIModelList({
 		add(combo.name, "custom-combo");
 	}
 
+	for (const model of customModels) {
+		if (isRouterModelDisabled(disabledModels, model.providerAlias, model.id)) {
+			continue;
+		}
+		add(`${model.providerAlias}/${model.id}`, model.providerAlias, {
+			kind: model.type,
+			name: model.name,
+		});
+	}
+
 	for (const node of providerNodes) {
 		if (!node.isActive) continue;
 		for (const model of node.models) {
+			if (
+				isRouterModelDisabled(disabledModels, node.prefix, model) ||
+				isRouterModelDisabled(disabledModels, node.id, model)
+			) {
+				continue;
+			}
 			add(`${node.prefix}/${model}`, node.id || node.prefix);
 		}
 	}
@@ -684,6 +807,18 @@ export function buildOpenAIModelList({
 		object: "list",
 		data: entries.sort((a, b) => a.id.localeCompare(b.id)),
 	};
+}
+
+export function isRouterModelDisabled(
+	disabledModels: RouterDisabledModel[] | undefined,
+	providerAlias: string,
+	modelId: string,
+): boolean {
+	return Boolean(
+		disabledModels?.some(
+			(entry) => entry.providerAlias === providerAlias && entry.id === modelId,
+		),
+	);
 }
 
 export function resolveRouterModelTarget(
