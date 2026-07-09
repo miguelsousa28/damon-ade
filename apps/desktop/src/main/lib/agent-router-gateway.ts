@@ -7,6 +7,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { connect as netConnect } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -29,6 +30,9 @@ import {
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
+	type RouterProxyPool,
+	type RouterProxyPoolTestResult,
+	type RouterProxyPoolType,
 	type RouterTokenSaverMode,
 	resolveRouterModelTarget,
 	routerModelKindsForSlug,
@@ -53,10 +57,12 @@ import {
 import {
 	clearRouterUsage,
 	createRouterProviderNode,
+	createRouterProxyPool,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
 	deleteRouterCustomModel,
 	deleteRouterProviderNode,
+	deleteRouterProxyPool,
 	disableRouterModels,
 	enableRouterModels,
 	estimateTokens,
@@ -70,6 +76,8 @@ import {
 	getRouterModelAvailability,
 	getRouterPricing,
 	getRouterProviderNodes,
+	getRouterProxyPoolById,
+	getRouterProxyPools,
 	getRouterUsageChart,
 	getRouterUsageCompatStats,
 	getRouterUsageLogs,
@@ -83,6 +91,7 @@ import {
 	setRouterMitmAliases,
 	updateRouterPricing,
 	updateRouterProviderNode,
+	updateRouterProxyPool,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 	upsertRouterCustomModel,
@@ -729,6 +738,103 @@ function createAgentRouterGatewayApp() {
 		} catch (error) {
 			res.status(400).json({ error: errorMessage(error) });
 		}
+	});
+	app.get("/api/proxy-pools", (req, res) => {
+		const isActive = booleanQuery(req.query.isActive);
+		const includeUsage = req.query.includeUsage === "true";
+		const proxyPools = getRouterProxyPools(
+			isActive === undefined ? {} : { isActive },
+		).map((pool) => ({
+			...pool,
+			...(includeUsage ? { boundConnectionCount: 0 } : {}),
+		}));
+		res.json({ proxyPools });
+	});
+	app.post("/api/proxy-pools", (req, res) => {
+		try {
+			const proxyPool = createRouterProxyPool(parseProxyPoolBody(req.body));
+			res.status(201).json({ proxyPool });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.post("/api/proxy-pools/vercel-deploy", (req, res) => {
+		try {
+			const proxyPool = createRelayProxyPoolFromBody(req.body, "vercel");
+			res.status(201).json({ proxyPool, deployUrl: proxyPool.proxyUrl });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.post("/api/proxy-pools/cloudflare-deploy", (req, res) => {
+		try {
+			const proxyPool = createRelayProxyPoolFromBody(req.body, "cloudflare");
+			res.status(201).json({ proxyPool, deployUrl: proxyPool.proxyUrl });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.post("/api/proxy-pools/deno-deploy", (req, res) => {
+		try {
+			const proxyPool = createRelayProxyPoolFromBody(req.body, "deno");
+			res.status(201).json({ proxyPool, deployUrl: proxyPool.proxyUrl });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.get("/api/proxy-pools/:id", (req, res) => {
+		const proxyPool = getRouterProxyPoolById(req.params.id);
+		if (!proxyPool) {
+			res.status(404).json({ error: "Proxy pool not found" });
+			return;
+		}
+		res.json({ proxyPool });
+	});
+	app.put("/api/proxy-pools/:id", (req, res) => {
+		const existing = getRouterProxyPoolById(req.params.id);
+		if (!existing) {
+			res.status(404).json({ error: "Proxy pool not found" });
+			return;
+		}
+		try {
+			const proxyPool = updateRouterProxyPool(
+				req.params.id,
+				parseProxyPoolUpdateBody(req.body),
+			);
+			res.json({ proxyPool });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.delete("/api/proxy-pools/:id", (req, res) => {
+		const deleted = deleteRouterProxyPool(req.params.id);
+		if (!deleted) {
+			res.status(404).json({ error: "Proxy pool not found" });
+			return;
+		}
+		res.json({ success: true });
+	});
+	app.post("/api/proxy-pools/:id/test", async (req, res) => {
+		const proxyPool = getRouterProxyPoolById(req.params.id);
+		if (!proxyPool) {
+			res.status(404).json({ error: "Proxy pool not found" });
+			return;
+		}
+		const result = await testRouterProxyPool(proxyPool, {
+			testUrl:
+				typeof req.body?.testUrl === "string" ? req.body.testUrl : undefined,
+			timeoutMs:
+				typeof req.body?.timeoutMs === "number"
+					? req.body.timeoutMs
+					: undefined,
+		});
+		updateRouterProxyPool(proxyPool.id, {
+			isActive: result.ok,
+			lastError: result.error,
+			lastTestedAt: result.testedAt,
+			testStatus: result.ok ? "active" : "error",
+		});
+		res.status(result.ok ? 200 : 502).json(result);
 	});
 	app.get("/api/provider-nodes", (_req, res) => {
 		res.json({ nodes: getRouterProviderNodes() });
@@ -2652,8 +2758,262 @@ function stringQuery(value: unknown): string | null {
 	return null;
 }
 
+function booleanQuery(value: unknown): boolean | undefined {
+	if (value === "true") return true;
+	if (value === "false") return false;
+	return undefined;
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function parseProxyPoolBody(value: unknown): Partial<RouterProxyPool> {
+	const body = toJsonObject(value);
+	return {
+		name: typeof body.name === "string" ? body.name : "",
+		proxyUrl: typeof body.proxyUrl === "string" ? body.proxyUrl : "",
+		noProxy: typeof body.noProxy === "string" ? body.noProxy : "",
+		isActive: typeof body.isActive === "boolean" ? body.isActive : true,
+		strictProxy:
+			typeof body.strictProxy === "boolean" ? body.strictProxy : false,
+		type: parseProxyPoolType(body.type),
+	};
+}
+
+function parseProxyPoolUpdateBody(value: unknown): Partial<RouterProxyPool> {
+	const body = toJsonObject(value);
+	const updates: Partial<RouterProxyPool> = {};
+	if (Object.hasOwn(body, "name")) {
+		updates.name = typeof body.name === "string" ? body.name : "";
+	}
+	if (Object.hasOwn(body, "proxyUrl")) {
+		updates.proxyUrl = typeof body.proxyUrl === "string" ? body.proxyUrl : "";
+	}
+	if (Object.hasOwn(body, "noProxy")) {
+		updates.noProxy = typeof body.noProxy === "string" ? body.noProxy : "";
+	}
+	if (Object.hasOwn(body, "isActive")) {
+		updates.isActive = body.isActive === true;
+	}
+	if (Object.hasOwn(body, "strictProxy")) {
+		updates.strictProxy = body.strictProxy === true;
+	}
+	if (Object.hasOwn(body, "type")) {
+		updates.type = parseProxyPoolType(body.type);
+	}
+	return updates;
+}
+
+function parseProxyPoolType(value: unknown): RouterProxyPoolType {
+	if (
+		value === "vercel" ||
+		value === "cloudflare" ||
+		value === "deno" ||
+		value === "http"
+	) {
+		return value;
+	}
+	return "http";
+}
+
+function createRelayProxyPoolFromBody(
+	value: unknown,
+	type: Exclude<RouterProxyPoolType, "http">,
+): RouterProxyPool {
+	const body = toJsonObject(value);
+	const proxyUrl =
+		typeof body.deployUrl === "string" && body.deployUrl.trim()
+			? body.deployUrl
+			: typeof body.proxyUrl === "string"
+				? body.proxyUrl
+				: "";
+	if (!proxyUrl.trim()) {
+		throw new Error(
+			`Automatic ${type} deployment is not bundled yet. Provide deployUrl/proxyUrl for an existing relay.`,
+		);
+	}
+	return createRouterProxyPool({
+		name:
+			typeof body.projectName === "string" && body.projectName.trim()
+				? body.projectName
+				: typeof body.name === "string"
+					? body.name
+					: `${type}-relay`,
+		proxyUrl,
+		type,
+		noProxy: "",
+		isActive: true,
+		strictProxy: false,
+	});
+}
+
+export async function testRouterProxyPool(
+	proxyPool: RouterProxyPool,
+	options: { testUrl?: string; timeoutMs?: number } = {},
+): Promise<RouterProxyPoolTestResult> {
+	const testedAt = new Date().toISOString();
+	const startedAt = Date.now();
+	const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
+	try {
+		const result =
+			proxyPool.type === "http"
+				? await testHttpProxyUrl({
+						proxyUrl: proxyPool.proxyUrl,
+						testUrl: options.testUrl,
+						timeoutMs,
+					})
+				: await testRelayProxyUrl({
+						relayUrl: proxyPool.proxyUrl,
+						timeoutMs,
+					});
+		return {
+			ok: result.ok,
+			status: result.status,
+			statusText: result.statusText ?? null,
+			error: result.error ?? null,
+			elapsedMs: result.elapsedMs ?? Date.now() - startedAt,
+			testedAt,
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			status: 500,
+			statusText: null,
+			error: errorMessage(error),
+			elapsedMs: Date.now() - startedAt,
+			testedAt,
+		};
+	}
+}
+
+async function testRelayProxyUrl({
+	relayUrl,
+	timeoutMs,
+}: {
+	relayUrl: string;
+	timeoutMs: number;
+}) {
+	const startedAt = Date.now();
+	const response = await fetchWithTimeout(
+		relayUrl,
+		{
+			method: "GET",
+			headers: {
+				"x-relay-target": "https://httpbin.org",
+				"x-relay-path": "/get",
+			},
+		},
+		timeoutMs,
+	);
+	return {
+		ok: response.ok,
+		status: response.status,
+		statusText: response.statusText,
+		elapsedMs: Date.now() - startedAt,
+		error: response.ok
+			? null
+			: `Relay test failed with status ${response.status}`,
+	};
+}
+
+function testHttpProxyUrl({
+	proxyUrl,
+	testUrl,
+	timeoutMs,
+}: {
+	proxyUrl: string;
+	testUrl?: string;
+	timeoutMs: number;
+}): Promise<{
+	ok: boolean;
+	status: number;
+	statusText?: string;
+	elapsedMs: number;
+	error?: string | null;
+}> {
+	const startedAt = Date.now();
+	let proxy: URL;
+	try {
+		proxy = new URL(proxyUrl);
+	} catch (error) {
+		return Promise.resolve({
+			ok: false,
+			status: 400,
+			error: `Invalid proxy URL: ${errorMessage(error)}`,
+			elapsedMs: Date.now() - startedAt,
+		});
+	}
+	if (proxy.protocol !== "http:") {
+		return Promise.resolve({
+			ok: false,
+			status: 400,
+			error: "Only http:// proxy URLs are supported by the embedded tester.",
+			elapsedMs: Date.now() - startedAt,
+		});
+	}
+
+	const target = new URL(testUrl?.trim() || "http://example.com/");
+	const port = Number(proxy.port || 80);
+
+	return new Promise((resolve) => {
+		let settled = false;
+		let buffer = "";
+		const settle = (
+			result: Omit<Awaited<ReturnType<typeof testHttpProxyUrl>>, "elapsedMs">,
+		) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			resolve({ ...result, elapsedMs: Date.now() - startedAt });
+		};
+		const socket = netConnect({ host: proxy.hostname, port });
+		const timeout = setTimeout(() => {
+			settle({ ok: false, status: 500, error: "Proxy test timed out" });
+		}, timeoutMs);
+		socket.on("connect", () => {
+			const headers = [
+				`HEAD ${target.href} HTTP/1.1`,
+				`Host: ${target.host}`,
+				"Connection: close",
+				"User-Agent: ADE-router",
+			];
+			if (proxy.username || proxy.password) {
+				headers.push(
+					`Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64")}`,
+				);
+			}
+			socket.write(`${headers.join("\r\n")}\r\n\r\n`);
+		});
+		socket.on("data", (chunk) => {
+			buffer += chunk.toString("utf8");
+			const line = buffer.split(/\r?\n/, 1)[0];
+			const match = /^HTTP\/\d(?:\.\d)?\s+(\d+)\s*(.*)$/i.exec(line);
+			if (!match) return;
+			clearTimeout(timeout);
+			const status = Number(match[1]);
+			settle({
+				ok: status >= 200 && status < 400,
+				status,
+				statusText: match[2] || undefined,
+				error:
+					status >= 200 && status < 400
+						? null
+						: `Proxy test failed with status ${status}`,
+			});
+		});
+		socket.on("error", (error) => {
+			clearTimeout(timeout);
+			settle({ ok: false, status: 500, error: errorMessage(error) });
+		});
+		socket.on("close", () => clearTimeout(timeout));
+	});
+}
+
+function normalizeTimeoutMs(value: unknown): number {
+	const numeric = Number(value);
+	if (!Number.isFinite(numeric) || numeric <= 0) return 8_000;
+	return Math.min(Math.round(numeric), 30_000);
 }
 
 function buildCliToolStatuses(): Record<CliToolId, JsonObject> {

@@ -2,6 +2,7 @@ import {
 	previewRouterTokenSaver,
 	ROUTER_MODEL_KINDS,
 	ROUTER_PROVIDER_KEY_IDS,
+	ROUTER_PROXY_POOL_TYPES,
 	type RouterCustomModel,
 	type RouterDashboardSnapshot,
 	type RouterDisabledModel,
@@ -13,6 +14,8 @@ import {
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
+	type RouterProxyPool,
+	type RouterProxyPoolType,
 	type RouterTokenSaverMode,
 } from "@superset/shared/router-control-plane";
 import { cn } from "@superset/ui/utils";
@@ -46,6 +49,7 @@ type TabId =
 	| "nodes"
 	| "models"
 	| "pricing"
+	| "proxies"
 	| "combos"
 	| "endpoints"
 	| "token-savers"
@@ -72,6 +76,7 @@ const TABS: { id: TabId; label: string }[] = [
 	{ id: "nodes", label: "Nodes" },
 	{ id: "models", label: "Models" },
 	{ id: "pricing", label: "Pricing" },
+	{ id: "proxies", label: "Proxies" },
 	{ id: "combos", label: "Combos" },
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
@@ -279,6 +284,7 @@ function RouterDashboardPage() {
 				{activeTab === "nodes" && <NodesTab />}
 				{activeTab === "models" && <ModelsTab />}
 				{activeTab === "pricing" && <PricingTab />}
+				{activeTab === "proxies" && <ProxiesTab />}
 				{activeTab === "combos" && <CombosTab data={data} />}
 				{activeTab === "endpoints" && <EndpointsTab data={data} />}
 				{activeTab === "token-savers" && <TokenSaversTab data={data} />}
@@ -1775,6 +1781,228 @@ function PricingTab() {
 								<span>{formatPricingValue(row.input)}</span>
 								<span>{formatPricingValue(row.output)}</span>
 								<span>{formatPricingValue(row.cached)}</span>
+							</div>
+						))
+					)}
+				</div>
+			</div>
+		</section>
+	);
+}
+
+function ProxiesTab() {
+	const utils = electronTrpc.useUtils();
+	const proxyPools = electronTrpc.agentRouter.proxyPools.useQuery(undefined, {
+		refetchInterval: 15_000,
+	});
+	const createProxyPool = electronTrpc.agentRouter.createProxyPool.useMutation({
+		onSuccess: () => utils.agentRouter.proxyPools.invalidate(),
+	});
+	const updateProxyPool = electronTrpc.agentRouter.updateProxyPool.useMutation({
+		onSuccess: () => utils.agentRouter.proxyPools.invalidate(),
+	});
+	const deleteProxyPool = electronTrpc.agentRouter.deleteProxyPool.useMutation({
+		onSuccess: () => utils.agentRouter.proxyPools.invalidate(),
+	});
+	const testProxyPool = electronTrpc.agentRouter.testProxyPool.useMutation({
+		onSuccess: () => utils.agentRouter.proxyPools.invalidate(),
+	});
+	const [name, setName] = useState("Local proxy");
+	const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:7890");
+	const [noProxy, setNoProxy] = useState("localhost,127.0.0.1");
+	const [type, setType] = useState<RouterProxyPoolType>("http");
+	const [strictProxy, setStrictProxy] = useState(false);
+	const [lastResult, setLastResult] = useState<{
+		id: string;
+		ok: boolean;
+		error: string | null;
+		elapsedMs: number;
+	} | null>(null);
+
+	const save = async () => {
+		if (!name.trim() || !proxyUrl.trim()) return;
+		await createProxyPool.mutateAsync({
+			name: name.trim(),
+			proxyUrl: proxyUrl.trim(),
+			noProxy: noProxy.trim(),
+			type,
+			isActive: true,
+			strictProxy,
+		});
+	};
+
+	const testPool = async (pool: RouterProxyPool) => {
+		const result = await testProxyPool.mutateAsync({ id: pool.id });
+		setLastResult({
+			id: pool.id,
+			ok: result.ok,
+			error: result.error,
+			elapsedMs: result.elapsedMs,
+		});
+	};
+
+	return (
+		<section className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+			<div className="rounded-lg border bg-card p-4">
+				<div className="flex items-center justify-between gap-3">
+					<div>
+						<h2 className="text-sm font-semibold">Proxy pool</h2>
+						<p className="mt-1 text-xs text-muted-foreground">
+							HTTP proxies and relay URLs compatible with the 9router proxy-pool
+							API.
+						</p>
+					</div>
+					<Pill>{proxyPools.data?.length ?? 0} pools</Pill>
+				</div>
+
+				<div className="mt-4 grid gap-3">
+					<label className="flex flex-col gap-1 text-xs font-medium">
+						Name
+						<input
+							value={name}
+							onChange={(event) => setName(event.target.value)}
+							className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+						/>
+					</label>
+					<label className="flex flex-col gap-1 text-xs font-medium">
+						Proxy URL
+						<input
+							value={proxyUrl}
+							onChange={(event) => setProxyUrl(event.target.value)}
+							className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							placeholder="http://127.0.0.1:7890 or relay URL"
+						/>
+					</label>
+					<div className="grid gap-3 sm:grid-cols-2">
+						<label className="flex flex-col gap-1 text-xs font-medium">
+							Type
+							<select
+								value={type}
+								onChange={(event) =>
+									setType(event.target.value as RouterProxyPoolType)
+								}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							>
+								{ROUTER_PROXY_POOL_TYPES.map((poolType) => (
+									<option key={poolType} value={poolType}>
+										{poolType}
+									</option>
+								))}
+							</select>
+						</label>
+						<label className="flex flex-col gap-1 text-xs font-medium">
+							No proxy
+							<input
+								value={noProxy}
+								onChange={(event) => setNoProxy(event.target.value)}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							/>
+						</label>
+					</div>
+					<label className="flex items-center gap-2 text-xs text-muted-foreground">
+						<input
+							type="checkbox"
+							checked={strictProxy}
+							onChange={(event) => setStrictProxy(event.target.checked)}
+						/>
+						Strict proxy for future provider bindings
+					</label>
+					<button
+						type="button"
+						onClick={save}
+						disabled={
+							createProxyPool.isPending || !name.trim() || !proxyUrl.trim()
+						}
+						className="rounded-md bg-foreground px-3 py-2 text-sm text-background disabled:opacity-50"
+					>
+						Add proxy pool
+					</button>
+					{lastResult && (
+						<div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+							Last test: {lastResult.ok ? "ok" : "failed"} in{" "}
+							{lastResult.elapsedMs}ms
+							{lastResult.error ? ` - ${lastResult.error}` : ""}
+						</div>
+					)}
+				</div>
+			</div>
+
+			<div className="rounded-lg border bg-card">
+				<div className="grid grid-cols-[100px_1fr_90px_90px_150px] gap-3 border-b px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+					<span>Status</span>
+					<span>Proxy</span>
+					<span>Type</span>
+					<span>Active</span>
+					<span>Actions</span>
+				</div>
+				<div className="divide-y">
+					{proxyPools.isLoading ? (
+						<p className="px-4 py-3 text-sm text-muted-foreground">
+							Loading proxy pools...
+						</p>
+					) : (proxyPools.data ?? []).length === 0 ? (
+						<p className="px-4 py-3 text-sm text-muted-foreground">
+							No proxy pools configured.
+						</p>
+					) : (
+						(proxyPools.data ?? []).map((pool) => (
+							<div
+								key={pool.id}
+								className="grid grid-cols-[100px_1fr_90px_90px_150px] gap-3 px-4 py-3 text-xs"
+							>
+								<span
+									className={cn(
+										pool.testStatus === "active"
+											? "text-emerald-600 dark:text-emerald-400"
+											: pool.testStatus === "error"
+												? "text-amber-600 dark:text-amber-400"
+												: "text-muted-foreground",
+									)}
+								>
+									{pool.testStatus}
+								</span>
+								<div className="min-w-0">
+									<div className="truncate font-medium">{pool.name}</div>
+									<div className="truncate font-mono text-muted-foreground">
+										{pool.proxyUrl}
+									</div>
+									{pool.lastError && (
+										<div className="truncate text-muted-foreground">
+											{pool.lastError}
+										</div>
+									)}
+								</div>
+								<span>{pool.type}</span>
+								<button
+									type="button"
+									onClick={() =>
+										updateProxyPool.mutate({
+											id: pool.id,
+											isActive: !pool.isActive,
+										})
+									}
+									className="text-left text-muted-foreground hover:text-foreground"
+								>
+									{pool.isActive ? "on" : "off"}
+								</button>
+								<div className="flex flex-wrap gap-2">
+									<button
+										type="button"
+										onClick={() => testPool(pool)}
+										disabled={testProxyPool.isPending}
+										className="rounded-md border px-2 py-1 text-xs enabled:hover:bg-muted disabled:opacity-50"
+									>
+										Test
+									</button>
+									<button
+										type="button"
+										onClick={() => deleteProxyPool.mutate({ id: pool.id })}
+										disabled={deleteProxyPool.isPending}
+										className="rounded-md border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+									>
+										Delete
+									</button>
+								</div>
 							</div>
 						))
 					)}

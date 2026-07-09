@@ -252,6 +252,42 @@ export type RouterPricingTable = Record<
 	Record<string, RouterPricingRate>
 >;
 
+export const ROUTER_PROXY_POOL_TYPES = [
+	"http",
+	"vercel",
+	"cloudflare",
+	"deno",
+] as const;
+
+export type RouterProxyPoolType = (typeof ROUTER_PROXY_POOL_TYPES)[number];
+
+export type RouterProxyPoolTestStatus = "unknown" | "active" | "error";
+
+export interface RouterProxyPool {
+	id: string;
+	name: string;
+	proxyUrl: string;
+	noProxy: string;
+	type: RouterProxyPoolType;
+	isActive: boolean;
+	strictProxy: boolean;
+	testStatus: RouterProxyPoolTestStatus;
+	lastTestedAt: string | null;
+	lastError: string | null;
+	createdAt: string;
+	updatedAt: string;
+	boundConnectionCount?: number;
+}
+
+export interface RouterProxyPoolTestResult {
+	ok: boolean;
+	status: number;
+	statusText: string | null;
+	error: string | null;
+	elapsedMs: number;
+	testedAt: string;
+}
+
 export type RouterProviderNodeType =
 	| "openai-compatible"
 	| "anthropic-compatible"
@@ -610,6 +646,20 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		status: "gateway-live",
 	},
 	{
+		path: "/api/proxy-pools",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Proxy pool registry",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/proxy-pools/{id}/test",
+		method: "POST",
+		compatibility: "Router",
+		capability: "Proxy and relay connectivity test",
+		status: "gateway-live",
+	},
+	{
 		path: "/api/provider-nodes/validate",
 		method: "POST",
 		compatibility: "Router",
@@ -794,6 +844,13 @@ export const ROUTER_FEATURES: RouterFeature[] = [
 		status: "active",
 		description:
 			"9router-style status/config endpoints for Codex, Claude, Cline, and MITM alias mappings.",
+	},
+	{
+		id: "proxy-pools",
+		label: "Proxy pools",
+		status: "active",
+		description:
+			"9router-style HTTP and relay proxy pool registry with connectivity testing.",
 	},
 	{
 		id: "fallback-classifier",

@@ -19,6 +19,9 @@ import type {
 	RouterProviderNode,
 	RouterProviderNodeApiType,
 	RouterProviderNodeType,
+	RouterProxyPool,
+	RouterProxyPoolTestStatus,
+	RouterProxyPoolType,
 } from "@superset/shared/router-control-plane";
 import { ROUTER_PROVIDER_KEY_IDS } from "@superset/shared/router-control-plane";
 import { app } from "electron";
@@ -147,6 +150,7 @@ export interface RouterStoreSnapshot {
 	mitmAliases: Record<string, Record<string, string>>;
 	modelAvailability: RouterModelAvailabilityEntry[];
 	pricing: RouterPricingTable;
+	proxyPools: RouterProxyPool[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	usage: RouterUsageEntry[];
@@ -160,6 +164,7 @@ interface RouterStoreFile {
 	mitmAliases: Record<string, Record<string, string>>;
 	modelAvailability: RouterModelAvailabilityEntry[];
 	pricing: RouterPricingTable;
+	proxyPools: RouterProxyPool[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
@@ -176,6 +181,7 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 		mitmAliases: data.mitmAliases,
 		modelAvailability: data.modelAvailability,
 		pricing: getRouterPricing(data.pricing),
+		proxyPools: getRouterProxyPools(undefined, data.proxyPools),
 		providerAccounts: data.providerAccounts,
 		providerNodes: data.providerNodes,
 		usage: data.usage,
@@ -294,6 +300,100 @@ export function resetRouterPricing({
 
 	writeStore({ ...data, pricing: next });
 	return getRouterPricing();
+}
+
+export function getRouterProxyPools(
+	filter: { isActive?: boolean; testStatus?: RouterProxyPoolTestStatus } = {},
+	source = readStore().proxyPools,
+): RouterProxyPool[] {
+	return sortProxyPools(
+		source
+			.filter((pool) =>
+				filter.isActive === undefined
+					? true
+					: pool.isActive === filter.isActive,
+			)
+			.filter((pool) =>
+				filter.testStatus ? pool.testStatus === filter.testStatus : true,
+			),
+	);
+}
+
+export function getRouterProxyPoolById(id: string): RouterProxyPool | null {
+	return readStore().proxyPools.find((pool) => pool.id === id) ?? null;
+}
+
+export function createRouterProxyPool(
+	input: Omit<Partial<RouterProxyPool>, "createdAt" | "updatedAt"> & {
+		name?: string;
+		proxyUrl?: string;
+	},
+): RouterProxyPool {
+	const data = readStore();
+	const now = new Date().toISOString();
+	const pool = normalizeProxyPool({
+		id: input.id ?? randomUUID(),
+		name: input.name ?? "",
+		proxyUrl: input.proxyUrl ?? "",
+		noProxy: input.noProxy ?? "",
+		type: normalizeProxyPoolType(input.type),
+		isActive: input.isActive ?? true,
+		strictProxy: input.strictProxy === true,
+		testStatus: normalizeProxyPoolTestStatus(input.testStatus),
+		lastTestedAt: input.lastTestedAt ?? null,
+		lastError: input.lastError ?? null,
+		createdAt: now,
+		updatedAt: now,
+	});
+	writeStore({
+		...data,
+		proxyPools: sortProxyPools([...data.proxyPools, pool]),
+	});
+	return pool;
+}
+
+export function updateRouterProxyPool(
+	id: string,
+	updates: Partial<
+		Pick<
+			RouterProxyPool,
+			| "isActive"
+			| "lastError"
+			| "lastTestedAt"
+			| "name"
+			| "noProxy"
+			| "proxyUrl"
+			| "strictProxy"
+			| "testStatus"
+			| "type"
+		>
+	>,
+): RouterProxyPool | null {
+	const data = readStore();
+	let updated: RouterProxyPool | null = null;
+	const next = data.proxyPools.map((pool) => {
+		if (pool.id !== id) return pool;
+		updated = normalizeProxyPool({
+			...pool,
+			...removeUndefinedValues(updates),
+			updatedAt: new Date().toISOString(),
+		});
+		return updated;
+	});
+	if (!updated) return null;
+	writeStore({ ...data, proxyPools: sortProxyPools(next) });
+	return updated;
+}
+
+export function deleteRouterProxyPool(id: string): RouterProxyPool | null {
+	const data = readStore();
+	const deleted = data.proxyPools.find((pool) => pool.id === id) ?? null;
+	if (!deleted) return null;
+	writeStore({
+		...data,
+		proxyPools: data.proxyPools.filter((pool) => pool.id !== id),
+	});
+	return deleted;
 }
 
 export function getRouterCustomCombos(): RouterCustomCombo[] {
@@ -1441,6 +1541,13 @@ function readStore(): RouterStoreFile {
 						.slice(0, MAX_AVAILABILITY_ENTRIES)
 				: [],
 			pricing: normalizePricingTable(parsed.pricing),
+			proxyPools: Array.isArray(parsed.proxyPools)
+				? sortProxyPools(
+						parsed.proxyPools
+							.map((pool) => normalizeProxyPool(pool as RouterProxyPool))
+							.filter((pool): pool is RouterProxyPool => Boolean(pool)),
+					)
+				: [],
 			providerAccounts: Array.isArray(parsed.providerAccounts)
 				? parsed.providerAccounts
 				: [],
@@ -1478,6 +1585,7 @@ function emptyStore(): RouterStoreFile {
 		mitmAliases: {},
 		modelAvailability: [],
 		pricing: {},
+		proxyPools: [],
 		providerAccounts: [],
 		providerNodes: [],
 		accountCursor: {},
@@ -1665,6 +1773,49 @@ function normalizeStringMap(
 	);
 }
 
+function normalizeProxyPool(pool: Partial<RouterProxyPool>): RouterProxyPool {
+	const name = pool.name?.trim() ?? "";
+	const proxyUrl = pool.proxyUrl?.trim() ?? "";
+	if (!name) throw new Error("Name is required");
+	if (!proxyUrl) throw new Error("Proxy URL is required");
+	const now = new Date().toISOString();
+	return {
+		id: pool.id?.trim() || randomUUID(),
+		name,
+		proxyUrl,
+		noProxy: pool.noProxy?.trim() ?? "",
+		type: normalizeProxyPoolType(pool.type),
+		isActive: pool.isActive !== false,
+		strictProxy: pool.strictProxy === true,
+		testStatus: normalizeProxyPoolTestStatus(pool.testStatus),
+		lastTestedAt: pool.lastTestedAt ?? null,
+		lastError: pool.lastError?.trim() || null,
+		createdAt: pool.createdAt ?? now,
+		updatedAt: pool.updatedAt ?? now,
+	};
+}
+
+function normalizeProxyPoolType(value: unknown): RouterProxyPoolType {
+	if (
+		value === "vercel" ||
+		value === "cloudflare" ||
+		value === "deno" ||
+		value === "http"
+	) {
+		return value;
+	}
+	return "http";
+}
+
+function normalizeProxyPoolTestStatus(
+	value: unknown,
+): RouterProxyPoolTestStatus {
+	if (value === "active" || value === "error" || value === "unknown") {
+		return value;
+	}
+	return "unknown";
+}
+
 function roundCurrency(value: number): number {
 	return Math.round(value * 10_000) / 10_000;
 }
@@ -1693,6 +1844,14 @@ function sortDisabledModels(
 		(a, b) =>
 			a.providerAlias.localeCompare(b.providerAlias) ||
 			a.id.localeCompare(b.id),
+	);
+}
+
+function sortProxyPools(pools: RouterProxyPool[]): RouterProxyPool[] {
+	return [...pools].sort(
+		(a, b) =>
+			new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime() ||
+			a.name.localeCompare(b.name),
 	);
 }
 

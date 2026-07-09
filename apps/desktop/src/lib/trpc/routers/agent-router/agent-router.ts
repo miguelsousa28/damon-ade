@@ -4,6 +4,7 @@ import {
 	previewRouterTokenSaver,
 	ROUTER_MODEL_KINDS,
 	ROUTER_PROVIDER_KEY_IDS,
+	ROUTER_PROXY_POOL_TYPES,
 	TOKEN_SAVER_MODES,
 } from "@superset/shared/router-control-plane";
 import {
@@ -18,15 +19,18 @@ import {
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
 	testRouterModel,
+	testRouterProxyPool,
 	validateRouterProviderNode,
 } from "main/lib/agent-router-gateway";
 import {
 	clearRouterUsage,
 	createRouterProviderNode,
+	createRouterProxyPool,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
 	deleteRouterCustomModel,
 	deleteRouterProviderNode,
+	deleteRouterProxyPool,
 	disableRouterModels,
 	enableRouterModels,
 	getRouterAliases,
@@ -37,10 +41,13 @@ import {
 	getRouterModelAvailability,
 	getRouterPricing,
 	getRouterProviderNodes,
+	getRouterProxyPoolById,
+	getRouterProxyPools,
 	getRouterUsageStats,
 	resetRouterPricing,
 	updateRouterPricing,
 	updateRouterProviderNode,
+	updateRouterProxyPool,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 	upsertRouterCustomModel,
@@ -51,6 +58,7 @@ import { publicProcedure, router } from "../..";
 
 const tokenSaverModeSchema = z.enum(TOKEN_SAVER_MODES);
 const routerModelKindSchema = z.enum(ROUTER_MODEL_KINDS);
+const proxyPoolTypeSchema = z.enum(ROUTER_PROXY_POOL_TYPES);
 const providerKeySchema = z.enum(ROUTER_PROVIDER_KEY_IDS);
 const providerNodeTypeSchema = z.enum([
 	"openai-compatible",
@@ -86,6 +94,17 @@ const pricingTableSchema = z.record(
 	z.string(),
 	z.record(z.string(), pricingRateSchema),
 );
+const proxyPoolInputSchema = z.object({
+	name: z.string().min(1),
+	proxyUrl: z.string().min(1),
+	noProxy: z.string().optional(),
+	type: proxyPoolTypeSchema.default("http"),
+	isActive: z.boolean().optional(),
+	strictProxy: z.boolean().optional(),
+});
+const proxyPoolUpdateSchema = proxyPoolInputSchema.partial().extend({
+	id: z.string().min(1),
+});
 
 export const createAgentRouterRouter = () => {
 	return router({
@@ -162,6 +181,52 @@ export const createAgentRouterRouter = () => {
 					.optional(),
 			)
 			.mutation(({ input }) => resetRouterPricing(input)),
+
+		proxyPools: publicProcedure
+			.input(z.object({ isActive: z.boolean().optional() }).optional())
+			.query(({ input }) => getRouterProxyPools(input ?? {})),
+
+		createProxyPool: publicProcedure
+			.input(proxyPoolInputSchema)
+			.mutation(({ input }) => createRouterProxyPool(input)),
+
+		updateProxyPool: publicProcedure
+			.input(proxyPoolUpdateSchema)
+			.mutation(({ input }) => {
+				const { id, ...updates } = input;
+				const updated = updateRouterProxyPool(id, updates);
+				if (!updated) throw new Error("Proxy pool not found");
+				return updated;
+			}),
+
+		deleteProxyPool: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.mutation(({ input }) => {
+				const deleted = deleteRouterProxyPool(input.id);
+				if (!deleted) throw new Error("Proxy pool not found");
+				return { success: true };
+			}),
+
+		testProxyPool: publicProcedure
+			.input(
+				z.object({
+					id: z.string().min(1),
+					testUrl: z.string().optional(),
+					timeoutMs: z.number().int().positive().optional(),
+				}),
+			)
+			.mutation(async ({ input }) => {
+				const proxyPool = getRouterProxyPoolById(input.id);
+				if (!proxyPool) throw new Error("Proxy pool not found");
+				const result = await testRouterProxyPool(proxyPool, input);
+				updateRouterProxyPool(proxyPool.id, {
+					isActive: result.ok,
+					lastError: result.error,
+					lastTestedAt: result.testedAt,
+					testStatus: result.ok ? "active" : "error",
+				});
+				return result;
+			}),
 
 		aliases: publicProcedure.query(() => getRouterAliases()),
 
