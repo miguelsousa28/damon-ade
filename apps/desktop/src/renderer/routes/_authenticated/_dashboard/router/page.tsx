@@ -58,25 +58,33 @@ type TabId =
 	| "usage"
 	| "aliases";
 
-type ProviderAccountView = RouterProviderAccount & { hasKey: boolean };
+type ProviderAccountView = RouterProviderAccount & {
+	hasIdToken: boolean;
+	hasKey: boolean;
+	hasRefreshToken: boolean;
+};
 type ProviderAccountInput = {
 	authType?: RouterProviderAccountAuthType;
 	email?: string | null;
 	expiresAt?: string | null;
+	idToken?: string | null;
 	key: string;
 	name?: string;
 	provider: RouterProviderKeyId;
 	providerSpecificData?: Record<string, unknown>;
+	refreshToken?: string | null;
 };
 type ProviderAccountUpdates = {
 	authType?: RouterProviderAccountAuthType;
 	email?: string | null;
 	expiresAt?: string | null;
+	idToken?: string | null;
 	isActive?: boolean;
 	key?: string;
 	name?: string;
 	priority?: number;
 	providerSpecificData?: Record<string, unknown>;
+	refreshToken?: string | null;
 };
 type ProviderNodeValidationState = {
 	valid: boolean;
@@ -160,6 +168,10 @@ function RouterDashboardPage() {
 		});
 	const updateProviderAccount =
 		electronTrpc.agentRouter.updateProviderAccount.useMutation({
+			onSuccess: invalidateRouter,
+		});
+	const refreshProviderAccount =
+		electronTrpc.agentRouter.refreshProviderAccount.useMutation({
 			onSuccess: invalidateRouter,
 		});
 	const deleteProviderAccount =
@@ -290,9 +302,13 @@ function RouterDashboardPage() {
 						isSavingProviderAccount={
 							createProviderAccount.isPending ||
 							updateProviderAccount.isPending ||
+							refreshProviderAccount.isPending ||
 							deleteProviderAccount.isPending
 						}
 						providerAccounts={providerAccounts.data ?? []}
+						refreshProviderAccount={(id) =>
+							refreshProviderAccount.mutateAsync({ force: true, id })
+						}
 						setProviderKey={(provider, key) =>
 							setProviderKey.mutateAsync({ provider, key })
 						}
@@ -407,6 +423,7 @@ function ProvidersTab({
 	isSavingKey,
 	isSavingProviderAccount,
 	providerAccounts,
+	refreshProviderAccount,
 	setProviderKey,
 	updateProviderAccount,
 }: {
@@ -417,6 +434,7 @@ function ProvidersTab({
 	isSavingKey: boolean;
 	isSavingProviderAccount: boolean;
 	providerAccounts: ProviderAccountView[];
+	refreshProviderAccount: (id: string) => Promise<unknown>;
 	setProviderKey: (
 		provider: RouterProviderKeyId,
 		key: string,
@@ -545,6 +563,7 @@ function ProvidersTab({
 								deleteProviderAccount={deleteProviderAccount}
 								isBusy={isSavingProviderAccount}
 								provider={provider.keyProvider}
+								refreshProviderAccount={refreshProviderAccount}
 								updateProviderAccount={updateProviderAccount}
 							/>
 						</div>
@@ -561,6 +580,7 @@ function ProviderAccountsPanel({
 	deleteProviderAccount,
 	isBusy,
 	provider,
+	refreshProviderAccount,
 	updateProviderAccount,
 }: {
 	accounts: ProviderAccountView[];
@@ -568,6 +588,7 @@ function ProviderAccountsPanel({
 	deleteProviderAccount: (id: string) => Promise<unknown>;
 	isBusy: boolean;
 	provider: RouterProviderKeyId;
+	refreshProviderAccount: (id: string) => Promise<unknown>;
 	updateProviderAccount: (
 		id: string,
 		updates: ProviderAccountUpdates,
@@ -579,7 +600,9 @@ function ProviderAccountsPanel({
 		useState<RouterProviderAccountAuthType>("api-key");
 	const [accountEmail, setAccountEmail] = useState("");
 	const [accountExpiresAt, setAccountExpiresAt] = useState("");
+	const [accountIdToken, setAccountIdToken] = useState("");
 	const [accountMetadata, setAccountMetadata] = useState("");
+	const [accountRefreshToken, setAccountRefreshToken] = useState("");
 	const [accountError, setAccountError] = useState<string | null>(null);
 
 	const addAccount = async () => {
@@ -594,16 +617,20 @@ function ProviderAccountsPanel({
 			authType: accountAuthType,
 			email: accountEmail.trim() || null,
 			expiresAt: accountExpiresAt.trim() || null,
+			idToken: accountIdToken.trim() || null,
 			key: accountKey.trim(),
 			name: accountName.trim() || undefined,
 			provider,
 			providerSpecificData: parsedMetadata.value,
+			refreshToken: accountRefreshToken.trim() || null,
 		});
 		setAccountName("");
 		setAccountKey("");
 		setAccountEmail("");
 		setAccountExpiresAt("");
+		setAccountIdToken("");
 		setAccountMetadata("");
+		setAccountRefreshToken("");
 	};
 
 	return (
@@ -622,11 +649,15 @@ function ProviderAccountsPanel({
 					/>
 					<select
 						value={accountAuthType}
-						onChange={(event) =>
-							setAccountAuthType(
-								event.target.value as RouterProviderAccountAuthType,
-							)
-						}
+						onChange={(event) => {
+							const nextAuthType = event.target
+								.value as RouterProviderAccountAuthType;
+							setAccountAuthType(nextAuthType);
+							if (nextAuthType === "api-key") {
+								setAccountIdToken("");
+								setAccountRefreshToken("");
+							}
+						}}
 						className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
 					>
 						<option value="api-key">API key</option>
@@ -641,6 +672,24 @@ function ProviderAccountsPanel({
 					placeholder={providerAccountSecretPlaceholder(accountAuthType)}
 					className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
 				/>
+				{accountAuthType !== "api-key" && (
+					<div className="grid gap-2 sm:grid-cols-2">
+						<input
+							type="password"
+							value={accountRefreshToken}
+							onChange={(event) => setAccountRefreshToken(event.target.value)}
+							placeholder="refresh token (optional)"
+							className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+						/>
+						<input
+							type="password"
+							value={accountIdToken}
+							onChange={(event) => setAccountIdToken(event.target.value)}
+							placeholder="id token (optional)"
+							className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+						/>
+					</div>
+				)}
 				<div className="grid gap-2 sm:grid-cols-2">
 					<input
 						value={accountEmail}
@@ -698,6 +747,19 @@ function ProviderAccountsPanel({
 								<div className="flex shrink-0 gap-1">
 									<button
 										type="button"
+										onClick={() => {
+											setAccountError(null);
+											refreshProviderAccount(account.id).catch((error) =>
+												setAccountError(errorMessage(error)),
+											);
+										}}
+										disabled={isBusy || !account.hasRefreshToken}
+										className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+									>
+										Refresh
+									</button>
+									<button
+										type="button"
 										onClick={() =>
 											updateProviderAccount(account.id, {
 												isActive: !account.isActive,
@@ -720,6 +782,8 @@ function ProviderAccountsPanel({
 							</div>
 							<div className="mt-2 flex flex-wrap gap-1.5">
 								<Pill>{account.hasKey ? "key stored" : "missing key"}</Pill>
+								{account.hasRefreshToken && <Pill>refresh stored</Pill>}
+								{account.hasIdToken && <Pill>id token stored</Pill>}
 								<Pill>{providerAccountAuthLabel(account.authType)}</Pill>
 								<Pill>{account.isActive ? "active" : "paused"}</Pill>
 								{account.email && <Pill>{account.email}</Pill>}
@@ -2635,6 +2699,10 @@ function providerAccountSecretPlaceholder(
 	if (authType === "oauth") return "oauth token";
 	if (authType === "access-token") return "access token";
 	return "api key";
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function parseDashboardJsonObject(value: string): {

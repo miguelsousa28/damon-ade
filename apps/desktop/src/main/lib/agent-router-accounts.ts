@@ -15,22 +15,33 @@ import {
 } from "./agent-router-store";
 import {
 	clearProviderAccountKey,
+	clearProviderAccountSecret,
 	getProviderAccountKey,
+	getProviderAccountSecret,
 	getProviderKey,
 	hasProviderAccountKey,
+	hasProviderAccountSecret,
 	setProviderAccountKey,
+	setProviderAccountSecret,
 } from "./provider-keys";
 
 export interface RouterProviderCredential {
 	id: string;
 	name: string;
 	provider: RouterProviderKeyId;
+	authType: RouterProviderAccountAuthType;
 	key: string;
+	refreshToken: string | null;
+	idToken: string | null;
+	expiresAt: string | null;
+	providerSpecificData: Record<string, unknown>;
 	legacy: boolean;
 }
 
 export interface RouterProviderAccountView extends RouterProviderAccount {
 	hasKey: boolean;
+	hasRefreshToken: boolean;
+	hasIdToken: boolean;
 }
 
 export function listRouterProviderAccountViews(
@@ -39,6 +50,12 @@ export function listRouterProviderAccountViews(
 	return getRouterProviderAccounts(provider).map((account) => ({
 		...account,
 		hasKey: hasProviderAccountKey(account.provider, account.id),
+		hasRefreshToken: hasProviderAccountSecret(
+			account.provider,
+			account.id,
+			"refresh",
+		),
+		hasIdToken: hasProviderAccountSecret(account.provider, account.id, "id"),
 	}));
 }
 
@@ -46,18 +63,22 @@ export function createRouterProviderAccount({
 	authType,
 	email,
 	expiresAt,
+	idToken,
 	key,
 	name,
 	provider,
 	providerSpecificData,
+	refreshToken,
 }: {
 	authType?: RouterProviderAccountAuthType;
 	email?: string | null;
 	expiresAt?: string | null;
+	idToken?: string | null;
 	key: string;
 	name?: string;
 	provider: RouterProviderKeyId;
 	providerSpecificData?: Record<string, unknown>;
+	refreshToken?: string | null;
 }): RouterProviderAccountView[] {
 	const account = createRouterProviderAccountMetadata({
 		authType,
@@ -69,7 +90,14 @@ export function createRouterProviderAccount({
 	});
 	try {
 		setProviderAccountKey(provider, account.id, key);
+		if (refreshToken?.trim()) {
+			setProviderAccountSecret(provider, account.id, "refresh", refreshToken);
+		}
+		if (idToken?.trim()) {
+			setProviderAccountSecret(provider, account.id, "id", idToken);
+		}
 	} catch (error) {
+		clearProviderAccountKey(provider, account.id);
 		deleteRouterProviderAccountMetadata(account.id);
 		throw error;
 	}
@@ -81,21 +109,25 @@ export function updateRouterProviderAccount({
 	authType,
 	email,
 	expiresAt,
+	idToken,
 	isActive,
 	key,
 	name,
 	priority,
 	providerSpecificData,
+	refreshToken,
 }: {
 	id: string;
 	authType?: RouterProviderAccountAuthType;
 	email?: string | null;
 	expiresAt?: string | null;
+	idToken?: string | null;
 	isActive?: boolean;
 	key?: string;
 	name?: string;
 	priority?: number;
 	providerSpecificData?: Record<string, unknown>;
+	refreshToken?: string | null;
 }): RouterProviderAccountView[] {
 	const account = getRouterProviderAccounts().find(
 		(candidate) => candidate.id === id,
@@ -104,6 +136,25 @@ export function updateRouterProviderAccount({
 
 	if (key?.trim()) {
 		setProviderAccountKey(account.provider, account.id, key);
+	}
+	if (refreshToken !== undefined) {
+		if (refreshToken?.trim()) {
+			setProviderAccountSecret(
+				account.provider,
+				account.id,
+				"refresh",
+				refreshToken,
+			);
+		} else {
+			clearProviderAccountSecret(account.provider, account.id, "refresh");
+		}
+	}
+	if (idToken !== undefined) {
+		if (idToken?.trim()) {
+			setProviderAccountSecret(account.provider, account.id, "id", idToken);
+		} else {
+			clearProviderAccountSecret(account.provider, account.id, "id");
+		}
 	}
 
 	updateRouterProviderAccountMetadata(id, {
@@ -141,7 +192,12 @@ export function getProviderAccountCredentials(
 			id: account.id,
 			name: account.name,
 			provider,
+			authType: account.authType,
 			key,
+			refreshToken: getProviderAccountSecret(provider, account.id, "refresh"),
+			idToken: getProviderAccountSecret(provider, account.id, "id"),
+			expiresAt: account.expiresAt ?? null,
+			providerSpecificData: account.providerSpecificData ?? {},
 			legacy: false,
 		});
 	}
@@ -155,7 +211,12 @@ export function getProviderAccountCredentials(
 					id: provider,
 					name: "Default key",
 					provider,
+					authType: "api-key",
 					key: legacyKey,
+					refreshToken: null,
+					idToken: null,
+					expiresAt: null,
+					providerSpecificData: {},
 					legacy: true,
 				},
 			]

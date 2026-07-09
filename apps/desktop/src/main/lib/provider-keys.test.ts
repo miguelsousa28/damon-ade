@@ -41,12 +41,16 @@ mock.module("./local-db", () => ({
 const {
 	setProviderKey,
 	setProviderAccountKey,
+	setProviderAccountSecret,
 	clearProviderKey,
 	clearProviderAccountKey,
+	clearProviderAccountSecret,
 	hasProviderKey,
 	hasProviderAccountKey,
+	hasProviderAccountSecret,
 	getProviderKey,
 	getProviderAccountKey,
+	getProviderAccountSecret,
 	getProviderKeyStatus,
 } = await import("./provider-keys");
 
@@ -113,6 +117,31 @@ describe("provider-keys", () => {
 
 		expect(getProviderAccountKey("openrouter", "account-a")).toBeNull();
 		expect(getProviderAccountKey("openrouter", "account-b")).toBe("sk-or-b");
+	});
+
+	it("stores independent account secrets alongside account keys", () => {
+		setProviderAccountKey("openai", "account-a", "access-token");
+		setProviderAccountSecret("openai", "account-a", "refresh", "refresh-token");
+		setProviderAccountSecret("openai", "account-a", "id", "id-token");
+
+		expect(hasProviderAccountSecret("openai", "account-a", "refresh")).toBe(
+			true,
+		);
+		expect(getProviderAccountSecret("openai", "account-a", "refresh")).toBe(
+			"refresh-token",
+		);
+		expect(getProviderAccountSecret("openai", "account-a", "id")).toBe(
+			"id-token",
+		);
+
+		clearProviderAccountSecret("openai", "account-a", "id");
+		expect(getProviderAccountSecret("openai", "account-a", "id")).toBeNull();
+
+		clearProviderAccountKey("openai", "account-a");
+		expect(getProviderAccountKey("openai", "account-a")).toBeNull();
+		expect(
+			getProviderAccountSecret("openai", "account-a", "refresh"),
+		).toBeNull();
 	});
 
 	it("degrades gracefully when secure storage is unavailable", () => {

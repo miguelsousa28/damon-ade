@@ -16,6 +16,7 @@ import {
 import {
 	discoverRouterProviderNodeModels,
 	getAgentRouterGatewayStatus,
+	refreshRouterProviderAccount,
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
 	testRouterModel,
@@ -148,7 +149,9 @@ export const createAgentRouterRouter = () => {
 					authType: providerAccountAuthTypeSchema.optional(),
 					email: z.string().nullable().optional(),
 					expiresAt: z.string().nullable().optional(),
+					idToken: z.string().nullable().optional(),
 					providerSpecificData: providerSpecificDataSchema.optional(),
+					refreshToken: z.string().nullable().optional(),
 				}),
 			)
 			.mutation(({ input }) => createRouterProviderAccount(input)),
@@ -162,9 +165,11 @@ export const createAgentRouterRouter = () => {
 					authType: providerAccountAuthTypeSchema.optional(),
 					email: z.string().nullable().optional(),
 					expiresAt: z.string().nullable().optional(),
+					idToken: z.string().nullable().optional(),
 					isActive: z.boolean().optional(),
 					priority: z.number().int().positive().optional(),
 					providerSpecificData: providerSpecificDataSchema.optional(),
+					refreshToken: z.string().nullable().optional(),
 				}),
 			)
 			.mutation(({ input }) => updateRouterProviderAccount(input)),
@@ -172,6 +177,15 @@ export const createAgentRouterRouter = () => {
 		deleteProviderAccount: publicProcedure
 			.input(z.object({ id: z.string().min(1) }))
 			.mutation(({ input }) => deleteRouterProviderAccount(input.id)),
+
+		refreshProviderAccount: publicProcedure
+			.input(
+				z.object({
+					force: z.boolean().optional(),
+					id: z.string().min(1),
+				}),
+			)
+			.mutation(({ input }) => refreshRouterProviderAccount(input)),
 
 		usageStats: publicProcedure.query(() => getRouterUsageStats()),
 

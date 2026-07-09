@@ -167,6 +167,94 @@ interface ProviderNodeSuccess {
 	model: string;
 }
 
+type OAuthRefreshProviderId = "codex" | "claude" | "gemini";
+
+interface OAuthRefreshConfig {
+	id: OAuthRefreshProviderId;
+	aliases: string[];
+	clientId?: string;
+	clientIdEnv?: string;
+	clientSecret?: string;
+	clientSecretEnv?: string;
+	encoding: "form" | "json";
+	keyProvider: RouterProviderKeyId;
+	leadMs: number;
+	maxRefreshAgeMs?: number;
+	tokenUrl: string;
+}
+
+type OAuthRefreshResult =
+	| {
+			ok: true;
+			accessToken: string;
+			expiresAt: string | null;
+			expiresIn: number | null;
+			idToken: string | null;
+			providerSpecificData: JsonObject;
+			refreshToken: string;
+	  }
+	| {
+			ok: false;
+			error: string;
+			permanent: boolean;
+			status: number | null;
+	  };
+
+type OAuthRefreshCredentialResult =
+	| {
+			ok: true;
+			credential: RouterProviderCredential;
+			provider: OAuthRefreshConfig | null;
+			refreshed: boolean;
+	  }
+	| {
+			ok: false;
+			error: string;
+			permanent: boolean;
+			provider: OAuthRefreshConfig | null;
+			status: number | null;
+	  };
+
+const OAUTH_REFRESH_CONFIGS: Record<
+	OAuthRefreshProviderId,
+	OAuthRefreshConfig
+> = {
+	claude: {
+		id: "claude",
+		aliases: ["anthropic"],
+		clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		encoding: "json",
+		keyProvider: "anthropic",
+		leadMs: 4 * 60 * 60 * 1000,
+		tokenUrl: "https://api.anthropic.com/v1/oauth/token",
+	},
+	codex: {
+		id: "codex",
+		aliases: ["openai", "chatgpt"],
+		clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
+		encoding: "json",
+		keyProvider: "openai",
+		leadMs: 5 * 24 * 60 * 60 * 1000,
+		maxRefreshAgeMs: 8 * 24 * 60 * 60 * 1000,
+		tokenUrl: "https://auth.openai.com/oauth/token",
+	},
+	gemini: {
+		id: "gemini",
+		aliases: ["google", "gemini-cli", "antigravity"],
+		clientIdEnv: "ADE_GEMINI_OAUTH_CLIENT_ID",
+		clientSecretEnv: "ADE_GEMINI_OAUTH_CLIENT_SECRET",
+		encoding: "form",
+		keyProvider: "gemini",
+		leadMs: 5 * 60 * 1000,
+		tokenUrl: "https://oauth2.googleapis.com/token",
+	},
+};
+
+const oauthRefreshLocks = new Map<
+	string,
+	Promise<OAuthRefreshCredentialResult>
+>();
+
 export interface RouterDiscoveredProviderNodeModel {
 	id: string;
 	name: string;
@@ -855,7 +943,13 @@ function createAgentRouterGatewayApp() {
 	});
 	app.post("/api/providers", async (req, res) => {
 		const provider = parseProviderKeyId(req.body?.provider);
-		const key = typeof req.body?.apiKey === "string" ? req.body.apiKey : "";
+		const body = toJsonObject(req.body);
+		const key =
+			stringValue(body.apiKey) ??
+			stringValue(body.key) ??
+			stringValue(body.accessToken) ??
+			stringValue(body.access_token) ??
+			"";
 		if (!provider) {
 			res.status(400).json({ error: "Invalid provider" });
 			return;
@@ -868,6 +962,22 @@ function createAgentRouterGatewayApp() {
 			provider,
 			key,
 			name: typeof req.body?.name === "string" ? req.body.name : undefined,
+			authType: parseProviderAccountInputAuthType(body.authType, key),
+			email: stringValue(body.email) ?? null,
+			expiresAt:
+				stringValue(body.expiresAt) ?? stringValue(body.expires_at) ?? null,
+			idToken: stringValue(body.idToken) ?? stringValue(body.id_token) ?? null,
+			providerSpecificData: {
+				...jsonObjectValue(body.providerSpecificData),
+				...jsonObjectValue(body.provider_specific_data),
+				...(stringValue(body.oauthProvider)
+					? { oauthProvider: stringValue(body.oauthProvider) }
+					: {}),
+			},
+			refreshToken:
+				stringValue(body.refreshToken) ??
+				stringValue(body.refresh_token) ??
+				null,
 		})
 			.filter((candidate) => candidate.provider === provider)
 			.sort(
@@ -914,10 +1024,35 @@ function createAgentRouterGatewayApp() {
 		}
 		updateRouterProviderAccount({
 			id: req.params.id,
-			key: typeof req.body?.apiKey === "string" ? req.body.apiKey : undefined,
+			authType: parseOptionalProviderAccountAuthType(req.body?.authType),
+			email: optionalStringValue(req.body, "email"),
+			expiresAt: optionalStringAliasValue(req.body, [
+				"expiresAt",
+				"expires_at",
+			]),
+			idToken: optionalStringAliasValue(req.body, ["idToken", "id_token"]),
+			key:
+				optionalStringAliasValue(req.body, [
+					"apiKey",
+					"key",
+					"accessToken",
+					"access_token",
+				]) ?? undefined,
 			name: typeof req.body?.name === "string" ? req.body.name : undefined,
 			priority:
 				typeof req.body?.priority === "number" ? req.body.priority : undefined,
+			providerSpecificData:
+				req.body?.providerSpecificData &&
+				typeof req.body.providerSpecificData === "object"
+					? jsonObjectValue(req.body.providerSpecificData)
+					: req.body?.provider_specific_data &&
+							typeof req.body.provider_specific_data === "object"
+						? jsonObjectValue(req.body.provider_specific_data)
+						: undefined,
+			refreshToken: optionalStringAliasValue(req.body, [
+				"refreshToken",
+				"refresh_token",
+			]),
 			isActive:
 				typeof req.body?.isActive === "boolean" ? req.body.isActive : undefined,
 		});
@@ -1010,6 +1145,26 @@ function createAgentRouterGatewayApp() {
 					}
 				: { error: "OAuth provider not supported by ADE" },
 		);
+	});
+	app.post("/api/oauth/:provider/:accountId/refresh", async (req, res) => {
+		const provider = resolveOAuthProvider(req.params.provider);
+		if (!provider) {
+			res.status(404).json({ error: "OAuth provider not supported by ADE" });
+			return;
+		}
+		const result = await refreshOAuthAccount({
+			accountId: req.params.accountId,
+			force: req.body?.force !== false,
+			providerId: req.params.provider,
+		});
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/providers/:id/refresh", async (req, res) => {
+		const result = await refreshOAuthAccount({
+			accountId: req.params.id,
+			force: req.body?.force !== false,
+		});
+		res.status(result.status).json(result.body);
 	});
 	app.get("/api/cli-tools/all-statuses", (_req, res) => {
 		res.json(buildCliToolStatuses());
@@ -2137,8 +2292,11 @@ async function validateProviderNodeEmbedding(
 	}
 
 	const attempts = providerNodeValidationAttempts(candidate);
-	for (const account of attempts) {
-		const upstream = await fetchWithTimeout(
+	for (const accountAttempt of attempts) {
+		const account = accountAttempt
+			? await refreshProviderCredentialIfNeeded(accountAttempt)
+			: undefined;
+		let upstream = await fetchWithTimeout(
 			providerNodeUrl(candidate.node, "/embeddings"),
 			{
 				method: "POST",
@@ -2146,6 +2304,23 @@ async function validateProviderNodeEmbedding(
 				body: JSON.stringify({ model, input: "ping" }),
 			},
 		);
+		if (isAuthFailureStatus(upstream.status) && account?.refreshToken) {
+			const refreshedAccount =
+				await refreshProviderCredentialAfterAuthFailure(account);
+			if (refreshedAccount) {
+				upstream = await fetchWithTimeout(
+					providerNodeUrl(candidate.node, "/embeddings"),
+					{
+						method: "POST",
+						headers: providerNodeHeadersForVersion(
+							candidate.node,
+							refreshedAccount,
+						),
+						body: JSON.stringify({ model, input: "ping" }),
+					},
+				);
+			}
+		}
 		if (upstream.ok) {
 			const data = await readJson(upstream);
 			const embedding = (
@@ -2157,7 +2332,7 @@ async function validateProviderNodeEmbedding(
 				dimensions: Array.isArray(embedding) ? embedding.length : null,
 			};
 		}
-		if (upstream.status === 401 || upstream.status === 403) {
+		if (isAuthFailureStatus(upstream.status)) {
 			return {
 				valid: false,
 				error: "API key unauthorized",
@@ -2219,12 +2394,26 @@ async function validateProviderNodeInference(
 				? "responses"
 				: "chat";
 
-	for (const account of providerNodeValidationAttempts(candidate)) {
-		const upstream = await fetchWithTimeout(providerNodeUrl(node, path), {
+	for (const accountAttempt of providerNodeValidationAttempts(candidate)) {
+		const account = accountAttempt
+			? await refreshProviderCredentialIfNeeded(accountAttempt)
+			: undefined;
+		let upstream = await fetchWithTimeout(providerNodeUrl(node, path), {
 			method: "POST",
 			headers: providerNodeHeadersForVersion(node, account),
 			body: JSON.stringify(body),
 		});
+		if (isAuthFailureStatus(upstream.status) && account?.refreshToken) {
+			const refreshedAccount =
+				await refreshProviderCredentialAfterAuthFailure(account);
+			if (refreshedAccount) {
+				upstream = await fetchWithTimeout(providerNodeUrl(node, path), {
+					method: "POST",
+					headers: providerNodeHeadersForVersion(node, refreshedAccount),
+					body: JSON.stringify(body),
+				});
+			}
+		}
 		if (upstream.ok) return { valid: true, method };
 		return {
 			valid: false,
@@ -2274,34 +2463,61 @@ async function fetchProviderNodeWithFallback({
 		null;
 
 	for (const account of attempts) {
-		const headers = providerNodeHeaders(node, account, req);
+		const activeAccount = account
+			? await refreshProviderCredentialIfNeeded(account)
+			: undefined;
+		const headers = providerNodeHeaders(node, activeAccount, req);
 		if (body.stream === true) headers.Accept = "text/event-stream";
-		const upstream = await fetch(providerNodeUrl(node, path), {
+		let upstream = await fetch(providerNodeUrl(node, path), {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
 		});
 
 		if (upstream.ok) {
-			if (account) markProviderAccountSuccess(account);
+			if (activeAccount) markProviderAccountSuccess(activeAccount);
 			return {
 				ok: true,
-				account,
+				account: activeAccount,
 				upstream,
 				node,
 				model: nodeTarget.model,
 			};
 		}
 
+		if (isAuthFailureStatus(upstream.status) && activeAccount?.refreshToken) {
+			const refreshedAccount =
+				await refreshProviderCredentialAfterAuthFailure(activeAccount);
+			if (refreshedAccount) {
+				const retryHeaders = providerNodeHeaders(node, refreshedAccount, req);
+				if (body.stream === true) retryHeaders.Accept = "text/event-stream";
+				upstream = await fetch(providerNodeUrl(node, path), {
+					method: "POST",
+					headers: retryHeaders,
+					body: JSON.stringify(body),
+				});
+				if (upstream.ok) {
+					markProviderAccountSuccess(refreshedAccount);
+					return {
+						ok: true,
+						account: refreshedAccount,
+						upstream,
+						node,
+						model: nodeTarget.model,
+					};
+				}
+			}
+		}
+
 		const text = await upstream.text().catch(() => upstream.statusText);
 		lastFailure = {
-			account: account?.name ?? "no-auth",
+			account: activeAccount?.name ?? "no-auth",
 			status: upstream.status,
 			text,
 		};
-		if (account) {
+		if (activeAccount) {
 			markProviderAccountFailure({
-				credential: account,
+				credential: activeAccount,
 				status: upstream.status,
 				text,
 			});
@@ -2347,14 +2563,33 @@ async function fetchProviderNodeModels(
 	| { ok: true; models: RouterDiscoveredProviderNodeModel[] }
 	| { ok: false; status: number }
 > {
-	for (const account of providerNodeValidationAttempts(candidate)) {
-		const upstream = await fetchWithTimeout(
+	for (const accountAttempt of providerNodeValidationAttempts(candidate)) {
+		const account = accountAttempt
+			? await refreshProviderCredentialIfNeeded(accountAttempt)
+			: undefined;
+		let upstream = await fetchWithTimeout(
 			providerNodeUrl(candidate.node, "/models"),
 			{
 				method: "GET",
 				headers: providerNodeHeadersForVersion(candidate.node, account),
 			},
 		);
+		if (isAuthFailureStatus(upstream.status) && account?.refreshToken) {
+			const refreshedAccount =
+				await refreshProviderCredentialAfterAuthFailure(account);
+			if (refreshedAccount) {
+				upstream = await fetchWithTimeout(
+					providerNodeUrl(candidate.node, "/models"),
+					{
+						method: "GET",
+						headers: providerNodeHeadersForVersion(
+							candidate.node,
+							refreshedAccount,
+						),
+					},
+				);
+			}
+		}
 		if (upstream.ok) {
 			return {
 				ok: true,
@@ -2432,7 +2667,12 @@ function getProviderNodeValidationCredentials(
 				id: "direct-validation-key",
 				name: "Direct validation key",
 				provider,
+				authType: "api-key",
+				expiresAt: null,
+				idToken: null,
 				key: directKey,
+				providerSpecificData: {},
+				refreshToken: null,
 				legacy: true,
 			},
 		];
@@ -2795,7 +3035,7 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		authorize: false,
 		deviceCode: false,
 		notes:
-			"Import a Codex/OpenAI access token. Automated browser exchange is not bundled yet.",
+			"Import a Codex/OpenAI access token plus refresh token; ADE can rotate it automatically.",
 	},
 	{
 		id: "claude",
@@ -2806,7 +3046,7 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		authorize: false,
 		deviceCode: false,
 		notes:
-			"Import a Claude/Anthropic access token or API token as an OAuth-style account.",
+			"Import a Claude/Anthropic access token plus refresh token; ADE can rotate it automatically.",
 	},
 	{
 		id: "gemini",
@@ -2817,7 +3057,7 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		authorize: false,
 		deviceCode: false,
 		notes:
-			"Import a Gemini OAuth access token. Refresh/device-code flow is not automated yet.",
+			"Import a Gemini OAuth access token plus refresh token; ADE can rotate it automatically.",
 	},
 ];
 
@@ -2832,6 +3072,375 @@ function resolveOAuthProvider(
 				provider.keyProvider === normalized ||
 				provider.aliases.includes(normalized),
 		) ?? null
+	);
+}
+
+function resolveOAuthRefreshConfig(
+	providerId: string | null | undefined,
+): OAuthRefreshConfig | null {
+	const normalized = providerId?.trim().toLowerCase();
+	if (!normalized) return null;
+	return (
+		Object.values(OAUTH_REFRESH_CONFIGS).find(
+			(config) =>
+				config.id === normalized ||
+				config.keyProvider === normalized ||
+				config.aliases.includes(normalized),
+		) ?? null
+	);
+}
+
+function resolveOAuthRefreshConfigForCredential(
+	credential: RouterProviderCredential,
+	providerId?: string,
+): OAuthRefreshConfig | null {
+	const requested = resolveOAuthRefreshConfig(providerId);
+	if (requested) {
+		return requested.keyProvider === credential.provider ? requested : null;
+	}
+	const metadataProvider = stringValue(
+		credential.providerSpecificData.oauthProvider,
+	);
+	return (
+		resolveOAuthRefreshConfig(metadataProvider) ??
+		resolveOAuthRefreshConfig(credential.provider)
+	);
+}
+
+async function refreshOAuthAccount({
+	accountId,
+	force,
+	providerId,
+}: {
+	accountId: string;
+	force: boolean;
+	providerId?: string;
+}): Promise<{ body: JsonObject; status: number }> {
+	const account = listRouterProviderAccountViews().find(
+		(candidate) => candidate.id === accountId,
+	);
+	if (!account) return { status: 404, body: { error: "Connection not found" } };
+	const credential = getProviderAccountCredentials(account.provider).find(
+		(candidate) => candidate.id === account.id,
+	);
+	if (!credential) {
+		return {
+			status: 400,
+			body: { error: "No access token is stored for this account." },
+		};
+	}
+	const result = await refreshProviderCredential({
+		credential,
+		force,
+		providerId,
+	});
+	if (!result.ok) {
+		return {
+			status: result.status ?? 400,
+			body: {
+				success: false,
+				error: result.error,
+				permanent: result.permanent,
+				provider: result.provider?.id ?? null,
+			},
+		};
+	}
+	return {
+		status: 200,
+		body: {
+			success: true,
+			refreshed: result.refreshed,
+			provider: result.provider?.id ?? null,
+			connection: providerConnectionView(result.credential.id),
+		},
+	};
+}
+
+export async function refreshRouterProviderAccount({
+	force = true,
+	id,
+}: {
+	force?: boolean;
+	id: string;
+}): Promise<JsonObject> {
+	const result = await refreshOAuthAccount({ accountId: id, force });
+	if (result.status >= 400) {
+		throw new Error(String(result.body.error ?? "Provider refresh failed"));
+	}
+	return result.body;
+}
+
+async function refreshProviderCredential({
+	credential,
+	force,
+	providerId,
+}: {
+	credential: RouterProviderCredential;
+	force: boolean;
+	providerId?: string;
+}): Promise<OAuthRefreshCredentialResult> {
+	const provider = resolveOAuthRefreshConfigForCredential(
+		credential,
+		providerId,
+	);
+	if (!provider) {
+		return {
+			ok: true,
+			credential,
+			provider: null,
+			refreshed: false,
+		};
+	}
+	if (!credential.refreshToken) {
+		return {
+			ok: false,
+			error: "This provider account has no refresh token.",
+			permanent: true,
+			provider,
+			status: 400,
+		};
+	}
+	if (!force && !shouldRefreshProviderCredential(credential, provider)) {
+		return {
+			ok: true,
+			credential,
+			provider,
+			refreshed: false,
+		};
+	}
+
+	const lockKey = oauthRefreshLockKey(provider, credential);
+	const existing = oauthRefreshLocks.get(lockKey);
+	if (existing) return existing;
+
+	const pending: Promise<OAuthRefreshCredentialResult> =
+		(async (): Promise<OAuthRefreshCredentialResult> => {
+			const refreshed = await refreshOAuthTokenForProvider(
+				provider,
+				credential.refreshToken as string,
+				credential.providerSpecificData,
+			);
+			if (!refreshed.ok) {
+				return {
+					ok: false,
+					error: refreshed.error,
+					permanent: refreshed.permanent,
+					provider,
+					status: refreshed.status,
+				};
+			}
+
+			const providerSpecificData = {
+				...credential.providerSpecificData,
+				...refreshed.providerSpecificData,
+				hasIdToken: Boolean(refreshed.idToken ?? credential.idToken),
+				hasRefreshToken: true,
+				lastRefreshAt: new Date().toISOString(),
+				oauthProvider: provider.id,
+			};
+			updateRouterProviderAccount({
+				id: credential.id,
+				authType:
+					credential.authType === "api-key" ? "oauth" : credential.authType,
+				expiresAt: refreshed.expiresAt ?? credential.expiresAt,
+				idToken:
+					refreshed.idToken ??
+					(credential.idToken ? credential.idToken : undefined),
+				key: refreshed.accessToken,
+				providerSpecificData,
+				refreshToken: refreshed.refreshToken,
+			});
+
+			const updated =
+				getProviderAccountCredentials(credential.provider).find(
+					(candidate) => candidate.id === credential.id,
+				) ?? credential;
+			return {
+				ok: true,
+				credential: updated,
+				provider,
+				refreshed: true,
+			};
+		})().finally(() => {
+			oauthRefreshLocks.delete(lockKey);
+		});
+
+	oauthRefreshLocks.set(lockKey, pending);
+	return pending;
+}
+
+async function refreshProviderCredentialIfNeeded(
+	credential: RouterProviderCredential,
+): Promise<RouterProviderCredential> {
+	const result = await refreshProviderCredential({
+		credential,
+		force: false,
+	});
+	return result.ok ? result.credential : credential;
+}
+
+async function refreshProviderCredentialAfterAuthFailure(
+	credential: RouterProviderCredential,
+): Promise<RouterProviderCredential | null> {
+	const result = await refreshProviderCredential({
+		credential,
+		force: true,
+	});
+	return result.ok && result.refreshed ? result.credential : null;
+}
+
+function shouldRefreshProviderCredential(
+	credential: RouterProviderCredential,
+	provider: OAuthRefreshConfig,
+	nowMs = Date.now(),
+): boolean {
+	const expiresAtMs = parseTimeMs(credential.expiresAt);
+	if (expiresAtMs !== null && expiresAtMs - nowMs < provider.leadMs)
+		return true;
+	if (provider.maxRefreshAgeMs && credential.refreshToken) {
+		const lastRefreshMs = parseTimeMs(
+			credential.providerSpecificData.lastRefreshAt,
+		);
+		return !lastRefreshMs || nowMs - lastRefreshMs >= provider.maxRefreshAgeMs;
+	}
+	return false;
+}
+
+async function refreshOAuthTokenForProvider(
+	provider: OAuthRefreshConfig,
+	refreshToken: string,
+	providerSpecificData: JsonObject = {},
+): Promise<OAuthRefreshResult> {
+	const clientId =
+		provider.clientId ??
+		stringValue(providerSpecificData.oauthClientId) ??
+		stringValue(providerSpecificData.clientId) ??
+		(provider.clientIdEnv
+			? stringValue(process.env[provider.clientIdEnv])
+			: undefined);
+	const clientSecret =
+		provider.clientSecret ??
+		stringValue(providerSpecificData.oauthClientSecret) ??
+		stringValue(providerSpecificData.clientSecret) ??
+		(provider.clientSecretEnv
+			? stringValue(process.env[provider.clientSecretEnv])
+			: undefined);
+	if (!clientId) {
+		return {
+			ok: false,
+			error: `${provider.id} OAuth client id is not configured.`,
+			permanent: true,
+			status: 400,
+		};
+	}
+	if (provider.clientSecretEnv && !clientSecret) {
+		return {
+			ok: false,
+			error: `${provider.id} OAuth client secret is not configured.`,
+			permanent: true,
+			status: 400,
+		};
+	}
+	const body =
+		provider.encoding === "form"
+			? new URLSearchParams({
+					client_id: clientId,
+					...(clientSecret ? { client_secret: clientSecret } : {}),
+					grant_type: "refresh_token",
+					refresh_token: refreshToken,
+				})
+			: JSON.stringify({
+					client_id: clientId,
+					grant_type: "refresh_token",
+					refresh_token: refreshToken,
+				});
+	const response = await fetchWithTimeout(
+		provider.tokenUrl,
+		{
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type":
+					provider.encoding === "form"
+						? "application/x-www-form-urlencoded"
+						: "application/json",
+			},
+			body,
+		},
+		15_000,
+	);
+	const data = await readJson(response);
+	if (!response.ok) {
+		return {
+			ok: false,
+			error: oauthRefreshErrorMessage(data, response.status),
+			permanent: isPermanentOAuthRefreshError(data, response.status),
+			status: response.status,
+		};
+	}
+	const accessToken =
+		stringValue(data.access_token) ??
+		stringValue(data.accessToken) ??
+		stringValue(data.token);
+	if (!accessToken) {
+		return {
+			ok: false,
+			error: "Refresh response did not include an access token.",
+			permanent: false,
+			status: response.status,
+		};
+	}
+	const expiresIn =
+		numberValue(data.expires_in) ?? numberValue(data.expiresIn) ?? null;
+	const nextRefreshToken =
+		stringValue(data.refresh_token) ??
+		stringValue(data.refreshToken) ??
+		refreshToken;
+	return {
+		ok: true,
+		accessToken,
+		expiresAt: expiresIn
+			? new Date(Date.now() + expiresIn * 1000).toISOString()
+			: (stringValue(data.expires_at) ?? stringValue(data.expiresAt) ?? null),
+		expiresIn,
+		idToken: stringValue(data.id_token) ?? stringValue(data.idToken) ?? null,
+		providerSpecificData: jsonObjectValue(data.providerSpecificData),
+		refreshToken: nextRefreshToken,
+	};
+}
+
+function oauthRefreshLockKey(
+	provider: OAuthRefreshConfig,
+	credential: RouterProviderCredential,
+): string {
+	const stableId =
+		credential.id ||
+		credential.name ||
+		credential.refreshToken?.slice(-16) ||
+		"default";
+	return `${provider.id}:${stableId}`;
+}
+
+function oauthRefreshErrorMessage(data: JsonObject, status: number): string {
+	return (
+		stringValue(data.error_description) ??
+		errorTextFromBody(data) ??
+		`OAuth refresh failed (${status})`
+	);
+}
+
+function isPermanentOAuthRefreshError(
+	data: JsonObject,
+	status: number,
+): boolean {
+	const error = stringValue(data.error)?.toLowerCase();
+	return (
+		error === "invalid_grant" ||
+		error === "invalid_request" ||
+		error === "refresh_token_reused" ||
+		status === 400 ||
+		status === 401 ||
+		status === 403
 	);
 }
 
@@ -2851,6 +3460,10 @@ function importOAuthTokenConnection(providerId: string, rawBody: unknown) {
 		stringValue(body.token) ??
 		stringValue(body.apiKey) ??
 		stringValue(body.key);
+	const refreshToken =
+		stringValue(body.refreshToken) ?? stringValue(body.refresh_token) ?? null;
+	const idToken =
+		stringValue(body.idToken) ?? stringValue(body.id_token) ?? null;
 	if (!token) {
 		return {
 			ok: false as const,
@@ -2864,6 +3477,11 @@ function importOAuthTokenConnection(providerId: string, rawBody: unknown) {
 		...jsonObjectValue(body.provider_specific_data),
 		importedFrom: "ade-oauth-compat",
 		oauthProvider: provider.id,
+		...(refreshToken ? { hasRefreshToken: true } : {}),
+		...(idToken ? { hasIdToken: true } : {}),
+		...(typeof body.lastRefreshAt === "string"
+			? { lastRefreshAt: body.lastRefreshAt }
+			: {}),
 		...(typeof jwtInfo.account_id === "string"
 			? { accountId: jwtInfo.account_id, chatgptAccountId: jwtInfo.account_id }
 			: {}),
@@ -2880,10 +3498,12 @@ function importOAuthTokenConnection(providerId: string, rawBody: unknown) {
 		authType: parseImportedAuthType(body.authType, token),
 		email: stringValue(body.email) ?? stringValue(jwtInfo.email) ?? null,
 		expiresAt: parseImportedExpiresAt(body),
+		idToken,
 		key: token,
 		name,
 		provider: provider.keyProvider,
 		providerSpecificData,
+		refreshToken,
 	})
 		.filter((candidate) => candidate.provider === provider.keyProvider)
 		.sort(
@@ -2928,10 +3548,52 @@ function parseImportedAuthType(
 	value: unknown,
 	token: string,
 ): RouterProviderAccountAuthType {
+	const explicit = parseOptionalProviderAccountAuthType(value);
+	if (explicit) return explicit;
 	if (value === "access-token" || value === "access_token")
 		return "access-token";
 	if (value === "oauth") return "oauth";
 	return looksLikeJwt(token) ? "access-token" : "oauth";
+}
+
+function parseProviderAccountInputAuthType(
+	value: unknown,
+	token: string,
+): RouterProviderAccountAuthType {
+	const explicit = parseOptionalProviderAccountAuthType(value);
+	return explicit ?? (looksLikeJwt(token) ? "access-token" : "api-key");
+}
+
+function parseOptionalProviderAccountAuthType(
+	value: unknown,
+): RouterProviderAccountAuthType | undefined {
+	if (value === "api-key" || value === "apikey" || value === "api_key")
+		return "api-key";
+	if (value === "access-token" || value === "access_token")
+		return "access-token";
+	if (value === "oauth") return "oauth";
+	return undefined;
+}
+
+function optionalStringAliasValue(
+	source: unknown,
+	keys: string[],
+): string | null | undefined {
+	for (const key of keys) {
+		const value = optionalStringValue(source, key);
+		if (value !== undefined) return value;
+	}
+	return undefined;
+}
+
+function optionalStringValue(
+	source: unknown,
+	key: string,
+): string | null | undefined {
+	const body = toJsonObject(source);
+	if (!Object.hasOwn(body, key)) return undefined;
+	const value = body[key];
+	return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function parseImportedExpiresAt(body: JsonObject): string | null {
@@ -3011,6 +3673,8 @@ function providerConnectionFromAccount(account: RouterProviderAccountView) {
 		createdAt: account.createdAt,
 		updatedAt: account.updatedAt,
 		hasKey: account.hasKey,
+		hasRefreshToken: account.hasRefreshToken,
+		hasIdToken: account.hasIdToken,
 		apiKey: undefined,
 		accessToken: undefined,
 		refreshToken: undefined,
@@ -3423,7 +4087,9 @@ async function testRouterProviderAccounts({
 	const accounts = listRouterProviderAccountViews().filter((account) => {
 		if (!account.isActive) return false;
 		if (mode === "provider") return account.provider === providerId;
-		if (mode === "apikey" || mode === "all") return true;
+		if (mode === "oauth") return account.authType !== "api-key";
+		if (mode === "apikey") return account.authType === "api-key";
+		if (mode === "compatible" || mode === "free" || mode === "all") return true;
 		return false;
 	});
 
@@ -3437,7 +4103,7 @@ async function testRouterProviderAccounts({
 				provider: account.provider,
 				connectionId: account.id,
 				connectionName: account.name,
-				authType: "apikey",
+				authType: providerConnectionAuthType(account.authType),
 				valid: false,
 				latencyMs: 0,
 				error: "No API key stored for this account.",
@@ -3446,15 +4112,17 @@ async function testRouterProviderAccounts({
 			});
 			continue;
 		}
+		const credentialForTest =
+			await refreshProviderCredentialIfNeeded(credential);
 		const test = await validateRouterProviderKey(
-			credential.provider,
-			credential.key,
+			credentialForTest.provider,
+			credentialForTest.key,
 		);
 		if (test.valid) {
-			markProviderAccountSuccess(credential);
+			markProviderAccountSuccess(credentialForTest);
 		} else {
 			markProviderAccountFailure({
-				credential,
+				credential: credentialForTest,
 				status: test.statusCode ?? undefined,
 				text: test.error ?? undefined,
 			});
@@ -3463,7 +4131,7 @@ async function testRouterProviderAccounts({
 			provider: account.provider,
 			connectionId: account.id,
 			connectionName: account.name,
-			authType: "apikey",
+			authType: providerConnectionAuthType(account.authType),
 			valid: test.valid,
 			latencyMs: test.latencyMs,
 			error: test.error,
@@ -4293,6 +4961,30 @@ function stringValue(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function numberValue(value: unknown): number | undefined {
+	const parsed =
+		typeof value === "number"
+			? value
+			: typeof value === "string" && value.trim()
+				? Number(value)
+				: Number.NaN;
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseTimeMs(value: unknown): number | null {
+	if (value === undefined || value === null || value === "") return null;
+	if (typeof value === "number") {
+		return Number.isFinite(value)
+			? value < 1e12
+				? value * 1000
+				: value
+			: null;
+	}
+	if (typeof value !== "string") return null;
+	const parsed = new Date(value).getTime();
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
 async function fetchWithTimeout(
 	url: string,
 	init: RequestInit,
@@ -4330,6 +5022,10 @@ function getChatErrorMessage(status: number): string {
 	if (status === 404) return "Inference endpoint not found";
 	if (status >= 500) return "Server error - try again later";
 	return `Inference request failed (${status})`;
+}
+
+function isAuthFailureStatus(status: number): boolean {
+	return status === 401 || status === 403;
 }
 
 function getProviderNodeNetworkErrorMessage(error: unknown): string {
