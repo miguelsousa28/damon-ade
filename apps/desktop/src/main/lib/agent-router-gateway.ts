@@ -39,6 +39,7 @@ import {
 	routerModelKindsForSlug,
 	TOKEN_SAVER_MODES,
 } from "@superset/shared/router-control-plane";
+import { app as electronApp } from "electron";
 import express, {
 	type ErrorRequestHandler,
 	type Response as ExpressResponse,
@@ -57,9 +58,11 @@ import {
 } from "./agent-router-accounts";
 import {
 	clearRouterUsage,
+	createRouterApiKey,
 	createRouterProviderNode,
 	createRouterProxyPool,
 	deleteRouterAlias,
+	deleteRouterApiKey,
 	deleteRouterCustomCombo,
 	deleteRouterCustomModel,
 	deleteRouterProviderNode,
@@ -68,6 +71,8 @@ import {
 	enableRouterModels,
 	estimateTokens,
 	getRouterAliases,
+	getRouterApiKeyById,
+	getRouterApiKeys,
 	getRouterCustomCombos,
 	getRouterCustomModels,
 	getRouterDefaultPricing,
@@ -79,20 +84,26 @@ import {
 	getRouterProviderNodes,
 	getRouterProxyPoolById,
 	getRouterProxyPools,
+	getRouterSettings,
+	getRouterStoreSnapshot,
 	getRouterUsageChart,
 	getRouterUsageCompatStats,
 	getRouterUsageLogs,
 	getRouterUsageProviders,
 	getRouterUsageStats,
 	isRouterModelDisabled,
+	type RouterGatewayApiKey,
+	type RouterGatewaySettings,
 	type RouterUsagePeriod,
 	recordRouterModelAvailability,
 	recordRouterUsage,
 	resetRouterPricing,
 	setRouterMitmAliases,
+	updateRouterApiKey,
 	updateRouterPricing,
 	updateRouterProviderNode,
 	updateRouterProxyPool,
+	updateRouterSettings,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 	upsertRouterCustomModel,
@@ -293,6 +304,264 @@ function createAgentRouterGatewayApp() {
 			usage: getRouterUsageStats(5),
 			...getAgentRouterGatewayStatus(),
 		});
+	});
+
+	app.get("/api/health", (_req, res) => {
+		res.json({
+			ok: true,
+			name: "ADE Agent Router Gateway",
+			compatibility: "9router",
+			...getAgentRouterGatewayStatus(),
+		});
+	});
+
+	app.get("/api/version", (_req, res) => {
+		res.json({
+			currentVersion: electronApp.getVersion(),
+			latestVersion: null,
+			hasUpdate: false,
+			compatibility: "9router",
+		});
+	});
+
+	app.post(["/api/shutdown", "/api/version/shutdown"], (_req, res) => {
+		res.status(202).json({
+			success: true,
+			message: "ADE is desktop-managed; shutdown endpoint acknowledged.",
+		});
+	});
+
+	app.get("/api/keys", (_req, res) => {
+		res.json({ keys: getRouterApiKeys().map(routerApiKeyView) });
+	});
+
+	app.post("/api/keys", (req, res) => {
+		const name = stringValue(req.body?.name);
+		if (!name) {
+			res.status(400).json({ error: "Name is required" });
+			return;
+		}
+		const apiKey = createRouterApiKey(name);
+		res.status(201).json({
+			id: apiKey.id,
+			key: apiKey.key,
+			keyPreview: apiKey.keyPreview,
+			machineId: apiKey.machineId,
+			name: apiKey.name,
+			isActive: apiKey.isActive,
+			createdAt: apiKey.createdAt,
+		});
+	});
+
+	app.get("/api/keys/:id", (req, res) => {
+		const apiKey = getRouterApiKeyById(req.params.id);
+		if (!apiKey) {
+			res.status(404).json({ error: "Key not found" });
+			return;
+		}
+		res.json({ key: routerApiKeyView(apiKey) });
+	});
+
+	app.put("/api/keys/:id", (req, res) => {
+		const updated = updateRouterApiKey(req.params.id, {
+			isActive:
+				typeof req.body?.isActive === "boolean" ? req.body.isActive : undefined,
+			name: stringValue(req.body?.name),
+		});
+		if (!updated) {
+			res.status(404).json({ error: "Key not found" });
+			return;
+		}
+		res.json({ key: routerApiKeyView(updated) });
+	});
+
+	app.delete("/api/keys/:id", (req, res) => {
+		if (!deleteRouterApiKey(req.params.id)) {
+			res.status(404).json({ error: "Key not found" });
+			return;
+		}
+		res.json({ message: "Key deleted successfully" });
+	});
+
+	app.get("/api/settings", (_req, res) => {
+		res.setHeader("Cache-Control", "no-store");
+		res.json(routerSettingsResponse(getRouterSettings()));
+	});
+
+	app.patch("/api/settings", (req, res) => {
+		res.setHeader("Cache-Control", "no-store");
+		res.json(
+			routerSettingsResponse(updateRouterSettings(toJsonObject(req.body))),
+		);
+	});
+
+	app.get("/api/settings/require-login", (_req, res) => {
+		const settings = getRouterSettings();
+		res.json({
+			requireLogin: settings.requireLogin !== false,
+			tunnelDashboardAccess: settings.tunnelDashboardAccess !== false,
+			tailscaleUrl: stringValue(settings.tailscaleUrl) ?? "",
+			tunnelUrl: stringValue(settings.tunnelUrl) ?? "",
+		});
+	});
+
+	app.get("/api/settings/database", (_req, res) => {
+		res.json({
+			compatibility: "ade-router-state",
+			...getRouterStoreSnapshot(),
+		});
+	});
+
+	app.post("/api/settings/database", (_req, res) => {
+		res.status(501).json({
+			error: "Importing a full 9router database into ADE is not automated yet.",
+			code: "DATABASE_IMPORT_NOT_MANAGED",
+		});
+	});
+
+	app.post("/api/settings/proxy-test", async (req, res) => {
+		const proxyUrl = stringValue(req.body?.proxyUrl);
+		if (!proxyUrl) {
+			res.status(400).json({ ok: false, error: "proxyUrl is required" });
+			return;
+		}
+		const result = await testRouterProxyPool(
+			{
+				id: "settings-proxy-test",
+				name: "Settings proxy test",
+				proxyUrl,
+				noProxy: stringValue(req.body?.noProxy) ?? "",
+				type: "http",
+				isActive: true,
+				strictProxy: false,
+				testStatus: "unknown",
+				lastTestedAt: null,
+				lastError: null,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			},
+			{
+				testUrl: stringValue(req.body?.testUrl),
+				timeoutMs:
+					typeof req.body?.timeoutMs === "number"
+						? req.body.timeoutMs
+						: undefined,
+			},
+		);
+		res.status(result.ok ? 200 : result.status || 500).json(result);
+	});
+
+	app.get("/api/providers/client", (req, res) => {
+		res.json(routerClientProvidersResponse(req));
+	});
+
+	app.get("/api/providers/suggested-models", async (req, res) => {
+		const url = typeof req.query.url === "string" ? req.query.url : "";
+		const type = typeof req.query.type === "string" ? req.query.type : "";
+		if (!url || !type) {
+			res.status(400).json({ error: "Missing url or type" });
+			return;
+		}
+		try {
+			const response = await fetchWithTimeout(url, { method: "GET" }, 5000);
+			if (!response.ok) {
+				res.json({ data: [] });
+				return;
+			}
+			const raw = await response.json();
+			const models = Array.isArray(raw)
+				? raw
+				: Array.isArray(raw?.data)
+					? raw.data
+					: Array.isArray(raw?.models)
+						? raw.models
+						: [];
+			res.json({ data: filterSuggestedModels(models, type) });
+		} catch {
+			res.json({ data: [] });
+		}
+	});
+
+	app.get("/api/tags", (_req, res) => {
+		res.json({ tags: [] });
+	});
+
+	app.get("/api/locale", (_req, res) => {
+		res.json({ locale: "en", source: "ade-default" });
+	});
+
+	app.get("/api/tunnel/status", (_req, res) => {
+		res.json(routerTunnelStatus());
+	});
+
+	app.post("/api/tunnel/disable", (_req, res) => {
+		const settings = updateRouterSettings({
+			tailscaleEnabled: false,
+			tunnelEnabled: false,
+		});
+		res.json({ success: true, tunnel: routerTunnelStatus(settings).tunnel });
+	});
+
+	app.post("/api/tunnel/enable", (_req, res) => {
+		res.status(501).json({
+			error:
+				"Cloud tunnel lifecycle is not managed by ADE yet. Configure an external tunnel URL in settings.",
+			code: "TUNNEL_NOT_MANAGED",
+			status: routerTunnelStatus(),
+		});
+	});
+
+	app.get("/api/tunnel/tailscale-check", (_req, res) => {
+		res.json(routerTailscaleCheck());
+	});
+
+	app.post("/api/tunnel/tailscale-disable", (_req, res) => {
+		const settings = updateRouterSettings({ tailscaleEnabled: false });
+		res.json({
+			success: true,
+			tailscale: routerTunnelStatus(settings).tailscale,
+		});
+	});
+
+	app.post("/api/tunnel/tailscale-enable", (_req, res) => {
+		res.status(501).json({
+			error:
+				"Tailscale lifecycle is not managed by ADE yet. Use the Tailscale app/CLI and store the URL in settings.",
+			code: "TAILSCALE_NOT_MANAGED",
+			status: routerTunnelStatus(),
+		});
+	});
+
+	app.get("/api/tunnel/tailscale-install", (_req, res) => {
+		res.status(501).json({
+			error: "Tailscale installation is not managed by ADE.",
+			code: "TAILSCALE_INSTALL_NOT_MANAGED",
+			...routerTailscaleCheck(),
+		});
+	});
+
+	app.get("/api/headroom/status", async (_req, res) => {
+		res.json(await routerHeadroomStatus());
+	});
+
+	app.post("/api/headroom/start", async (_req, res) => {
+		const status = await routerHeadroomStatus();
+		if (status.ok) {
+			updateRouterSettings({ headroomEnabled: true, headroomUrl: status.url });
+			res.json({ success: true, ...status });
+			return;
+		}
+		res.status(501).json({
+			error:
+				"Headroom process lifecycle is not bundled with ADE yet. Start Headroom externally and set headroomUrl.",
+			code: "HEADROOM_NOT_MANAGED",
+			...status,
+		});
+	});
+
+	app.post("/api/headroom/stop", (_req, res) => {
+		updateRouterSettings({ headroomEnabled: false });
+		res.json({ stopped: false, managedPid: null });
 	});
 
 	app.get("/v1/models", (_req, res) => {
@@ -2753,6 +3022,176 @@ function providerConnectionAuthType(authType: RouterProviderAccountAuthType) {
 	if (authType === "access-token") return "access_token";
 	if (authType === "oauth") return "oauth";
 	return "apikey";
+}
+
+function routerApiKeyView(apiKey: RouterGatewayApiKey) {
+	return {
+		id: apiKey.id,
+		key: apiKey.keyPreview,
+		keyPreview: apiKey.keyPreview,
+		name: apiKey.name,
+		machineId: apiKey.machineId,
+		isActive: apiKey.isActive,
+		createdAt: apiKey.createdAt,
+		updatedAt: apiKey.updatedAt,
+		lastUsedAt: apiKey.lastUsedAt,
+	};
+}
+
+function routerSettingsResponse(settings: RouterGatewaySettings) {
+	return {
+		...settings,
+		enableRequestLogs: process.env.ENABLE_REQUEST_LOGS === "true",
+		enableTranslator: false,
+		hasPassword: false,
+		oidcConfigured: false,
+	};
+}
+
+function routerClientProvidersResponse(req: Request) {
+	const provider =
+		typeof req.query.provider === "string" ? req.query.provider : "all";
+	const accountStatus =
+		typeof req.query.accountStatus === "string"
+			? req.query.accountStatus
+			: "all";
+	const sort = typeof req.query.sort === "string" ? req.query.sort : "priority";
+	const page = parsePositiveIntQuery(req.query.page, 1);
+	const pageSize = Math.min(parsePositiveIntQuery(req.query.pageSize, 20), 500);
+	const allConnections = listRouterProviderConnections();
+	const providerFilteredConnections = allConnections.filter(
+		(connection) => provider === "all" || connection.provider === provider,
+	);
+	const accountFilteredConnections = providerFilteredConnections.filter(
+		(connection) => {
+			if (accountStatus === "active") return connection.isActive;
+			if (accountStatus === "inactive") return !connection.isActive;
+			return true;
+		},
+	);
+	const sortedConnections = [...accountFilteredConnections].sort((a, b) => {
+		if (sort === "provider") {
+			return (
+				String(a.provider).localeCompare(String(b.provider)) ||
+				a.priority - b.priority
+			);
+		}
+		return (
+			a.priority - b.priority || String(a.provider).localeCompare(b.provider)
+		);
+	});
+	const total = sortedConnections.length;
+	const totalPages = Math.max(1, Math.ceil(total / pageSize));
+	const currentPage = Math.min(page, totalPages);
+	const offset = (currentPage - 1) * pageSize;
+	const connections = sortedConnections.slice(offset, offset + pageSize);
+	return {
+		connections,
+		providerOptions: Array.from(
+			new Set(allConnections.map((connection) => connection.provider)),
+		).sort(),
+		pagination: {
+			page: currentPage,
+			pageSize,
+			total,
+			totalPages,
+		},
+		totals: {
+			eligibleConnections: allConnections.length,
+			providerFilteredConnections: providerFilteredConnections.length,
+		},
+	};
+}
+
+function filterSuggestedModels(models: unknown[], type: string) {
+	const normalizedType = type.toLowerCase();
+	return models.filter((model) => {
+		if (!model || typeof model !== "object") return false;
+		const entry = model as Record<string, unknown>;
+		const id = String(entry.id ?? entry.name ?? "");
+		const kind = String(entry.kind ?? entry.type ?? "").toLowerCase();
+		const capabilities = Array.isArray(entry.capabilities)
+			? entry.capabilities.map((capability) => String(capability).toLowerCase())
+			: [];
+		if (!normalizedType || normalizedType === "all") return true;
+		if (kind === normalizedType || capabilities.includes(normalizedType))
+			return true;
+		if (normalizedType === "embedding") return /embed/i.test(id);
+		if (normalizedType === "image") return /image|vision|dall-e/i.test(id);
+		if (normalizedType === "tts") return /tts|speech|audio/i.test(id);
+		if (normalizedType === "stt") return /transcri|whisper|stt/i.test(id);
+		return normalizedType === "chat";
+	});
+}
+
+function routerTunnelStatus(settings = getRouterSettings()) {
+	const tunnelUrl = stringValue(settings.tunnelUrl) ?? "";
+	const tailscaleUrl = stringValue(settings.tailscaleUrl) ?? "";
+	return {
+		tunnel: {
+			enabled: settings.tunnelEnabled === true,
+			provider: stringValue(settings.tunnelProvider) ?? "cloudflare",
+			running: false,
+			status: settings.tunnelEnabled === true ? "configured" : "disabled",
+			url: tunnelUrl,
+		},
+		tailscale: {
+			enabled: settings.tailscaleEnabled === true,
+			installed: false,
+			loggedIn: false,
+			running: false,
+			status: settings.tailscaleEnabled === true ? "external" : "disabled",
+			url: tailscaleUrl,
+		},
+		download: {
+			status: "idle",
+		},
+	};
+}
+
+function routerTailscaleCheck() {
+	return {
+		installed: false,
+		loggedIn: false,
+		platform: process.platform,
+		brewAvailable: false,
+		daemonRunning: false,
+		customDaemonRunning: false,
+		systemDaemonRunning: false,
+		hasCachedPassword: false,
+	};
+}
+
+async function routerHeadroomStatus() {
+	const settings = getRouterSettings();
+	const url = stringValue(settings.headroomUrl) ?? "http://localhost:8787";
+	try {
+		const response = await fetchWithTimeout(url, { method: "GET" }, 1500);
+		return {
+			ok: response.ok,
+			reachable: response.ok,
+			status: response.status,
+			statusText: response.statusText,
+			url,
+			enabled: settings.headroomEnabled === true,
+			managedPid: null,
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			reachable: false,
+			error: errorMessage(error),
+			url,
+			enabled: settings.headroomEnabled === true,
+			managedPid: null,
+		};
+	}
+}
+
+function parsePositiveIntQuery(value: unknown, fallback: number): number {
+	const raw = Array.isArray(value) ? value[0] : value;
+	const parsed = Number.parseInt(String(raw ?? ""), 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function providerDisplayName(provider: RouterProviderKeyId): string {

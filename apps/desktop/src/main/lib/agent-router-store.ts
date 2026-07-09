@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -29,6 +29,48 @@ import { app } from "electron";
 
 const MAX_USAGE_ENTRIES = 2000;
 const MAX_AVAILABILITY_ENTRIES = 500;
+const PROTECTED_ROUTER_SETTING_KEYS = new Set([
+	"password",
+	"newPassword",
+	"currentPassword",
+	"oidcClientSecret",
+	"mitmSudoEncrypted",
+]);
+
+const DEFAULT_ROUTER_GATEWAY_SETTINGS: RouterGatewaySettings = {
+	authMode: "none",
+	cavemanEnabled: false,
+	cavemanLevel: "full",
+	cloudEnabled: false,
+	comboStickyRoundRobinLimit: 1,
+	comboStrategies: {},
+	comboStrategy: "fallback",
+	dnsToolEnabled: {},
+	enableObservability: true,
+	headroomCompressUserMessages: false,
+	headroomEnabled: false,
+	headroomUrl: "http://localhost:8787",
+	mitmRouterBaseUrl: "http://localhost:20128",
+	observabilityBatchSize: 20,
+	observabilityFlushIntervalMs: 5000,
+	observabilityMaxJsonSize: 5,
+	observabilityMaxRecords: 1000,
+	outboundNoProxy: "",
+	outboundProxyEnabled: false,
+	outboundProxyUrl: "",
+	ponytailEnabled: false,
+	ponytailLevel: "full",
+	providerStrategies: {},
+	requireLogin: false,
+	rtkEnabled: true,
+	stickyRoundRobinLimit: 3,
+	tailscaleEnabled: false,
+	tailscaleUrl: "",
+	tunnelDashboardAccess: true,
+	tunnelEnabled: false,
+	tunnelProvider: "cloudflare",
+	tunnelUrl: "",
+};
 
 export interface RouterUsageRecordInput {
 	endpoint: string;
@@ -145,6 +187,7 @@ export interface RouterUsageChartBucket {
 
 export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
+	apiKeys: RouterGatewayApiKey[];
 	customCombos: RouterCustomCombo[];
 	customModels: RouterCustomModel[];
 	disabledModels: RouterDisabledModel[];
@@ -154,11 +197,13 @@ export interface RouterStoreSnapshot {
 	proxyPools: RouterProxyPool[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
+	settings: RouterGatewaySettings;
 	usage: RouterUsageEntry[];
 }
 
 interface RouterStoreFile {
 	aliases: RouterModelAlias[];
+	apiKeys: RouterGatewayApiKey[];
 	customCombos: RouterCustomCombo[];
 	customModels: RouterCustomModel[];
 	disabledModels: RouterDisabledModel[];
@@ -168,14 +213,68 @@ interface RouterStoreFile {
 	proxyPools: RouterProxyPool[];
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
+	settings: RouterGatewaySettings;
 	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
 	usage: RouterUsageEntry[];
+}
+
+export interface RouterGatewayApiKey {
+	id: string;
+	keyHash: string;
+	keyPreview: string;
+	name: string;
+	machineId: string;
+	isActive: boolean;
+	createdAt: string;
+	updatedAt: string;
+	lastUsedAt: string | null;
+}
+
+export interface RouterGatewayApiKeyCreated extends RouterGatewayApiKey {
+	key: string;
+}
+
+export interface RouterGatewaySettings {
+	[key: string]: unknown;
+	authMode: string;
+	cavemanEnabled: boolean;
+	cavemanLevel: string;
+	cloudEnabled: boolean;
+	comboStickyRoundRobinLimit: number;
+	comboStrategies: Record<string, unknown>;
+	comboStrategy: string;
+	dnsToolEnabled: Record<string, unknown>;
+	enableObservability: boolean;
+	headroomCompressUserMessages: boolean;
+	headroomEnabled: boolean;
+	headroomUrl: string;
+	mitmRouterBaseUrl: string;
+	observabilityBatchSize: number;
+	observabilityFlushIntervalMs: number;
+	observabilityMaxJsonSize: number;
+	observabilityMaxRecords: number;
+	outboundNoProxy: string;
+	outboundProxyEnabled: boolean;
+	outboundProxyUrl: string;
+	ponytailEnabled: boolean;
+	ponytailLevel: string;
+	providerStrategies: Record<string, unknown>;
+	requireLogin: boolean;
+	rtkEnabled: boolean;
+	stickyRoundRobinLimit: number;
+	tailscaleEnabled: boolean;
+	tailscaleUrl: string;
+	tunnelDashboardAccess: boolean;
+	tunnelEnabled: boolean;
+	tunnelProvider: string;
+	tunnelUrl: string;
 }
 
 export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 	const data = readStore();
 	return {
 		aliases: data.aliases,
+		apiKeys: data.apiKeys,
 		customCombos: data.customCombos,
 		customModels: data.customModels,
 		disabledModels: data.disabledModels,
@@ -185,6 +284,7 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 		proxyPools: getRouterProxyPools(undefined, data.proxyPools),
 		providerAccounts: data.providerAccounts,
 		providerNodes: data.providerNodes,
+		settings: data.settings,
 		usage: data.usage,
 	};
 }
@@ -235,6 +335,108 @@ export function setRouterMitmAliases(
 		},
 	});
 	return filtered;
+}
+
+export function getRouterApiKeys(): RouterGatewayApiKey[] {
+	return readStore().apiKeys;
+}
+
+export function getRouterApiKeyById(id: string): RouterGatewayApiKey | null {
+	return readStore().apiKeys.find((key) => key.id === id) ?? null;
+}
+
+export function createRouterApiKey(name: string): RouterGatewayApiKeyCreated {
+	const trimmedName = name.trim();
+	if (!trimmedName) throw new Error("Name is required");
+	const key = `ade_9r_${randomBytes(24).toString("hex")}`;
+	const now = new Date().toISOString();
+	const apiKey: RouterGatewayApiKey = {
+		id: randomUUID(),
+		keyHash: hashRouterApiKey(key),
+		keyPreview: previewRouterApiKey(key),
+		name: trimmedName,
+		machineId: getRouterMachineId(),
+		isActive: true,
+		createdAt: now,
+		updatedAt: now,
+		lastUsedAt: null,
+	};
+	const data = readStore();
+	writeStore({
+		...data,
+		apiKeys: sortRouterApiKeys([...data.apiKeys, apiKey]),
+	});
+	return { ...apiKey, key };
+}
+
+export function updateRouterApiKey(
+	id: string,
+	updates: Partial<Pick<RouterGatewayApiKey, "isActive" | "name">>,
+): RouterGatewayApiKey | null {
+	const data = readStore();
+	let updated: RouterGatewayApiKey | null = null;
+	const next = data.apiKeys.map((apiKey) => {
+		if (apiKey.id !== id) return apiKey;
+		updated = {
+			...apiKey,
+			isActive:
+				typeof updates.isActive === "boolean"
+					? updates.isActive
+					: apiKey.isActive,
+			name: updates.name?.trim() || apiKey.name,
+			updatedAt: new Date().toISOString(),
+		};
+		return updated;
+	});
+	if (!updated) return null;
+	writeStore({ ...data, apiKeys: sortRouterApiKeys(next) });
+	return updated;
+}
+
+export function deleteRouterApiKey(id: string): boolean {
+	const data = readStore();
+	const next = data.apiKeys.filter((apiKey) => apiKey.id !== id);
+	if (next.length === data.apiKeys.length) return false;
+	writeStore({ ...data, apiKeys: next });
+	return true;
+}
+
+export function validateRouterApiKey(key: string): boolean {
+	const hash = hashRouterApiKey(key);
+	const match = readStore().apiKeys.find((apiKey) => apiKey.keyHash === hash);
+	if (!match?.isActive) return false;
+	const data = readStore();
+	writeStore({
+		...data,
+		apiKeys: data.apiKeys.map((apiKey) =>
+			apiKey.id === match.id
+				? { ...apiKey, lastUsedAt: new Date().toISOString() }
+				: apiKey,
+		),
+	});
+	return true;
+}
+
+export function getRouterSettings(): RouterGatewaySettings {
+	return readStore().settings;
+}
+
+export function updateRouterSettings(
+	updates: Record<string, unknown>,
+): RouterGatewaySettings {
+	const data = readStore();
+	const safeUpdates = Object.fromEntries(
+		Object.entries(updates).filter(
+			([key, value]) =>
+				!PROTECTED_ROUTER_SETTING_KEYS.has(key) && value !== undefined,
+		),
+	);
+	const settings = normalizeRouterSettings({
+		...data.settings,
+		...safeUpdates,
+	});
+	writeStore({ ...data, settings });
+	return settings;
 }
 
 export function getRouterDefaultPricing(): RouterPricingTable {
@@ -1524,6 +1726,17 @@ function readStore(): RouterStoreFile {
 		) as Partial<RouterStoreFile>;
 		return {
 			aliases: Array.isArray(parsed.aliases) ? parsed.aliases : [],
+			apiKeys: Array.isArray(parsed.apiKeys)
+				? sortRouterApiKeys(
+						parsed.apiKeys
+							.map((apiKey) =>
+								normalizeRouterApiKey(apiKey as Partial<RouterGatewayApiKey>),
+							)
+							.filter((apiKey): apiKey is RouterGatewayApiKey =>
+								Boolean(apiKey),
+							),
+					)
+				: [],
 			customCombos: Array.isArray(parsed.customCombos)
 				? parsed.customCombos
 				: [],
@@ -1582,6 +1795,7 @@ function readStore(): RouterStoreFile {
 						.map((node) => normalizeProviderNode(node as RouterProviderNode))
 						.filter(Boolean)
 				: [],
+			settings: normalizeRouterSettings(parsed.settings),
 			accountCursor:
 				parsed.accountCursor && typeof parsed.accountCursor === "object"
 					? parsed.accountCursor
@@ -1605,6 +1819,7 @@ function writeStore(data: RouterStoreFile): void {
 function emptyStore(): RouterStoreFile {
 	return {
 		aliases: [],
+		apiKeys: [],
 		customCombos: [],
 		customModels: [],
 		disabledModels: [],
@@ -1614,6 +1829,7 @@ function emptyStore(): RouterStoreFile {
 		proxyPools: [],
 		providerAccounts: [],
 		providerNodes: [],
+		settings: normalizeRouterSettings({}),
 		accountCursor: {},
 		usage: [],
 	};
@@ -1799,6 +2015,90 @@ function normalizeStringMap(
 	);
 }
 
+function normalizeRouterApiKey(
+	apiKey: Partial<RouterGatewayApiKey>,
+): RouterGatewayApiKey | null {
+	const keyHash = apiKey.keyHash?.trim();
+	const name = apiKey.name?.trim();
+	if (!keyHash || !name) return null;
+	const now = new Date().toISOString();
+	return {
+		id: apiKey.id?.trim() || randomUUID(),
+		keyHash,
+		keyPreview: apiKey.keyPreview?.trim() || "stored key",
+		name,
+		machineId: apiKey.machineId?.trim() || getRouterMachineId(),
+		isActive: apiKey.isActive !== false,
+		createdAt: apiKey.createdAt ?? now,
+		updatedAt: apiKey.updatedAt ?? apiKey.createdAt ?? now,
+		lastUsedAt: apiKey.lastUsedAt ?? null,
+	};
+}
+
+function normalizeRouterSettings(value: unknown): RouterGatewaySettings {
+	const raw =
+		value && typeof value === "object" && !Array.isArray(value)
+			? (value as Record<string, unknown>)
+			: {};
+	const safe = Object.fromEntries(
+		Object.entries(raw).filter(
+			([key, entry]) =>
+				!PROTECTED_ROUTER_SETTING_KEYS.has(key) && entry !== undefined,
+		),
+	);
+	return {
+		...DEFAULT_ROUTER_GATEWAY_SETTINGS,
+		...safe,
+		authMode:
+			typeof safe.authMode === "string"
+				? safe.authMode
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.authMode,
+		headroomUrl:
+			typeof safe.headroomUrl === "string"
+				? safe.headroomUrl
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.headroomUrl,
+		mitmRouterBaseUrl:
+			typeof safe.mitmRouterBaseUrl === "string"
+				? safe.mitmRouterBaseUrl
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.mitmRouterBaseUrl,
+		outboundNoProxy:
+			typeof safe.outboundNoProxy === "string"
+				? safe.outboundNoProxy
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.outboundNoProxy,
+		outboundProxyUrl:
+			typeof safe.outboundProxyUrl === "string"
+				? safe.outboundProxyUrl
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.outboundProxyUrl,
+		tailscaleUrl:
+			typeof safe.tailscaleUrl === "string"
+				? safe.tailscaleUrl
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.tailscaleUrl,
+		tunnelProvider:
+			typeof safe.tunnelProvider === "string"
+				? safe.tunnelProvider
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.tunnelProvider,
+		tunnelUrl:
+			typeof safe.tunnelUrl === "string"
+				? safe.tunnelUrl
+				: DEFAULT_ROUTER_GATEWAY_SETTINGS.tunnelUrl,
+	} satisfies RouterGatewaySettings;
+}
+
+function hashRouterApiKey(key: string): string {
+	return createHash("sha256").update(key).digest("hex");
+}
+
+function previewRouterApiKey(key: string): string {
+	return `${key.slice(0, 10)}...${key.slice(-6)}`;
+}
+
+function getRouterMachineId(): string {
+	return createHash("sha256")
+		.update(app.getPath("userData"))
+		.digest("hex")
+		.slice(0, 16);
+}
+
 function normalizeProxyPool(pool: Partial<RouterProxyPool>): RouterProxyPool {
 	const name = pool.name?.trim() ?? "";
 	const proxyUrl = pool.proxyUrl?.trim() ?? "";
@@ -1877,6 +2177,16 @@ function sortProxyPools(pools: RouterProxyPool[]): RouterProxyPool[] {
 	return [...pools].sort(
 		(a, b) =>
 			new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime() ||
+			a.name.localeCompare(b.name),
+	);
+}
+
+function sortRouterApiKeys(
+	apiKeys: RouterGatewayApiKey[],
+): RouterGatewayApiKey[] {
+	return [...apiKeys].sort(
+		(a, b) =>
+			new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() ||
 			a.name.localeCompare(b.name),
 	);
 }
