@@ -8,6 +8,7 @@ import {
 	type RouterModelAvailabilityEntry,
 	type RouterModelKind,
 	type RouterModelTestResult,
+	type RouterPricingTable,
 	type RouterProviderAccount,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
@@ -44,6 +45,7 @@ type TabId =
 	| "providers"
 	| "nodes"
 	| "models"
+	| "pricing"
 	| "combos"
 	| "endpoints"
 	| "token-savers"
@@ -69,6 +71,7 @@ const TABS: { id: TabId; label: string }[] = [
 	{ id: "providers", label: "Providers" },
 	{ id: "nodes", label: "Nodes" },
 	{ id: "models", label: "Models" },
+	{ id: "pricing", label: "Pricing" },
 	{ id: "combos", label: "Combos" },
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
@@ -275,6 +278,7 @@ function RouterDashboardPage() {
 				)}
 				{activeTab === "nodes" && <NodesTab />}
 				{activeTab === "models" && <ModelsTab />}
+				{activeTab === "pricing" && <PricingTab />}
 				{activeTab === "combos" && <CombosTab data={data} />}
 				{activeTab === "endpoints" && <EndpointsTab data={data} />}
 				{activeTab === "token-savers" && <TokenSaversTab data={data} />}
@@ -1600,6 +1604,186 @@ function ModelKindSelect({
 	);
 }
 
+function PricingTab() {
+	const utils = electronTrpc.useUtils();
+	const pricing = electronTrpc.agentRouter.pricing.useQuery();
+	const defaultPricing = electronTrpc.agentRouter.defaultPricing.useQuery();
+	const updatePricing = electronTrpc.agentRouter.updatePricing.useMutation({
+		onSuccess: () => {
+			utils.agentRouter.pricing.invalidate();
+			utils.agentRouter.usageStats.invalidate();
+		},
+	});
+	const resetPricing = electronTrpc.agentRouter.resetPricing.useMutation({
+		onSuccess: () => {
+			utils.agentRouter.pricing.invalidate();
+			utils.agentRouter.usageStats.invalidate();
+		},
+	});
+	const [provider, setProvider] = useState("openrouter");
+	const [model, setModel] = useState("z-ai/glm-5.2");
+	const [input, setInput] = useState("1");
+	const [output, setOutput] = useState("4");
+	const [cached, setCached] = useState("");
+
+	const rows = pricingRows(pricing.data ?? {});
+	const defaultRows = pricingRows(defaultPricing.data ?? {});
+
+	const save = async () => {
+		if (!provider.trim() || !model.trim()) return;
+		await updatePricing.mutateAsync({
+			[provider.trim()]: {
+				[model.trim()]: {
+					input: parsePricingNumber(input),
+					output: parsePricingNumber(output),
+					...(cached.trim() ? { cached: parsePricingNumber(cached) } : {}),
+				},
+			},
+		});
+	};
+
+	return (
+		<section className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+			<div className="rounded-lg border bg-card p-4">
+				<div className="flex items-center justify-between gap-3">
+					<div>
+						<h2 className="text-sm font-semibold">Pricing registry</h2>
+						<p className="mt-1 text-xs text-muted-foreground">
+							Values are USD per million tokens and feed usage cost estimates.
+						</p>
+					</div>
+					<Pill>{rows.length} rates</Pill>
+				</div>
+
+				<div className="mt-4 grid gap-3">
+					<label className="flex flex-col gap-1 text-xs font-medium">
+						Provider
+						<input
+							value={provider}
+							onChange={(event) => setProvider(event.target.value)}
+							className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							placeholder="openrouter"
+						/>
+					</label>
+					<label className="flex flex-col gap-1 text-xs font-medium">
+						Model
+						<input
+							value={model}
+							onChange={(event) => setModel(event.target.value)}
+							className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							placeholder="z-ai/glm-5.2"
+						/>
+					</label>
+					<div className="grid gap-3 sm:grid-cols-3">
+						<label className="flex flex-col gap-1 text-xs font-medium">
+							Input
+							<input
+								value={input}
+								onChange={(event) => setInput(event.target.value)}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+								inputMode="decimal"
+							/>
+						</label>
+						<label className="flex flex-col gap-1 text-xs font-medium">
+							Output
+							<input
+								value={output}
+								onChange={(event) => setOutput(event.target.value)}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+								inputMode="decimal"
+							/>
+						</label>
+						<label className="flex flex-col gap-1 text-xs font-medium">
+							Cached
+							<input
+								value={cached}
+								onChange={(event) => setCached(event.target.value)}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+								inputMode="decimal"
+								placeholder="optional"
+							/>
+						</label>
+					</div>
+					<div className="flex flex-wrap gap-2">
+						<button
+							type="button"
+							onClick={save}
+							disabled={
+								updatePricing.isPending || !provider.trim() || !model.trim()
+							}
+							className="rounded-md bg-foreground px-3 py-2 text-sm text-background disabled:opacity-50"
+						>
+							Save rate
+						</button>
+						<button
+							type="button"
+							onClick={() =>
+								resetPricing.mutate({
+									provider: provider.trim(),
+									model: model.trim(),
+								})
+							}
+							disabled={
+								resetPricing.isPending || !provider.trim() || !model.trim()
+							}
+							className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+						>
+							Reset model
+						</button>
+						<button
+							type="button"
+							onClick={() => resetPricing.mutate({})}
+							disabled={resetPricing.isPending}
+							className="rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+						>
+							Reset all overrides
+						</button>
+					</div>
+				</div>
+
+				<div className="mt-5 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+					Default table currently contributes {defaultRows.length} baseline
+					rates. Overrides are stored in the ADE router state file.
+				</div>
+			</div>
+
+			<div className="rounded-lg border bg-card">
+				<div className="grid grid-cols-[120px_1fr_80px_80px_80px] gap-3 border-b px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+					<span>Provider</span>
+					<span>Model</span>
+					<span>Input</span>
+					<span>Output</span>
+					<span>Cached</span>
+				</div>
+				<div className="max-h-[520px] divide-y overflow-auto">
+					{pricing.isLoading ? (
+						<p className="px-4 py-3 text-sm text-muted-foreground">
+							Loading pricing...
+						</p>
+					) : rows.length === 0 ? (
+						<p className="px-4 py-3 text-sm text-muted-foreground">
+							No pricing rates configured.
+						</p>
+					) : (
+						rows.map((row) => (
+							<div
+								key={`${row.provider}-${row.model}`}
+								className="grid grid-cols-[120px_1fr_80px_80px_80px] gap-3 px-4 py-3 text-xs"
+							>
+								<span className="truncate">{row.provider}</span>
+								<span className="truncate font-mono">{row.model}</span>
+								<span>{formatPricingValue(row.input)}</span>
+								<span>{formatPricingValue(row.output)}</span>
+								<span>{formatPricingValue(row.cached)}</span>
+							</div>
+						))
+					)}
+				</div>
+			</div>
+		</section>
+	);
+}
+
 function CombosTab({ data }: { data: RouterDashboardSnapshot }) {
 	return (
 		<section className="grid gap-3 lg:grid-cols-2">
@@ -2142,6 +2326,34 @@ function parseDashboardModels(value: string): string[] {
 		.split(/[\n,]+/)
 		.map((model) => model.trim())
 		.filter(Boolean);
+}
+
+function pricingRows(table: RouterPricingTable) {
+	return Object.entries(table)
+		.flatMap(([provider, models]) =>
+			Object.entries(models).map(([model, pricing]) => ({
+				provider,
+				model,
+				input: pricing.input,
+				output: pricing.output,
+				cached: pricing.cached,
+			})),
+		)
+		.sort(
+			(a, b) =>
+				a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model),
+		);
+}
+
+function parsePricingNumber(value: string): number {
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function formatPricingValue(value: number | undefined): string {
+	return typeof value === "number"
+		? value.toFixed(4).replace(/\.?0+$/, "")
+		: "-";
 }
 
 function TierBadge({ tier }: { tier: string }) {

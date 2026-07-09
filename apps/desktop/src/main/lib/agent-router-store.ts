@@ -12,6 +12,8 @@ import type {
 	RouterModelAlias,
 	RouterModelAvailabilityEntry,
 	RouterModelKind,
+	RouterPricingRate,
+	RouterPricingTable,
 	RouterProviderAccount,
 	RouterProviderKeyId,
 	RouterProviderNode,
@@ -142,7 +144,9 @@ export interface RouterStoreSnapshot {
 	customCombos: RouterCustomCombo[];
 	customModels: RouterCustomModel[];
 	disabledModels: RouterDisabledModel[];
+	mitmAliases: Record<string, Record<string, string>>;
 	modelAvailability: RouterModelAvailabilityEntry[];
+	pricing: RouterPricingTable;
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	usage: RouterUsageEntry[];
@@ -153,7 +157,9 @@ interface RouterStoreFile {
 	customCombos: RouterCustomCombo[];
 	customModels: RouterCustomModel[];
 	disabledModels: RouterDisabledModel[];
+	mitmAliases: Record<string, Record<string, string>>;
 	modelAvailability: RouterModelAvailabilityEntry[];
+	pricing: RouterPricingTable;
 	providerAccounts: RouterProviderAccount[];
 	providerNodes: RouterProviderNode[];
 	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
@@ -167,7 +173,9 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 		customCombos: data.customCombos,
 		customModels: data.customModels,
 		disabledModels: data.disabledModels,
+		mitmAliases: data.mitmAliases,
 		modelAvailability: data.modelAvailability,
+		pricing: getRouterPricing(data.pricing),
 		providerAccounts: data.providerAccounts,
 		providerNodes: data.providerNodes,
 		usage: data.usage,
@@ -194,6 +202,98 @@ export function deleteRouterAlias(alias: string): RouterModelAlias[] {
 	const next = data.aliases.filter((entry) => entry.alias !== alias);
 	writeStore({ ...data, aliases: next });
 	return next;
+}
+
+export function getRouterMitmAliases(
+	tool?: string | null,
+): Record<string, Record<string, string>> | Record<string, string> {
+	const aliases = readStore().mitmAliases;
+	const toolName = tool?.trim();
+	return toolName ? (aliases[toolName] ?? {}) : aliases;
+}
+
+export function setRouterMitmAliases(
+	tool: string,
+	mappings: Record<string, string>,
+): Record<string, string> {
+	const toolName = tool.trim();
+	if (!toolName) throw new Error("tool is required");
+	const filtered = normalizeStringMap(mappings);
+	const data = readStore();
+	writeStore({
+		...data,
+		mitmAliases: {
+			...data.mitmAliases,
+			[toolName]: filtered,
+		},
+	});
+	return filtered;
+}
+
+export function getRouterDefaultPricing(): RouterPricingTable {
+	const pricing: RouterPricingTable = {};
+	for (const profile of Object.values(AGENT_ROUTER_PROFILES)) {
+		if (!profile.pricing) continue;
+		const provider = profile.provider.startsWith("OpenRouter/")
+			? "openrouter"
+			: profile.provider.toLowerCase();
+		pricing[provider] = {
+			...(pricing[provider] ?? {}),
+			[profile.modelId]: {
+				input: profile.pricing.inputPerMillion,
+				output: profile.pricing.outputPerMillion,
+			},
+			[profile.agent]: {
+				input: profile.pricing.inputPerMillion,
+				output: profile.pricing.outputPerMillion,
+			},
+		};
+	}
+	return pricing;
+}
+
+export function getRouterPricing(
+	overrides: RouterPricingTable = readStore().pricing,
+): RouterPricingTable {
+	return mergePricingTables(getRouterDefaultPricing(), overrides);
+}
+
+export function updateRouterPricing(
+	updates: RouterPricingTable,
+): RouterPricingTable {
+	const data = readStore();
+	writeStore({
+		...data,
+		pricing: mergePricingTables(data.pricing, normalizePricingTable(updates)),
+	});
+	return getRouterPricing();
+}
+
+export function resetRouterPricing({
+	model,
+	provider,
+}: {
+	model?: string | null;
+	provider?: string | null;
+} = {}): RouterPricingTable {
+	const data = readStore();
+	const next = clonePricingTable(data.pricing);
+	const providerId = provider?.trim();
+	const modelId = model?.trim();
+
+	if (providerId && modelId) {
+		delete next[providerId]?.[modelId];
+		if (next[providerId] && Object.keys(next[providerId]).length === 0) {
+			delete next[providerId];
+		}
+	} else if (providerId) {
+		delete next[providerId];
+	} else {
+		for (const key of Object.keys(next)) delete next[key];
+	}
+
+	writeStore({ ...data, pricing: next });
+	return getRouterPricing();
 }
 
 export function getRouterCustomCombos(): RouterCustomCombo[] {
@@ -1329,6 +1429,7 @@ function readStore(): RouterStoreFile {
 							.filter((model): model is RouterDisabledModel => Boolean(model)),
 					)
 				: [],
+			mitmAliases: normalizeNestedStringMap(parsed.mitmAliases),
 			modelAvailability: Array.isArray(parsed.modelAvailability)
 				? parsed.modelAvailability
 						.map((entry) =>
@@ -1339,6 +1440,7 @@ function readStore(): RouterStoreFile {
 						.filter(Boolean)
 						.slice(0, MAX_AVAILABILITY_ENTRIES)
 				: [],
+			pricing: normalizePricingTable(parsed.pricing),
 			providerAccounts: Array.isArray(parsed.providerAccounts)
 				? parsed.providerAccounts
 				: [],
@@ -1373,7 +1475,9 @@ function emptyStore(): RouterStoreFile {
 		customCombos: [],
 		customModels: [],
 		disabledModels: [],
+		mitmAliases: {},
 		modelAvailability: [],
+		pricing: {},
 		providerAccounts: [],
 		providerNodes: [],
 		accountCursor: {},
@@ -1436,10 +1540,129 @@ function findPricing(model: string): AgentPricing | null {
 	const normalized = model.startsWith("openrouter/")
 		? model.slice("openrouter/".length)
 		: model;
+	const editable = findEditablePricing(model, normalized);
+	if (editable) {
+		return {
+			inputPerMillion: editable.input ?? 0,
+			outputPerMillion: editable.output ?? 0,
+		};
+	}
 	const profile = Object.values(AGENT_ROUTER_PROFILES).find(
 		(entry) => entry.modelId === normalized || entry.agent === normalized,
 	);
 	return profile?.pricing ?? null;
+}
+
+function findEditablePricing(
+	model: string,
+	normalized: string,
+): RouterPricingRate | null {
+	const table = getRouterPricing();
+	const candidates = Array.from(new Set([model, normalized]));
+
+	for (const candidate of candidates) {
+		for (const [provider, models] of Object.entries(table)) {
+			if (models[candidate]) return models[candidate];
+			const prefix = `${provider}/`;
+			if (candidate.startsWith(prefix)) {
+				const modelId = candidate.slice(prefix.length);
+				if (models[modelId]) return models[modelId];
+			}
+		}
+	}
+
+	return null;
+}
+
+function clonePricingTable(table: RouterPricingTable): RouterPricingTable {
+	return Object.fromEntries(
+		Object.entries(table).map(([provider, models]) => [
+			provider,
+			Object.fromEntries(
+				Object.entries(models).map(([model, pricing]) => [
+					model,
+					{ ...pricing },
+				]),
+			),
+		]),
+	);
+}
+
+function mergePricingTables(
+	base: RouterPricingTable,
+	overrides: RouterPricingTable,
+): RouterPricingTable {
+	const next = clonePricingTable(base);
+	for (const [provider, models] of Object.entries(overrides)) {
+		next[provider] = {
+			...(next[provider] ?? {}),
+			...models,
+		};
+	}
+	return next;
+}
+
+function normalizePricingTable(value: unknown): RouterPricingTable {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const table: RouterPricingTable = {};
+	for (const [rawProvider, rawModels] of Object.entries(value)) {
+		const provider = rawProvider.trim();
+		if (!provider || !rawModels || typeof rawModels !== "object") continue;
+		const models: Record<string, RouterPricingRate> = {};
+		for (const [rawModel, rawPricing] of Object.entries(rawModels)) {
+			const model = rawModel.trim();
+			const pricing = normalizePricingRate(rawPricing);
+			if (!model || !pricing) continue;
+			models[model] = pricing;
+		}
+		if (Object.keys(models).length > 0) table[provider] = models;
+	}
+	return table;
+}
+
+function normalizePricingRate(value: unknown): RouterPricingRate | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const rate: RouterPricingRate = {};
+	for (const key of [
+		"input",
+		"output",
+		"cached",
+		"reasoning",
+		"cache_creation",
+	] as const) {
+		const candidate = (value as Record<string, unknown>)[key];
+		if (candidate === undefined) continue;
+		const numeric = Number(candidate);
+		if (!Number.isFinite(numeric) || numeric < 0) {
+			throw new Error(`Invalid pricing value for ${key}`);
+		}
+		rate[key] = numeric;
+	}
+	return Object.keys(rate).length > 0 ? rate : null;
+}
+
+function normalizeNestedStringMap(
+	value: unknown,
+): Record<string, Record<string, string>> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const map: Record<string, Record<string, string>> = {};
+	for (const [tool, mappings] of Object.entries(value)) {
+		const toolName = tool.trim();
+		if (!toolName || !mappings || typeof mappings !== "object") continue;
+		const normalized = normalizeStringMap(mappings as Record<string, unknown>);
+		if (Object.keys(normalized).length > 0) map[toolName] = normalized;
+	}
+	return map;
+}
+
+function normalizeStringMap(
+	value: Record<string, unknown>,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(value)
+			.map(([key, entry]) => [key.trim(), String(entry ?? "").trim()])
+			.filter(([key, entry]) => key && entry),
+	);
 }
 
 function roundCurrency(value: number): number {

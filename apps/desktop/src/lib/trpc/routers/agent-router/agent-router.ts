@@ -32,10 +32,14 @@ import {
 	getRouterAliases,
 	getRouterCustomCombos,
 	getRouterCustomModels,
+	getRouterDefaultPricing,
 	getRouterDisabledModels,
 	getRouterModelAvailability,
+	getRouterPricing,
 	getRouterProviderNodes,
 	getRouterUsageStats,
+	resetRouterPricing,
+	updateRouterPricing,
 	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
@@ -71,6 +75,17 @@ const providerNodeValidationInputSchema = providerNodeInputSchema.extend({
 	id: z.string().min(1).optional(),
 	modelId: z.string().optional(),
 });
+const pricingRateSchema = z.object({
+	input: z.number().nonnegative().optional(),
+	output: z.number().nonnegative().optional(),
+	cached: z.number().nonnegative().optional(),
+	reasoning: z.number().nonnegative().optional(),
+	cache_creation: z.number().nonnegative().optional(),
+});
+const pricingTableSchema = z.record(
+	z.string(),
+	z.record(z.string(), pricingRateSchema),
+);
 
 export const createAgentRouterRouter = () => {
 	return router({
@@ -128,6 +143,25 @@ export const createAgentRouterRouter = () => {
 		usageStats: publicProcedure.query(() => getRouterUsageStats()),
 
 		clearUsage: publicProcedure.mutation(() => clearRouterUsage()),
+
+		pricing: publicProcedure.query(() => getRouterPricing()),
+
+		defaultPricing: publicProcedure.query(() => getRouterDefaultPricing()),
+
+		updatePricing: publicProcedure
+			.input(pricingTableSchema)
+			.mutation(({ input }) => updateRouterPricing(input)),
+
+		resetPricing: publicProcedure
+			.input(
+				z
+					.object({
+						provider: z.string().optional(),
+						model: z.string().optional(),
+					})
+					.optional(),
+			)
+			.mutation(({ input }) => resetRouterPricing(input)),
 
 		aliases: publicProcedure.query(() => getRouterAliases()),
 

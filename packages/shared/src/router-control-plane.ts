@@ -83,7 +83,7 @@ export interface RouterProviderCatalogItem {
 
 export interface RouterEndpoint {
 	path: string;
-	method: "GET" | "POST";
+	method: "DELETE" | "GET" | "PATCH" | "POST" | "PUT";
 	compatibility: "OpenAI" | "Anthropic" | "Router";
 	capability: string;
 	status: "native-dashboard" | "gateway-live" | "gateway-catalogued";
@@ -238,6 +238,19 @@ export interface RouterModelTestResult {
 	error: string | null;
 	method: string;
 }
+
+export interface RouterPricingRate {
+	input?: number;
+	output?: number;
+	cached?: number;
+	reasoning?: number;
+	cache_creation?: number;
+}
+
+export type RouterPricingTable = Record<
+	string,
+	Record<string, RouterPricingRate>
+>;
 
 export type RouterProviderNodeType =
 	| "openai-compatible"
@@ -583,6 +596,20 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		status: "gateway-live",
 	},
 	{
+		path: "/api/providers",
+		method: "GET",
+		compatibility: "Router",
+		capability: "9router-compatible provider account registry",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/providers/validate",
+		method: "POST",
+		compatibility: "Router",
+		capability: "Provider API key validation",
+		status: "gateway-live",
+	},
+	{
 		path: "/api/provider-nodes/validate",
 		method: "POST",
 		compatibility: "Router",
@@ -615,6 +642,41 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		method: "GET",
 		compatibility: "Router",
 		capability: "Disabled model registry",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/models/alias",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Model alias registry",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/pricing",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Editable model pricing table",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/cli-tools/all-statuses",
+		method: "GET",
+		compatibility: "Router",
+		capability: "CLI tool integration status batch",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/cli-tools/{tool}-settings",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Codex, Claude, and Cline router config presets",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/cli-tools/antigravity-mitm/alias",
+		method: "GET",
+		compatibility: "Router",
+		capability: "MITM model alias registry",
 		status: "gateway-live",
 	},
 	{
@@ -718,6 +780,20 @@ export const ROUTER_FEATURES: RouterFeature[] = [
 		status: "active",
 		description:
 			"9router-style custom models, disabled models, per-model pings, and availability history.",
+	},
+	{
+		id: "pricing-registry",
+		label: "Pricing registry",
+		status: "active",
+		description:
+			"9router-style editable per-provider/model pricing used by usage cost estimates.",
+	},
+	{
+		id: "cli-tool-presets",
+		label: "CLI tool presets",
+		status: "active",
+		description:
+			"9router-style status/config endpoints for Codex, Claude, Cline, and MITM alias mappings.",
 	},
 	{
 		id: "fallback-classifier",

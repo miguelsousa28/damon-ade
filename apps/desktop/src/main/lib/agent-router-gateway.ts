@@ -1,4 +1,14 @@
+import { execFileSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { AGENT_COMBOS } from "@superset/shared/agent-router";
 import {
@@ -7,11 +17,15 @@ import {
 	buildRouterModelInfo,
 	previewRouterTokenSaver,
 	ROUTER_MODEL_KIND_SLUGS,
+	ROUTER_PROVIDER_CATALOG,
+	ROUTER_PROVIDER_KEY_IDS,
 	type RouterGatewayStatus,
 	type RouterModelKind,
 	type RouterModelResolutionOptions,
 	type RouterModelTarget,
 	type RouterModelTestResult,
+	type RouterPricingTable,
+	type RouterProviderAccount,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
@@ -26,10 +40,15 @@ import express, {
 	type Request,
 } from "express";
 import {
+	createRouterProviderAccount,
+	deleteRouterProviderAccount,
 	getProviderAccountCredentials,
+	listRouterProviderAccountViews,
 	markProviderAccountFailure,
 	markProviderAccountSuccess,
+	type RouterProviderAccountView,
 	type RouterProviderCredential,
+	updateRouterProviderAccount,
 } from "./agent-router-accounts";
 import {
 	clearRouterUsage,
@@ -44,9 +63,12 @@ import {
 	getRouterAliases,
 	getRouterCustomCombos,
 	getRouterCustomModels,
+	getRouterDefaultPricing,
 	getRouterDisabledModelMap,
 	getRouterDisabledModels,
+	getRouterMitmAliases,
 	getRouterModelAvailability,
+	getRouterPricing,
 	getRouterProviderNodes,
 	getRouterUsageChart,
 	getRouterUsageCompatStats,
@@ -57,6 +79,9 @@ import {
 	type RouterUsagePeriod,
 	recordRouterModelAvailability,
 	recordRouterUsage,
+	resetRouterPricing,
+	setRouterMitmAliases,
+	updateRouterPricing,
 	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
@@ -71,6 +96,25 @@ const OPENAI_BASE_URL = "https://api.openai.com/v1";
 const PERPLEXITY_CHAT_COMPLETIONS_URL =
 	"https://api.perplexity.ai/chat/completions";
 const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
+const CLI_TOOL_IDS = [
+	"claude",
+	"codex",
+	"opencode",
+	"droid",
+	"openclaw",
+	"hermes",
+	"cowork",
+	"copilot",
+	"cline",
+	"kilo",
+	"deepseek-tui",
+	"jcode",
+] as const;
+const CODEX_MANAGED_START = "# ADE 9router managed start";
+const CODEX_MANAGED_END = "# ADE 9router managed end";
+
+type CliToolId = (typeof CLI_TOOL_IDS)[number];
+type ConfigurableCliToolId = "claude" | "cline" | "codex";
 
 let server: Server | null = null;
 let activePort = DEFAULT_AGENT_ROUTER_GATEWAY_PORT;
@@ -203,7 +247,7 @@ function createAgentRouterGatewayApp() {
 		res.setHeader("Access-Control-Allow-Origin", "*");
 		res.setHeader(
 			"Access-Control-Allow-Methods",
-			"GET,POST,PUT,DELETE,OPTIONS",
+			"GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		);
 		res.setHeader("Access-Control-Allow-Headers", "*");
 		if (req.method === "OPTIONS") {
@@ -363,16 +407,55 @@ function createAgentRouterGatewayApp() {
 	app.delete("/api/usage", (_req, res) => {
 		res.json(clearRouterUsage());
 	});
+	app.get("/api/pricing/defaults", (_req, res) => {
+		res.json(getRouterDefaultPricing());
+	});
+	app.get("/api/pricing", (_req, res) => {
+		res.json(getRouterPricing());
+	});
+	app.patch("/api/pricing", (req, res) => {
+		try {
+			res.json(updateRouterPricing(parsePricingBody(req.body)));
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.delete("/api/pricing", (req, res) => {
+		res.json(
+			resetRouterPricing({
+				provider: stringQuery(req.query.provider),
+				model: stringQuery(req.query.model),
+			}),
+		);
+	});
 	app.get("/api/models/alias", (_req, res) => {
 		res.json({ aliases: getRouterAliases() });
+	});
+	app.put("/api/models/alias", (req, res) => {
+		const alias = String(req.body?.alias ?? "");
+		const targetModel = String(req.body?.targetModel ?? req.body?.model ?? "");
+		res.json({
+			success: true,
+			model: targetModel,
+			alias,
+			aliases: upsertRouterAlias({ alias, targetModel }),
+		});
 	});
 	app.post("/api/models/alias", (req, res) => {
 		res.json({
 			aliases: upsertRouterAlias({
 				alias: String(req.body?.alias ?? ""),
-				targetModel: String(req.body?.targetModel ?? ""),
+				targetModel: String(req.body?.targetModel ?? req.body?.model ?? ""),
 			}),
 		});
+	});
+	app.delete("/api/models/alias", (req, res) => {
+		const alias = stringQuery(req.query.alias);
+		if (!alias) {
+			res.status(400).json({ error: "Alias required" });
+			return;
+		}
+		res.json({ success: true, aliases: deleteRouterAlias(alias) });
 	});
 	app.delete("/api/models/alias/:alias", (req, res) => {
 		res.json({ aliases: deleteRouterAlias(req.params.alias) });
@@ -470,6 +553,182 @@ function createAgentRouterGatewayApp() {
 	});
 	app.delete("/api/combos/:name", (req, res) => {
 		res.json({ customCombos: deleteRouterCustomCombo(req.params.name) });
+	});
+	app.get("/api/providers", (_req, res) => {
+		res.json({ connections: listRouterProviderConnections() });
+	});
+	app.post("/api/providers/validate", async (req, res) => {
+		const provider = parseProviderKeyId(req.body?.provider);
+		const apiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey : "";
+		if (!provider || !apiKey.trim()) {
+			res.status(400).json({ error: "Provider and API key required" });
+			return;
+		}
+		res.json(await validateRouterProviderKey(provider, apiKey));
+	});
+	app.post("/api/providers/test-batch", async (req, res) => {
+		const result = await testRouterProviderAccounts({
+			mode: typeof req.body?.mode === "string" ? req.body.mode : "",
+			providerId:
+				typeof req.body?.providerId === "string" ? req.body.providerId : null,
+		});
+		res.status(result.ok ? 200 : 400).json(result.body);
+	});
+	app.post("/api/providers", async (req, res) => {
+		const provider = parseProviderKeyId(req.body?.provider);
+		const key = typeof req.body?.apiKey === "string" ? req.body.apiKey : "";
+		if (!provider) {
+			res.status(400).json({ error: "Invalid provider" });
+			return;
+		}
+		if (!key.trim()) {
+			res.status(400).json({ error: "API Key is required" });
+			return;
+		}
+		const account = createRouterProviderAccount({
+			provider,
+			key,
+			name: typeof req.body?.name === "string" ? req.body.name : undefined,
+		})
+			.filter((candidate) => candidate.provider === provider)
+			.sort(
+				(a, b) =>
+					new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+			)[0];
+		if (!account) {
+			res.status(500).json({ error: "Failed to create provider" });
+			return;
+		}
+		if (
+			typeof req.body?.priority === "number" ||
+			typeof req.body?.isActive === "boolean"
+		) {
+			updateRouterProviderAccount({
+				id: account.id,
+				priority:
+					typeof req.body.priority === "number" ? req.body.priority : undefined,
+				isActive:
+					typeof req.body.isActive === "boolean"
+						? req.body.isActive
+						: undefined,
+			});
+		}
+		res.status(201).json({
+			connection: providerConnectionView(account.id),
+		});
+	});
+	app.get("/api/providers/:id", (req, res) => {
+		const connection = providerConnectionView(req.params.id);
+		if (!connection) {
+			res.status(404).json({ error: "Connection not found" });
+			return;
+		}
+		res.json({ connection });
+	});
+	app.put("/api/providers/:id", (req, res) => {
+		const existing = listRouterProviderAccountViews().find(
+			(account) => account.id === req.params.id,
+		);
+		if (!existing) {
+			res.status(404).json({ error: "Connection not found" });
+			return;
+		}
+		updateRouterProviderAccount({
+			id: req.params.id,
+			key: typeof req.body?.apiKey === "string" ? req.body.apiKey : undefined,
+			name: typeof req.body?.name === "string" ? req.body.name : undefined,
+			priority:
+				typeof req.body?.priority === "number" ? req.body.priority : undefined,
+			isActive:
+				typeof req.body?.isActive === "boolean" ? req.body.isActive : undefined,
+		});
+		res.json({ connection: providerConnectionView(req.params.id) });
+	});
+	app.delete("/api/providers/:id", (req, res) => {
+		const existing = listRouterProviderAccountViews().find(
+			(account) => account.id === req.params.id,
+		);
+		if (!existing) {
+			res.status(404).json({ error: "Connection not found" });
+			return;
+		}
+		deleteRouterProviderAccount(req.params.id);
+		res.json({ message: "Connection deleted successfully" });
+	});
+	app.get("/api/cli-tools/all-statuses", (_req, res) => {
+		res.json(buildCliToolStatuses());
+	});
+	app.get("/api/cli-tools/antigravity-mitm/alias", (req, res) => {
+		res.json({ aliases: getRouterMitmAliases(stringQuery(req.query.tool)) });
+	});
+	app.put("/api/cli-tools/antigravity-mitm/alias", (req, res) => {
+		const tool = typeof req.body?.tool === "string" ? req.body.tool : "";
+		const mappings =
+			req.body?.mappings && typeof req.body.mappings === "object"
+				? (req.body.mappings as Record<string, string>)
+				: null;
+		if (!tool || !mappings) {
+			res.status(400).json({ error: "tool and mappings required" });
+			return;
+		}
+		res.json({
+			success: true,
+			aliases: setRouterMitmAliases(tool, mappings),
+		});
+	});
+	app.get("/api/cli-tools/antigravity-mitm", (_req, res) => {
+		res.json(buildMitmStatus());
+	});
+	app.post("/api/cli-tools/antigravity-mitm", (_req, res) => {
+		res.status(501).json({
+			error:
+				"MITM server lifecycle is not bundled in the embedded ADE router yet.",
+			code: "mitm_runtime_unavailable",
+			...buildMitmStatus(),
+		});
+	});
+	app.patch("/api/cli-tools/antigravity-mitm", (_req, res) => {
+		res.status(501).json({
+			error:
+				"MITM DNS/certificate mutation is not bundled in the embedded ADE router yet.",
+			code: "mitm_runtime_unavailable",
+			...buildMitmStatus(),
+		});
+	});
+	app.delete("/api/cli-tools/antigravity-mitm", (_req, res) => {
+		res.json({ success: true, running: false });
+	});
+	app.get("/api/cli-tools/:settingsRoute", (req, res) => {
+		const tool = parseCliSettingsRoute(req.params.settingsRoute);
+		if (!tool) {
+			res.status(404).json({ error: "CLI tool settings route not found" });
+			return;
+		}
+		res.json(buildCliToolStatus(tool));
+	});
+	app.post("/api/cli-tools/:settingsRoute", (req, res) => {
+		const tool = parseCliSettingsRoute(req.params.settingsRoute);
+		if (!tool) {
+			res.status(404).json({ error: "CLI tool settings route not found" });
+			return;
+		}
+		try {
+			res.json(applyCliToolSettings(tool, req.body));
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.delete("/api/cli-tools/:settingsRoute", (req, res) => {
+		const tool = parseCliSettingsRoute(req.params.settingsRoute);
+		if (!tool) {
+			res.status(404).json({ error: "CLI tool settings route not found" });
+			return;
+		}
+		try {
+			res.json(resetCliToolSettings(tool));
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
 	});
 	app.get("/api/provider-nodes", (_req, res) => {
 		res.json({ nodes: getRouterProviderNodes() });
@@ -2054,6 +2313,734 @@ function errorTextFromBody(body: JsonObject): string | null {
 		return stringValue(value.message) ?? stringValue(value.error) ?? null;
 	}
 	return stringValue(body.message) ?? stringValue(body.msg) ?? null;
+}
+
+function listRouterProviderConnections() {
+	return listRouterProviderAccountViews().map(providerConnectionFromAccount);
+}
+
+function providerConnectionView(id: string) {
+	const account = listRouterProviderAccountViews().find(
+		(candidate) => candidate.id === id,
+	);
+	return account ? providerConnectionFromAccount(account) : null;
+}
+
+function providerConnectionFromAccount(account: RouterProviderAccountView) {
+	return {
+		id: account.id,
+		provider: account.provider,
+		name: account.name,
+		displayName: providerDisplayName(account.provider),
+		authType: "apikey",
+		priority: account.priority,
+		globalPriority: null,
+		defaultModel: null,
+		providerSpecificData: {},
+		isActive: account.isActive,
+		testStatus: providerAccountTestStatus(account),
+		lastError: account.lastError?.message ?? null,
+		lastErrorAt: account.lastError?.timestamp ?? null,
+		lastUsedAt: account.lastUsedAt,
+		createdAt: account.createdAt,
+		updatedAt: account.updatedAt,
+		hasKey: account.hasKey,
+		apiKey: undefined,
+		accessToken: undefined,
+		refreshToken: undefined,
+		idToken: undefined,
+	};
+}
+
+function providerDisplayName(provider: RouterProviderKeyId): string {
+	return (
+		ROUTER_PROVIDER_CATALOG.find(
+			(item) => item.keyProvider === provider || item.id === provider,
+		)?.label ?? provider
+	);
+}
+
+function providerAccountTestStatus(account: RouterProviderAccount): string {
+	if (!account.isActive) return "disabled";
+	if (account.lastError) return "failed";
+	if (account.lastUsedAt || account.requestCount > 0) return "success";
+	return "unknown";
+}
+
+function parseProviderKeyId(value: unknown): RouterProviderKeyId | null {
+	return typeof value === "string" &&
+		ROUTER_PROVIDER_KEY_IDS.includes(value as RouterProviderKeyId)
+		? (value as RouterProviderKeyId)
+		: null;
+}
+
+function parsePricingBody(value: unknown): RouterPricingTable {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Invalid pricing data format");
+	}
+	const table: RouterPricingTable = {};
+	for (const [provider, rawModels] of Object.entries(value)) {
+		if (
+			!rawModels ||
+			typeof rawModels !== "object" ||
+			Array.isArray(rawModels)
+		) {
+			throw new Error(`Invalid pricing for provider: ${provider}`);
+		}
+		const models: RouterPricingTable[string] = {};
+		for (const [model, rawPricing] of Object.entries(rawModels)) {
+			if (
+				!rawPricing ||
+				typeof rawPricing !== "object" ||
+				Array.isArray(rawPricing)
+			) {
+				throw new Error(`Invalid pricing for model: ${provider}/${model}`);
+			}
+			const pricing: RouterPricingTable[string][string] = {};
+			for (const key of [
+				"input",
+				"output",
+				"cached",
+				"reasoning",
+				"cache_creation",
+			] as const) {
+				const candidate = (rawPricing as Record<string, unknown>)[key];
+				if (candidate === undefined) continue;
+				const numeric = Number(candidate);
+				if (!Number.isFinite(numeric) || numeric < 0) {
+					throw new Error(
+						`Invalid pricing value for ${key} in ${provider}/${model}`,
+					);
+				}
+				pricing[key] = numeric;
+			}
+			models[model] = pricing;
+		}
+		table[provider] = models;
+	}
+	return table;
+}
+
+async function validateRouterProviderKey(
+	provider: RouterProviderKeyId,
+	apiKey: string,
+) {
+	const startedAt = Date.now();
+	try {
+		const response = await fetchProviderValidationProbe(provider, apiKey);
+		const valid = isProviderValidationSuccess(provider, response);
+		return {
+			valid,
+			error: valid ? null : providerValidationError(provider, response.status),
+			statusCode: response.status,
+			latencyMs: Date.now() - startedAt,
+			testedAt: new Date().toISOString(),
+		};
+	} catch (error) {
+		return {
+			valid: false,
+			error: errorMessage(error),
+			statusCode: null,
+			latencyMs: Date.now() - startedAt,
+			testedAt: new Date().toISOString(),
+		};
+	}
+}
+
+async function fetchProviderValidationProbe(
+	provider: RouterProviderKeyId,
+	apiKey: string,
+): Promise<globalThis.Response> {
+	if (provider === "openrouter") {
+		return fetchWithTimeout(
+			"https://openrouter.ai/api/v1/models",
+			{ headers: { Authorization: `Bearer ${apiKey}` } },
+			8_000,
+		);
+	}
+	if (provider === "openai") {
+		return fetchWithTimeout(
+			`${OPENAI_BASE_URL}/models`,
+			{ headers: { Authorization: `Bearer ${apiKey}` } },
+			8_000,
+		);
+	}
+	if (provider === "anthropic") {
+		return fetchWithTimeout(
+			"https://api.anthropic.com/v1/messages",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"anthropic-version": "2023-06-01",
+					"x-api-key": apiKey,
+				},
+				body: JSON.stringify({
+					model: "claude-3-haiku-20240307",
+					max_tokens: 1,
+					messages: [{ role: "user", content: "ping" }],
+				}),
+			},
+			10_000,
+		);
+	}
+	if (provider === "gemini") {
+		return fetchWithTimeout(
+			`https://generativelanguage.googleapis.com/v1/models?key=${encodeURIComponent(apiKey)}`,
+			{},
+			8_000,
+		);
+	}
+	if (provider === "perplexity") {
+		return fetchWithTimeout(
+			PERPLEXITY_CHAT_COMPLETIONS_URL,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${apiKey}`,
+				},
+				body: JSON.stringify({
+					model: "sonar",
+					messages: [{ role: "user", content: "ping" }],
+					max_tokens: 1,
+				}),
+			},
+			10_000,
+		);
+	}
+	if (provider === "brave-search") {
+		return fetchWithTimeout(
+			`${BRAVE_SEARCH_URL}?q=ping&count=1`,
+			{ headers: { "X-Subscription-Token": apiKey } },
+			8_000,
+		);
+	}
+	if (provider === "elevenlabs") {
+		return fetchWithTimeout(
+			"https://api.elevenlabs.io/v1/voices",
+			{ headers: { "xi-api-key": apiKey } },
+			8_000,
+		);
+	}
+	if (provider === "stability-ai") {
+		return fetchWithTimeout(
+			"https://api.stability.ai/v1/user/account",
+			{ headers: { Authorization: `Bearer ${apiKey}` } },
+			8_000,
+		);
+	}
+	throw new Error(`Provider validation not supported: ${provider}`);
+}
+
+function isProviderValidationSuccess(
+	provider: RouterProviderKeyId,
+	response: globalThis.Response,
+): boolean {
+	if (provider === "anthropic" || provider === "perplexity") {
+		return response.status !== 401 && response.status !== 403;
+	}
+	return response.ok;
+}
+
+function providerValidationError(
+	provider: RouterProviderKeyId,
+	status: number,
+): string {
+	if (status === 401 || status === 403) return "Invalid API key";
+	if (status === 404 && provider === "anthropic") return "Invalid model probe";
+	return `Validation request failed (${status})`;
+}
+
+async function testRouterProviderAccounts({
+	mode,
+	providerId,
+}: {
+	mode: string;
+	providerId: string | null;
+}): Promise<{ ok: boolean; body: JsonObject }> {
+	if (!mode) return { ok: false, body: { error: "mode is required" } };
+	const allowedModes = new Set([
+		"provider",
+		"oauth",
+		"free",
+		"apikey",
+		"compatible",
+		"all",
+	]);
+	if (!allowedModes.has(mode)) {
+		return {
+			ok: false,
+			body: {
+				error:
+					"Invalid mode. Use: provider, oauth, free, apikey, compatible, all",
+			},
+		};
+	}
+
+	const accounts = listRouterProviderAccountViews().filter((account) => {
+		if (!account.isActive) return false;
+		if (mode === "provider") return account.provider === providerId;
+		if (mode === "apikey" || mode === "all") return true;
+		return false;
+	});
+
+	const results = [];
+	for (const account of accounts) {
+		const credential = getProviderAccountCredentials(account.provider).find(
+			(candidate) => candidate.id === account.id,
+		);
+		if (!credential) {
+			results.push({
+				provider: account.provider,
+				connectionId: account.id,
+				connectionName: account.name,
+				authType: "apikey",
+				valid: false,
+				latencyMs: 0,
+				error: "No API key stored for this account.",
+				statusCode: null,
+				testedAt: new Date().toISOString(),
+			});
+			continue;
+		}
+		const test = await validateRouterProviderKey(
+			credential.provider,
+			credential.key,
+		);
+		if (test.valid) {
+			markProviderAccountSuccess(credential);
+		} else {
+			markProviderAccountFailure({
+				credential,
+				status: test.statusCode ?? undefined,
+				text: test.error ?? undefined,
+			});
+		}
+		results.push({
+			provider: account.provider,
+			connectionId: account.id,
+			connectionName: account.name,
+			authType: "apikey",
+			valid: test.valid,
+			latencyMs: test.latencyMs,
+			error: test.error,
+			statusCode: test.statusCode,
+			testedAt: test.testedAt,
+		});
+	}
+
+	return {
+		ok: true,
+		body: {
+			mode,
+			providerId: providerId ?? null,
+			results,
+			testedAt: new Date().toISOString(),
+			summary: {
+				total: results.length,
+				passed: results.filter((result) => result.valid).length,
+				failed: results.filter((result) => !result.valid).length,
+			},
+		},
+	};
+}
+
+function stringQuery(value: unknown): string | null {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value) && typeof value[0] === "string") return value[0];
+	return null;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function buildCliToolStatuses(): Record<CliToolId, JsonObject> {
+	return Object.fromEntries(
+		CLI_TOOL_IDS.map((tool) => [tool, buildCliToolStatus(tool)]),
+	) as Record<CliToolId, JsonObject>;
+}
+
+function buildCliToolStatus(tool: CliToolId): JsonObject {
+	if (tool === "codex") return buildCodexToolStatus();
+	if (tool === "claude") return buildClaudeToolStatus();
+	if (tool === "cline") return buildClineToolStatus();
+	return {
+		installed: commandExists(tool),
+		config: null,
+		settings: null,
+		has9Router: false,
+		message: `${tool} status is catalogued; automatic ADE config is not implemented yet.`,
+	};
+}
+
+function buildCodexToolStatus(): JsonObject {
+	const configPath = codexConfigPath();
+	const config = readTextOrNull(configPath);
+	return {
+		installed: commandExists("codex") || Boolean(config),
+		config,
+		has9Router:
+			Boolean(config?.includes('model_provider = "9router"')) ||
+			Boolean(config?.includes("[model_providers.9router]")),
+		configPath,
+		authPath: codexAuthPath(),
+	};
+}
+
+function buildClaudeToolStatus(): JsonObject {
+	const settingsPath = claudeSettingsPath();
+	const settings = readJsonOrNull(settingsPath);
+	const baseUrl =
+		stringValue(toJsonObject(settings?.env).ANTHROPIC_BASE_URL) ?? "";
+	return {
+		installed: commandExists("claude") || Boolean(settings),
+		settings,
+		has9Router:
+			baseUrl.includes("localhost") ||
+			baseUrl.includes("127.0.0.1") ||
+			baseUrl.includes("9router") ||
+			baseUrl.includes(getAgentRouterGatewayStatus().url),
+		settingsPath,
+	};
+}
+
+function buildClineToolStatus(): JsonObject {
+	const globalStatePath = clineGlobalStatePath();
+	const settings = readJsonOrNull(globalStatePath);
+	const baseUrl = stringValue(toJsonObject(settings).openAiBaseUrl) ?? "";
+	return {
+		installed: commandExists("cline") || Boolean(settings),
+		settings: {
+			actModeApiProvider: toJsonObject(settings).actModeApiProvider,
+			planModeApiProvider: toJsonObject(settings).planModeApiProvider,
+			openAiBaseUrl: baseUrl || undefined,
+			openAiModelId: toJsonObject(settings).openAiModelId,
+		},
+		has9Router:
+			baseUrl.includes("localhost") ||
+			baseUrl.includes("127.0.0.1") ||
+			baseUrl.includes("9router"),
+		globalStatePath,
+		secretsPath: clineSecretsPath(),
+	};
+}
+
+function applyCliToolSettings(tool: ConfigurableCliToolId, input: unknown) {
+	if (tool === "codex") return applyCodexSettings(input);
+	if (tool === "claude") return applyClaudeSettings(input);
+	return applyClineSettings(input);
+}
+
+function resetCliToolSettings(tool: ConfigurableCliToolId) {
+	if (tool === "codex") return resetCodexSettings();
+	if (tool === "claude") return resetClaudeSettings();
+	return resetClineSettings();
+}
+
+function parseCliSettingsRoute(value: string): ConfigurableCliToolId | null {
+	if (value === "codex-settings") return "codex";
+	if (value === "claude-settings") return "claude";
+	if (value === "cline-settings") return "cline";
+	return null;
+}
+
+function applyCodexSettings(input: unknown): JsonObject {
+	const body = toJsonObject(input);
+	const baseUrl = normalizeCliBaseUrl(body.baseUrl, true);
+	const apiKey = requiredString(body.apiKey, "apiKey");
+	const model = requiredString(body.model, "model");
+	const subagentModel =
+		typeof body.subagentModel === "string" && body.subagentModel.trim()
+			? body.subagentModel.trim()
+			: model;
+	const configPath = codexConfigPath();
+	mkdirSync(dirname(configPath), { recursive: true });
+	const current = readTextOrNull(configPath) ?? "";
+	writeFileSync(
+		configPath,
+		replaceManagedBlock(
+			current,
+			codexManagedBlock(baseUrl, model, subagentModel),
+		),
+		"utf8",
+	);
+	const auth = toJsonObject(readJsonOrNull(codexAuthPath()));
+	writeJsonFile(codexAuthPath(), {
+		...auth,
+		OPENAI_API_KEY: apiKey,
+		auth_mode: "apikey",
+	});
+	return {
+		success: true,
+		message: "Codex settings applied successfully.",
+		configPath,
+	};
+}
+
+function resetCodexSettings(): JsonObject {
+	const configPath = codexConfigPath();
+	const current = readTextOrNull(configPath);
+	if (current !== null) {
+		writeFileSync(configPath, removeManagedBlock(current), "utf8");
+	}
+	const authPath = codexAuthPath();
+	const auth = toJsonObject(readJsonOrNull(authPath));
+	delete auth.OPENAI_API_KEY;
+	delete auth.auth_mode;
+	if (Object.keys(auth).length === 0) {
+		if (existsSync(authPath)) unlinkSync(authPath);
+	} else {
+		writeJsonFile(authPath, auth);
+	}
+	return { success: true, message: "Codex ADE settings removed." };
+}
+
+function applyClaudeSettings(input: unknown): JsonObject {
+	const body = toJsonObject(input);
+	const envInput = toJsonObject(body.env);
+	const env =
+		Object.keys(envInput).length > 0
+			? envInput
+			: {
+					ANTHROPIC_BASE_URL: normalizeCliBaseUrl(body.baseUrl, true),
+					ANTHROPIC_AUTH_TOKEN: requiredString(body.apiKey, "apiKey"),
+					ANTHROPIC_DEFAULT_OPUS_MODEL: requiredString(body.model, "model"),
+					ANTHROPIC_DEFAULT_SONNET_MODEL: requiredString(body.model, "model"),
+					ANTHROPIC_DEFAULT_HAIKU_MODEL: requiredString(body.model, "model"),
+					API_TIMEOUT_MS: "600000",
+				};
+	if (typeof env.ANTHROPIC_BASE_URL === "string") {
+		env.ANTHROPIC_BASE_URL = normalizeCliBaseUrl(env.ANTHROPIC_BASE_URL, true);
+	}
+	const settingsPath = claudeSettingsPath();
+	const current = toJsonObject(readJsonOrNull(settingsPath));
+	writeJsonFile(settingsPath, {
+		...current,
+		hasCompletedOnboarding: true,
+		env: {
+			...toJsonObject(current.env),
+			...env,
+		},
+	});
+	return {
+		success: true,
+		message: "Claude settings applied successfully.",
+		settingsPath,
+	};
+}
+
+function resetClaudeSettings(): JsonObject {
+	const settingsPath = claudeSettingsPath();
+	if (!existsSync(settingsPath)) {
+		return { success: true, message: "No Claude settings file to reset." };
+	}
+	const current = toJsonObject(readJsonOrNull(settingsPath));
+	const env = toJsonObject(current.env);
+	for (const key of [
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"API_TIMEOUT_MS",
+	]) {
+		delete env[key];
+	}
+	const next = { ...current };
+	if (Object.keys(env).length > 0) next.env = env;
+	else delete next.env;
+	writeJsonFile(settingsPath, next);
+	return { success: true, message: "Claude ADE settings removed." };
+}
+
+function applyClineSettings(input: unknown): JsonObject {
+	const body = toJsonObject(input);
+	const baseUrl = normalizeCliBaseUrl(body.baseUrl, false);
+	const apiKey = requiredString(body.apiKey, "apiKey");
+	const model = requiredString(body.model, "model");
+	const globalStatePath = clineGlobalStatePath();
+	const current = toJsonObject(readJsonOrNull(globalStatePath));
+	writeJsonFile(globalStatePath, {
+		...current,
+		actModeApiProvider: "openai",
+		planModeApiProvider: "openai",
+		openAiBaseUrl: baseUrl,
+		openAiModelId: model,
+		planModeOpenAiModelId: model,
+	});
+	writeJsonFile(clineSecretsPath(), {
+		...toJsonObject(readJsonOrNull(clineSecretsPath())),
+		openAiApiKey: apiKey,
+	});
+	return {
+		success: true,
+		message: "Cline settings applied successfully.",
+		globalStatePath,
+	};
+}
+
+function resetClineSettings(): JsonObject {
+	const globalStatePath = clineGlobalStatePath();
+	if (!existsSync(globalStatePath) && !existsSync(clineSecretsPath())) {
+		return { success: true, message: "No Cline settings file to reset." };
+	}
+	const globalState = toJsonObject(readJsonOrNull(globalStatePath));
+	if (globalState.actModeApiProvider === "openai") {
+		globalState.actModeApiProvider = "cline";
+		globalState.planModeApiProvider = "cline";
+		delete globalState.openAiBaseUrl;
+		delete globalState.openAiModelId;
+		delete globalState.planModeOpenAiModelId;
+		writeJsonFile(globalStatePath, globalState);
+	}
+	const secretsPath = clineSecretsPath();
+	const secrets = toJsonObject(readJsonOrNull(secretsPath));
+	delete secrets.openAiApiKey;
+	writeJsonFile(secretsPath, secrets);
+	return { success: true, message: "Cline ADE settings removed." };
+}
+
+function buildMitmStatus(): JsonObject {
+	return {
+		running: false,
+		pid: null,
+		certExists: false,
+		certTrusted: false,
+		dnsStatus: {},
+		hasCachedPassword: false,
+		isWin: process.platform === "win32",
+		needsSudoPassword: false,
+		isAdmin: false,
+		mitmRouterBaseUrl: getAgentRouterGatewayStatus().url,
+		aliases: getRouterMitmAliases(),
+		runtime: "catalogued",
+	};
+}
+
+function commandExists(command: string): boolean {
+	try {
+		const executable = process.platform === "win32" ? "where.exe" : "which";
+		execFileSync(executable, [command], {
+			stdio: "ignore",
+			windowsHide: true,
+			env:
+				process.platform === "win32"
+					? {
+							...process.env,
+							PATH: `${process.env.APPDATA}\\npm;${process.env.PATH ?? ""}`,
+						}
+					: process.env,
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function normalizeCliBaseUrl(value: unknown, withV1: boolean): string {
+	const fallback = getAgentRouterGatewayStatus().url;
+	const raw = (typeof value === "string" && value.trim() ? value : fallback)
+		.trim()
+		.replace(/\/+$/g, "");
+	if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+		throw new Error("baseUrl must be an http(s) URL");
+	}
+	if (withV1) return raw.endsWith("/v1") ? raw : `${raw}/v1`;
+	return raw.endsWith("/v1") ? raw.slice(0, -3) : raw;
+}
+
+function requiredString(value: unknown, name: string): string {
+	if (typeof value === "string" && value.trim()) return value.trim();
+	throw new Error(`${name} is required`);
+}
+
+function codexManagedBlock(
+	baseUrl: string,
+	model: string,
+	subagentModel: string,
+): string {
+	return [
+		CODEX_MANAGED_START,
+		`model = ${tomlString(model)}`,
+		'model_provider = "9router"',
+		"",
+		"[model_providers.9router]",
+		'name = "9Router"',
+		`base_url = ${tomlString(baseUrl)}`,
+		'wire_api = "responses"',
+		"",
+		"[agents.subagent]",
+		`model = ${tomlString(subagentModel)}`,
+		CODEX_MANAGED_END,
+	].join("\n");
+}
+
+function replaceManagedBlock(content: string, block: string): string {
+	const without = removeManagedBlock(content).trimEnd();
+	return `${without ? `${without}\n\n` : ""}${block}\n`;
+}
+
+function removeManagedBlock(content: string): string {
+	const pattern = new RegExp(
+		`${escapeRegExp(CODEX_MANAGED_START)}[\\s\\S]*?${escapeRegExp(CODEX_MANAGED_END)}\\n?`,
+		"g",
+	);
+	return content.replace(pattern, "").trimEnd() + (content.trim() ? "\n" : "");
+}
+
+function tomlString(value: string): string {
+	return JSON.stringify(value);
+}
+
+function readTextOrNull(path: string): string | null {
+	try {
+		return readFileSync(path, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+function readJsonOrNull(path: string): JsonObject | null {
+	try {
+		return JSON.parse(readFileSync(path, "utf8").replace(/,(\s*[}\]])/g, "$1"));
+	} catch {
+		return null;
+	}
+}
+
+function writeJsonFile(path: string, value: JsonObject): void {
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function codexConfigPath(): string {
+	return join(homedir(), ".codex", "config.toml");
+}
+
+function codexAuthPath(): string {
+	return join(homedir(), ".codex", "auth.json");
+}
+
+function claudeSettingsPath(): string {
+	return join(homedir(), ".claude", "settings.json");
+}
+
+function clineDataDir(): string {
+	return join(homedir(), ".cline", "data");
+}
+
+function clineGlobalStatePath(): string {
+	return join(clineDataDir(), "globalState.json");
+}
+
+function clineSecretsPath(): string {
+	return join(clineDataDir(), "secrets.json");
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseCustomModelBody(value: unknown) {
