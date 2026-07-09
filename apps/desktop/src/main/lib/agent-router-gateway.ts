@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -172,14 +173,22 @@ type OAuthRefreshProviderId = "codex" | "claude" | "gemini";
 interface OAuthRefreshConfig {
 	id: OAuthRefreshProviderId;
 	aliases: string[];
+	authorizeUrl: string;
+	callbackPath?: string;
 	clientId?: string;
 	clientIdEnv?: string;
 	clientSecret?: string;
 	clientSecretEnv?: string;
+	codeChallengeMethod?: "S256";
+	defaultRedirectUri: string;
 	encoding: "form" | "json";
+	exchangeEncoding: "form" | "json";
+	extraAuthParams?: Record<string, string>;
 	keyProvider: RouterProviderKeyId;
 	leadMs: number;
 	maxRefreshAgeMs?: number;
+	scope?: string;
+	scopes?: string[];
 	tokenUrl: string;
 }
 
@@ -191,7 +200,7 @@ type OAuthRefreshResult =
 			expiresIn: number | null;
 			idToken: string | null;
 			providerSpecificData: JsonObject;
-			refreshToken: string;
+			refreshToken: string | null;
 	  }
 	| {
 			ok: false;
@@ -222,30 +231,58 @@ const OAUTH_REFRESH_CONFIGS: Record<
 	claude: {
 		id: "claude",
 		aliases: ["anthropic"],
+		authorizeUrl: "https://claude.ai/oauth/authorize",
 		clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		codeChallengeMethod: "S256",
+		defaultRedirectUri: "http://localhost:8080/callback",
 		encoding: "json",
+		exchangeEncoding: "json",
 		keyProvider: "anthropic",
 		leadMs: 4 * 60 * 60 * 1000,
+		scopes: ["org:create_api_key", "user:profile", "user:inference"],
 		tokenUrl: "https://api.anthropic.com/v1/oauth/token",
 	},
 	codex: {
 		id: "codex",
 		aliases: ["openai", "chatgpt"],
+		authorizeUrl: "https://auth.openai.com/oauth/authorize",
+		callbackPath: "/auth/callback",
 		clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
+		codeChallengeMethod: "S256",
+		defaultRedirectUri: "http://localhost:1455/auth/callback",
 		encoding: "json",
+		exchangeEncoding: "form",
+		extraAuthParams: {
+			codex_cli_simplified_flow: "true",
+			id_token_add_organizations: "true",
+			originator: "codex_cli_rs",
+		},
 		keyProvider: "openai",
 		leadMs: 5 * 24 * 60 * 60 * 1000,
 		maxRefreshAgeMs: 8 * 24 * 60 * 60 * 1000,
+		scope: "openid profile email offline_access",
 		tokenUrl: "https://auth.openai.com/oauth/token",
 	},
 	gemini: {
 		id: "gemini",
 		aliases: ["google", "gemini-cli", "antigravity"],
+		authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
 		clientIdEnv: "ADE_GEMINI_OAUTH_CLIENT_ID",
 		clientSecretEnv: "ADE_GEMINI_OAUTH_CLIENT_SECRET",
+		defaultRedirectUri: "http://localhost:8080/callback",
 		encoding: "form",
+		exchangeEncoding: "form",
+		extraAuthParams: {
+			access_type: "offline",
+			prompt: "consent",
+		},
 		keyProvider: "gemini",
 		leadMs: 5 * 60 * 1000,
+		scopes: [
+			"https://www.googleapis.com/auth/cloud-platform",
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		],
 		tokenUrl: "https://oauth2.googleapis.com/token",
 	},
 };
@@ -1080,16 +1117,8 @@ function createAgentRouterGatewayApp() {
 		});
 	});
 	app.get("/api/oauth/:provider/authorize", (req, res) => {
-		const provider = resolveOAuthProvider(req.params.provider);
-		if (!provider) {
-			res.status(404).json({ error: "OAuth provider not supported by ADE" });
-			return;
-		}
-		res.status(501).json({
-			error: "Browser OAuth authorize is not automated in ADE yet.",
-			provider,
-			importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
-		});
+		const result = buildOAuthAuthorizeResponse(req.params.provider, req.query);
+		res.status(result.status).json(result.body);
 	});
 	app.get("/api/oauth/:provider/device-code", (req, res) => {
 		const provider = resolveOAuthProvider(req.params.provider);
@@ -1097,9 +1126,10 @@ function createAgentRouterGatewayApp() {
 			res.status(404).json({ error: "OAuth provider not supported by ADE" });
 			return;
 		}
-		res.status(501).json({
-			error: "Device-code OAuth is not automated in ADE yet.",
+		res.status(400).json({
+			error: "Device-code OAuth is not supported for this ADE provider.",
 			provider,
+			authorizeUrl: `/api/oauth/${req.params.provider}/authorize`,
 			importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
 		});
 	});
@@ -1107,7 +1137,7 @@ function createAgentRouterGatewayApp() {
 		const result = importOAuthTokenConnection(req.params.provider, req.body);
 		res.status(result.ok ? 201 : result.status).json(result.body);
 	});
-	app.post("/api/oauth/:provider/exchange", (req, res) => {
+	app.post("/api/oauth/:provider/exchange", async (req, res) => {
 		const body = toJsonObject(req.body);
 		const code = typeof body.code === "string" ? body.code.trim() : "";
 		if (looksLikeJwt(code)) {
@@ -1119,17 +1149,8 @@ function createAgentRouterGatewayApp() {
 			res.status(result.ok ? 201 : result.status).json(result.body);
 			return;
 		}
-		const provider = resolveOAuthProvider(req.params.provider);
-		res.status(provider ? 501 : 404).json(
-			provider
-				? {
-						error:
-							"OAuth code exchange is not automated in ADE yet. Import an access token instead.",
-						provider,
-						importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
-					}
-				: { error: "OAuth provider not supported by ADE" },
-		);
+		const result = await exchangeOAuthCodeConnection(req.params.provider, body);
+		res.status(result.status).json(result.body);
 	});
 	app.post("/api/oauth/:provider/poll", (req, res) => {
 		const provider = resolveOAuthProvider(req.params.provider);
@@ -3032,10 +3053,10 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		keyProvider: "openai",
 		label: "Codex / OpenAI",
 		importToken: true,
-		authorize: false,
+		authorize: true,
 		deviceCode: false,
 		notes:
-			"Import a Codex/OpenAI access token plus refresh token; ADE can rotate it automatically.",
+			"Authorize with PKCE or import a Codex/OpenAI token; ADE can rotate refresh tokens automatically.",
 	},
 	{
 		id: "claude",
@@ -3043,10 +3064,10 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		keyProvider: "anthropic",
 		label: "Claude / Anthropic",
 		importToken: true,
-		authorize: false,
+		authorize: true,
 		deviceCode: false,
 		notes:
-			"Import a Claude/Anthropic access token plus refresh token; ADE can rotate it automatically.",
+			"Authorize with PKCE or import a Claude/Anthropic token; ADE can rotate refresh tokens automatically.",
 	},
 	{
 		id: "gemini",
@@ -3054,10 +3075,10 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		keyProvider: "gemini",
 		label: "Gemini / Google",
 		importToken: true,
-		authorize: false,
+		authorize: true,
 		deviceCode: false,
 		notes:
-			"Import a Gemini OAuth access token plus refresh token; ADE can rotate it automatically.",
+			"Authorize with configured Google OAuth credentials or import a Gemini token; ADE can rotate refresh tokens automatically.",
 	},
 ];
 
@@ -3105,6 +3126,352 @@ function resolveOAuthRefreshConfigForCredential(
 		resolveOAuthRefreshConfig(metadataProvider) ??
 		resolveOAuthRefreshConfig(credential.provider)
 	);
+}
+
+function buildOAuthAuthorizeResponse(providerId: string, rawQuery: unknown) {
+	const provider = resolveOAuthProvider(providerId);
+	if (!provider) {
+		return {
+			status: 404,
+			body: { error: "OAuth provider not supported by ADE" },
+		};
+	}
+	const config = resolveOAuthRefreshConfig(provider.id);
+	if (!config) {
+		return {
+			status: 404,
+			body: { error: "OAuth provider authorize is not supported by ADE" },
+		};
+	}
+	const client = resolveOAuthClientCredentials(
+		config,
+		oauthMetadataFromSource(rawQuery),
+		{ requireSecret: false },
+	);
+	if (!client.ok) {
+		return { status: client.status, body: { error: client.error, provider } };
+	}
+
+	const redirectUri =
+		sourceStringValue(rawQuery, "redirect_uri") ??
+		sourceStringValue(rawQuery, "redirectUri") ??
+		config.defaultRedirectUri;
+	const state = sourceStringValue(rawQuery, "state") ?? randomBase64Url(32);
+	const pkce = config.codeChallengeMethod ? generateOAuthPkce() : null;
+	const params: Record<string, string> = {
+		client_id: client.clientId,
+		redirect_uri: redirectUri,
+		response_type: "code",
+		state,
+		...buildOAuthScopeParam(config),
+		...(config.extraAuthParams ?? {}),
+	};
+	if (config.id === "claude") params.code = "true";
+	if (pkce) {
+		params.code_challenge = pkce.codeChallenge;
+		params.code_challenge_method = config.codeChallengeMethod ?? "S256";
+	}
+
+	const authUrl = `${config.authorizeUrl}?${buildQueryString(params)}`;
+	return {
+		status: 200,
+		body: {
+			success: true,
+			authUrl,
+			authorizationUrl: authUrl,
+			codeVerifier: pkce?.codeVerifier ?? null,
+			expiresIn: 300,
+			importTokenUrl: `/api/oauth/${provider.id}/import-token`,
+			provider,
+			redirectUri,
+			state,
+		},
+	};
+}
+
+async function exchangeOAuthCodeConnection(
+	providerId: string,
+	rawBody: JsonObject,
+): Promise<{ body: JsonObject; status: number }> {
+	const provider = resolveOAuthProvider(providerId);
+	if (!provider) {
+		return {
+			status: 404,
+			body: { error: "OAuth provider not supported by ADE" },
+		};
+	}
+	const config = resolveOAuthRefreshConfig(provider.id);
+	if (!config) {
+		return {
+			status: 404,
+			body: { error: "OAuth provider exchange is not supported by ADE" },
+		};
+	}
+	const code = sourceStringValue(rawBody, "code");
+	if (!code) return { status: 400, body: { error: "code is required" } };
+	const redirectUri =
+		sourceStringValue(rawBody, "redirectUri") ??
+		sourceStringValue(rawBody, "redirect_uri") ??
+		config.defaultRedirectUri;
+	const codeVerifier =
+		sourceStringValue(rawBody, "codeVerifier") ??
+		sourceStringValue(rawBody, "code_verifier");
+	if (config.codeChallengeMethod && !codeVerifier) {
+		return {
+			status: 400,
+			body: { error: "codeVerifier is required for this OAuth provider" },
+		};
+	}
+	const client = resolveOAuthClientCredentials(
+		config,
+		oauthMetadataFromSource(rawBody),
+		{ requireSecret: Boolean(config.clientSecretEnv) },
+	);
+	if (!client.ok) {
+		return { status: client.status, body: { error: client.error, provider } };
+	}
+
+	const tokens = await exchangeOAuthCodeForTokens(config, client, {
+		code,
+		codeVerifier,
+		redirectUri,
+		state: sourceStringValue(rawBody, "state"),
+	});
+	if (!tokens.ok) {
+		return {
+			status: tokens.status ?? 400,
+			body: { success: false, error: tokens.error, provider },
+		};
+	}
+
+	return importOAuthTokenConnection(provider.id, {
+		accessToken: tokens.accessToken,
+		authType: "oauth",
+		email: sourceStringValue(rawBody, "email"),
+		expiresAt: tokens.expiresAt,
+		idToken: tokens.idToken,
+		name: sourceStringValue(rawBody, "name"),
+		providerSpecificData: {
+			...jsonObjectValue(rawBody.providerSpecificData),
+			...jsonObjectValue(rawBody.provider_specific_data),
+			...tokens.providerSpecificData,
+			...(client.fromMetadata ? { oauthClientId: client.clientId } : {}),
+		},
+		refreshToken: tokens.refreshToken,
+	});
+}
+
+async function exchangeOAuthCodeForTokens(
+	provider: OAuthRefreshConfig,
+	client: { clientId: string; clientSecret?: string },
+	input: {
+		code: string;
+		codeVerifier?: string;
+		redirectUri: string;
+		state?: string;
+	},
+): Promise<OAuthRefreshResult> {
+	let code = input.code;
+	let state = input.state;
+	if (provider.id === "claude" && code.includes("#")) {
+		const [authCode, codeState] = code.split("#");
+		code = authCode;
+		state = codeState || state;
+	}
+	const payload: Record<string, string> = {
+		client_id: client.clientId,
+		code,
+		grant_type: "authorization_code",
+		redirect_uri: input.redirectUri,
+		...(client.clientSecret ? { client_secret: client.clientSecret } : {}),
+	};
+	if (input.codeVerifier) payload.code_verifier = input.codeVerifier;
+	if (provider.id === "claude" && state) payload.state = state;
+
+	const response = await fetchWithTimeout(
+		provider.tokenUrl,
+		{
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type":
+					provider.exchangeEncoding === "form"
+						? "application/x-www-form-urlencoded"
+						: "application/json",
+			},
+			body:
+				provider.exchangeEncoding === "form"
+					? new URLSearchParams(payload)
+					: JSON.stringify(payload),
+		},
+		15_000,
+	);
+	return oauthTokenResultFromResponse(provider, response, "");
+}
+
+function resolveOAuthClientCredentials(
+	provider: OAuthRefreshConfig,
+	source: JsonObject = {},
+	options: { requireSecret: boolean },
+):
+	| { ok: true; clientId: string; clientSecret?: string; fromMetadata: boolean }
+	| { ok: false; error: string; status: number } {
+	const metadataClientId =
+		stringValue(source.oauthClientId) ?? stringValue(source.clientId);
+	const metadataClientSecret =
+		stringValue(source.oauthClientSecret) ?? stringValue(source.clientSecret);
+	const envClientId = provider.clientIdEnv
+		? stringValue(process.env[provider.clientIdEnv])
+		: undefined;
+	const envClientSecret = provider.clientSecretEnv
+		? stringValue(process.env[provider.clientSecretEnv])
+		: undefined;
+	const clientId = provider.clientId ?? metadataClientId ?? envClientId;
+	const clientSecret =
+		provider.clientSecret ?? metadataClientSecret ?? envClientSecret;
+	if (!clientId) {
+		return {
+			ok: false,
+			error: `${provider.id} OAuth client id is not configured.`,
+			status: 400,
+		};
+	}
+	if (options.requireSecret && !clientSecret) {
+		return {
+			ok: false,
+			error: `${provider.id} OAuth client secret is not configured.`,
+			status: 400,
+		};
+	}
+	return {
+		ok: true,
+		clientId,
+		clientSecret,
+		fromMetadata: Boolean(metadataClientId),
+	};
+}
+
+function oauthMetadataFromSource(source: unknown): JsonObject {
+	const body = toJsonObject(source);
+	return {
+		...jsonObjectValue(body.meta),
+		...jsonObjectValue(body.providerSpecificData),
+		...jsonObjectValue(body.provider_specific_data),
+		...(sourceStringValue(source, "clientId")
+			? { clientId: sourceStringValue(source, "clientId") }
+			: {}),
+		...(sourceStringValue(source, "client_id")
+			? { clientId: sourceStringValue(source, "client_id") }
+			: {}),
+		...(sourceStringValue(source, "oauthClientId")
+			? { oauthClientId: sourceStringValue(source, "oauthClientId") }
+			: {}),
+		...(sourceStringValue(source, "clientSecret")
+			? { clientSecret: sourceStringValue(source, "clientSecret") }
+			: {}),
+		...(sourceStringValue(source, "client_secret")
+			? { clientSecret: sourceStringValue(source, "client_secret") }
+			: {}),
+		...(sourceStringValue(source, "oauthClientSecret")
+			? { oauthClientSecret: sourceStringValue(source, "oauthClientSecret") }
+			: {}),
+	};
+}
+
+function sourceStringValue(source: unknown, key: string): string | undefined {
+	const body = toJsonObject(source);
+	const value = body[key];
+	if (Array.isArray(value)) return stringValue(value[0]);
+	return stringValue(value);
+}
+
+function buildOAuthScopeParam(
+	provider: OAuthRefreshConfig,
+): Record<string, string> {
+	if (provider.scope) return { scope: provider.scope };
+	if (provider.scopes?.length) return { scope: provider.scopes.join(" ") };
+	return {};
+}
+
+function generateOAuthPkce(): {
+	codeChallenge: string;
+	codeVerifier: string;
+} {
+	const codeVerifier = randomBase64Url(64);
+	return {
+		codeChallenge: createHash("sha256")
+			.update(codeVerifier)
+			.digest("base64url"),
+		codeVerifier,
+	};
+}
+
+function randomBase64Url(bytes: number): string {
+	return randomBytes(bytes).toString("base64url");
+}
+
+function buildQueryString(params: Record<string, string>): string {
+	return Object.entries(params)
+		.map(
+			([key, value]) =>
+				`${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+		)
+		.join("&");
+}
+
+async function oauthTokenResultFromResponse(
+	provider: OAuthRefreshConfig,
+	response: globalThis.Response,
+	fallbackRefreshToken: string | null,
+): Promise<OAuthRefreshResult> {
+	const text = await response.text().catch(() => "");
+	let data: JsonObject = {};
+	try {
+		data = text ? (JSON.parse(text) as JsonObject) : {};
+	} catch {
+		data = {};
+	}
+	if (!response.ok) {
+		return {
+			ok: false,
+			error:
+				oauthRefreshErrorMessage(data, response.status) ||
+				`OAuth ${provider.id} token request failed (${response.status})`,
+			permanent: isPermanentOAuthRefreshError(data, response.status),
+			status: response.status,
+		};
+	}
+	const accessToken =
+		stringValue(data.access_token) ??
+		stringValue(data.accessToken) ??
+		stringValue(data.token);
+	if (!accessToken) {
+		return {
+			ok: false,
+			error: "OAuth token response did not include an access token.",
+			permanent: false,
+			status: response.status,
+		};
+	}
+	const expiresIn =
+		numberValue(data.expires_in) ?? numberValue(data.expiresIn) ?? null;
+	return {
+		ok: true,
+		accessToken,
+		expiresAt: expiresIn
+			? new Date(Date.now() + expiresIn * 1000).toISOString()
+			: (stringValue(data.expires_at) ?? stringValue(data.expiresAt) ?? null),
+		expiresIn,
+		idToken: stringValue(data.id_token) ?? stringValue(data.idToken) ?? null,
+		providerSpecificData: {
+			...jsonObjectValue(data.providerSpecificData),
+			...(stringValue(data.scope) ? { scope: stringValue(data.scope) } : {}),
+		},
+		refreshToken:
+			stringValue(data.refresh_token) ??
+			stringValue(data.refreshToken) ??
+			fallbackRefreshToken,
+	};
 }
 
 async function refreshOAuthAccount({
@@ -3311,46 +3678,29 @@ async function refreshOAuthTokenForProvider(
 	refreshToken: string,
 	providerSpecificData: JsonObject = {},
 ): Promise<OAuthRefreshResult> {
-	const clientId =
-		provider.clientId ??
-		stringValue(providerSpecificData.oauthClientId) ??
-		stringValue(providerSpecificData.clientId) ??
-		(provider.clientIdEnv
-			? stringValue(process.env[provider.clientIdEnv])
-			: undefined);
-	const clientSecret =
-		provider.clientSecret ??
-		stringValue(providerSpecificData.oauthClientSecret) ??
-		stringValue(providerSpecificData.clientSecret) ??
-		(provider.clientSecretEnv
-			? stringValue(process.env[provider.clientSecretEnv])
-			: undefined);
-	if (!clientId) {
+	const client = resolveOAuthClientCredentials(provider, providerSpecificData, {
+		requireSecret: Boolean(provider.clientSecretEnv),
+	});
+	if (!client.ok) {
 		return {
 			ok: false,
-			error: `${provider.id} OAuth client id is not configured.`,
+			error: client.error,
 			permanent: true,
-			status: 400,
-		};
-	}
-	if (provider.clientSecretEnv && !clientSecret) {
-		return {
-			ok: false,
-			error: `${provider.id} OAuth client secret is not configured.`,
-			permanent: true,
-			status: 400,
+			status: client.status,
 		};
 	}
 	const body =
 		provider.encoding === "form"
 			? new URLSearchParams({
-					client_id: clientId,
-					...(clientSecret ? { client_secret: clientSecret } : {}),
+					client_id: client.clientId,
+					...(client.clientSecret
+						? { client_secret: client.clientSecret }
+						: {}),
 					grant_type: "refresh_token",
 					refresh_token: refreshToken,
 				})
 			: JSON.stringify({
-					client_id: clientId,
+					client_id: client.clientId,
 					grant_type: "refresh_token",
 					refresh_token: refreshToken,
 				});
@@ -3369,44 +3719,7 @@ async function refreshOAuthTokenForProvider(
 		},
 		15_000,
 	);
-	const data = await readJson(response);
-	if (!response.ok) {
-		return {
-			ok: false,
-			error: oauthRefreshErrorMessage(data, response.status),
-			permanent: isPermanentOAuthRefreshError(data, response.status),
-			status: response.status,
-		};
-	}
-	const accessToken =
-		stringValue(data.access_token) ??
-		stringValue(data.accessToken) ??
-		stringValue(data.token);
-	if (!accessToken) {
-		return {
-			ok: false,
-			error: "Refresh response did not include an access token.",
-			permanent: false,
-			status: response.status,
-		};
-	}
-	const expiresIn =
-		numberValue(data.expires_in) ?? numberValue(data.expiresIn) ?? null;
-	const nextRefreshToken =
-		stringValue(data.refresh_token) ??
-		stringValue(data.refreshToken) ??
-		refreshToken;
-	return {
-		ok: true,
-		accessToken,
-		expiresAt: expiresIn
-			? new Date(Date.now() + expiresIn * 1000).toISOString()
-			: (stringValue(data.expires_at) ?? stringValue(data.expiresAt) ?? null),
-		expiresIn,
-		idToken: stringValue(data.id_token) ?? stringValue(data.idToken) ?? null,
-		providerSpecificData: jsonObjectValue(data.providerSpecificData),
-		refreshToken: nextRefreshToken,
-	};
+	return oauthTokenResultFromResponse(provider, response, refreshToken);
 }
 
 function oauthRefreshLockKey(
