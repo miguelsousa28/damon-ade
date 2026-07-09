@@ -73,6 +73,70 @@ export interface RouterUsageStats {
 	recentRequests: RouterUsageEntry[];
 }
 
+export type RouterUsagePeriod = "today" | "24h" | "7d" | "30d" | "60d" | "all";
+
+export interface RouterUsageCompatStats {
+	totalRequests: number;
+	totalPromptTokens: number;
+	totalCompletionTokens: number;
+	totalCachedTokens: number;
+	totalCost: number;
+	byProvider: Record<string, RouterUsageCompatBucket>;
+	byModel: Record<string, RouterUsageCompatBucket>;
+	byAccount: Record<string, RouterUsageCompatBucket>;
+	byApiKey: Record<string, RouterUsageCompatBucket>;
+	byEndpoint: Record<string, RouterUsageCompatBucket>;
+	last10Minutes: RouterUsageMinuteBucket[];
+	pending: {
+		byAccount: Record<string, Record<string, number>>;
+	};
+	activeRequests: Array<{
+		account: string;
+		count: number;
+		model: string;
+		provider: string;
+	}>;
+	recentRequests: RouterUsageCompatRecentRequest[];
+	errorProvider: string;
+}
+
+export interface RouterUsageCompatBucket {
+	requests: number;
+	promptTokens: number;
+	completionTokens: number;
+	cachedTokens: number;
+	cost: number;
+	rawModel?: string;
+	provider?: string;
+	connectionId?: string | null;
+	accountName?: string | null;
+	endpoint?: string;
+	lastUsed?: string;
+}
+
+export interface RouterUsageCompatRecentRequest {
+	timestamp: string;
+	model: string;
+	provider: string;
+	promptTokens: number;
+	completionTokens: number;
+	cachedTokens: number;
+	status: string;
+}
+
+export interface RouterUsageMinuteBucket {
+	requests: number;
+	promptTokens: number;
+	completionTokens: number;
+	cost: number;
+}
+
+export interface RouterUsageChartBucket {
+	label: string;
+	tokens: number;
+	cost: number;
+}
+
 export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
@@ -684,6 +748,132 @@ export function getRouterUsageStats(limit = 50): RouterUsageStats {
 	};
 }
 
+export function getRouterUsageCompatStats(
+	period: RouterUsagePeriod = "all",
+): RouterUsageCompatStats {
+	const usage = filterUsageForPeriod(readStore().usage, period);
+	const stats: RouterUsageCompatStats = {
+		totalRequests: 0,
+		totalPromptTokens: 0,
+		totalCompletionTokens: 0,
+		totalCachedTokens: 0,
+		totalCost: 0,
+		byProvider: {},
+		byModel: {},
+		byAccount: {},
+		byApiKey: {},
+		byEndpoint: {},
+		last10Minutes: buildLast10Minutes(usage),
+		pending: { byAccount: {} },
+		activeRequests: [],
+		recentRequests: usage.slice(0, 20).map(toCompatRecentRequest),
+		errorProvider:
+			usage.find(
+				(entry) => !entry.success && Date.now() - timestampMs(entry) < 10_000,
+			)?.provider ?? "",
+	};
+
+	for (const entry of usage) {
+		const promptTokens = entry.requestTokens;
+		const completionTokens = entry.responseTokens;
+		const values = {
+			cachedTokens: 0,
+			completionTokens,
+			cost: entry.estimatedCostUsd,
+			promptTokens,
+			requests: 1,
+		};
+		stats.totalRequests++;
+		stats.totalPromptTokens += promptTokens;
+		stats.totalCompletionTokens += completionTokens;
+		stats.totalCost += entry.estimatedCostUsd;
+		addCompatBucket(stats.byProvider, entry.provider, values, {
+			lastUsed: entry.timestamp,
+			provider: entry.provider,
+		});
+		addCompatBucket(stats.byModel, modelStatsKey(entry), values, {
+			lastUsed: entry.timestamp,
+			provider: entry.provider,
+			rawModel: entry.model,
+		});
+		addCompatBucket(stats.byAccount, accountStatsKey(entry), values, {
+			accountName: entry.accountName,
+			connectionId: entry.accountId,
+			lastUsed: entry.timestamp,
+			provider: entry.provider,
+			rawModel: entry.model,
+		});
+		addCompatBucket(
+			stats.byApiKey,
+			entry.accountName ?? entry.accountId ?? "local-no-key",
+			values,
+			{
+				accountName: entry.accountName ?? "Local (No API Key)",
+				connectionId: entry.accountId,
+				lastUsed: entry.timestamp,
+				provider: entry.provider,
+				rawModel: entry.model,
+			},
+		);
+		addCompatBucket(
+			stats.byEndpoint,
+			`${entry.endpoint}|${entry.model}|${entry.provider}`,
+			values,
+			{
+				endpoint: entry.endpoint,
+				lastUsed: entry.timestamp,
+				provider: entry.provider,
+				rawModel: entry.model,
+			},
+		);
+	}
+
+	stats.totalCost = roundCurrency(stats.totalCost);
+	return stats;
+}
+
+export function getRouterUsageProviders(): Array<{ id: string; name: string }> {
+	return Array.from(
+		new Set(
+			readStore()
+				.usage.map((entry) => entry.provider)
+				.filter(Boolean),
+		),
+	)
+		.sort((a, b) => a.localeCompare(b))
+		.map((provider) => ({ id: provider, name: provider }));
+}
+
+export function getRouterUsageLogs(limit = 200): string[] {
+	return readStore()
+		.usage.slice(0, limit)
+		.map((entry) => {
+			const timestamp = formatLogDate(new Date(entry.timestamp));
+			const provider = entry.provider.toUpperCase();
+			const account = entry.accountName ?? entry.accountId?.slice(0, 8) ?? "-";
+			const status = entry.success ? "ok" : String(entry.status);
+			return `${timestamp} | ${entry.model} | ${provider} | ${account} | ${entry.requestTokens} | ${entry.responseTokens} | ${status}`;
+		});
+}
+
+export function getRouterUsageChart(
+	period: Exclude<RouterUsagePeriod, "all"> = "7d",
+): RouterUsageChartBucket[] {
+	const usage = filterUsageForPeriod(readStore().usage, period);
+	const now = new Date();
+	const buckets = chartBuckets(period, now);
+	for (const entry of usage) {
+		const time = timestampMs(entry);
+		const bucket = buckets.find(
+			(candidate) => time >= candidate.startMs && time < candidate.endMs,
+		);
+		if (!bucket) continue;
+		bucket.tokens += entry.totalTokens;
+		bucket.cost = roundCurrency(bucket.cost + entry.estimatedCostUsd);
+	}
+	return buckets.map(({ cost, label, tokens }) => ({ cost, label, tokens }));
+}
+
 export function clearRouterUsage(): RouterUsageStats {
 	const data = readStore();
 	writeStore({ ...data, usage: [] });
@@ -694,6 +884,189 @@ export function estimateTokens(value: unknown): number {
 	if (value === undefined || value === null) return 0;
 	const text = typeof value === "string" ? value : JSON.stringify(value);
 	return Math.ceil(text.length / 4);
+}
+
+function filterUsageForPeriod(
+	usage: RouterUsageEntry[],
+	period: RouterUsagePeriod,
+): RouterUsageEntry[] {
+	const startMs = usagePeriodStartMs(period);
+	if (startMs === null) return usage;
+	return usage.filter((entry) => timestampMs(entry) >= startMs);
+}
+
+function usagePeriodStartMs(period: RouterUsagePeriod): number | null {
+	const now = new Date();
+	if (period === "all") return null;
+	if (period === "24h") return now.getTime() - 24 * 60 * 60 * 1000;
+	if (period === "today") {
+		const start = new Date(now);
+		start.setHours(0, 0, 0, 0);
+		return start.getTime();
+	}
+	const days = period === "7d" ? 7 : period === "30d" ? 30 : 60;
+	return now.getTime() - days * 24 * 60 * 60 * 1000;
+}
+
+function timestampMs(entry: RouterUsageEntry): number {
+	const value = new Date(entry.timestamp).getTime();
+	return Number.isFinite(value) ? value : 0;
+}
+
+function addCompatBucket(
+	target: Record<string, RouterUsageCompatBucket>,
+	key: string,
+	values: Pick<
+		RouterUsageCompatBucket,
+		"cachedTokens" | "completionTokens" | "cost" | "promptTokens" | "requests"
+	>,
+	metadata: Partial<RouterUsageCompatBucket> = {},
+): void {
+	const bucket = target[key] ?? {
+		requests: 0,
+		promptTokens: 0,
+		completionTokens: 0,
+		cachedTokens: 0,
+		cost: 0,
+		...metadata,
+	};
+	bucket.requests += values.requests;
+	bucket.promptTokens += values.promptTokens;
+	bucket.completionTokens += values.completionTokens;
+	bucket.cachedTokens += values.cachedTokens;
+	bucket.cost = roundCurrency(bucket.cost + values.cost);
+	if (
+		metadata.lastUsed &&
+		(!bucket.lastUsed ||
+			new Date(metadata.lastUsed) > new Date(bucket.lastUsed))
+	) {
+		bucket.lastUsed = metadata.lastUsed;
+	}
+	target[key] = { ...bucket, ...metadata, lastUsed: bucket.lastUsed };
+}
+
+function toCompatRecentRequest(
+	entry: RouterUsageEntry,
+): RouterUsageCompatRecentRequest {
+	return {
+		timestamp: entry.timestamp,
+		model: entry.model,
+		provider: entry.provider,
+		promptTokens: entry.requestTokens,
+		completionTokens: entry.responseTokens,
+		cachedTokens: 0,
+		status: entry.success ? "ok" : String(entry.status),
+	};
+}
+
+function buildLast10Minutes(
+	usage: RouterUsageEntry[],
+): RouterUsageMinuteBucket[] {
+	const now = Date.now();
+	const currentMinuteStart = Math.floor(now / 60_000) * 60_000;
+	const buckets = Array.from({ length: 10 }, (_, index) => {
+		const startMs = currentMinuteStart - (9 - index) * 60_000;
+		return {
+			startMs,
+			requests: 0,
+			promptTokens: 0,
+			completionTokens: 0,
+			cost: 0,
+		};
+	});
+
+	for (const entry of usage) {
+		const minuteStart = Math.floor(timestampMs(entry) / 60_000) * 60_000;
+		const bucket = buckets.find(
+			(candidate) => candidate.startMs === minuteStart,
+		);
+		if (!bucket) continue;
+		bucket.requests++;
+		bucket.promptTokens += entry.requestTokens;
+		bucket.completionTokens += entry.responseTokens;
+		bucket.cost = roundCurrency(bucket.cost + entry.estimatedCostUsd);
+	}
+
+	return buckets.map(({ cost, completionTokens, promptTokens, requests }) => ({
+		cost,
+		completionTokens,
+		promptTokens,
+		requests,
+	}));
+}
+
+function modelStatsKey(entry: RouterUsageEntry): string {
+	return entry.provider ? `${entry.model} (${entry.provider})` : entry.model;
+}
+
+function accountStatsKey(entry: RouterUsageEntry): string {
+	const account = entry.accountName ?? entry.accountId ?? "Local (No API Key)";
+	return `${entry.model} (${entry.provider} - ${account})`;
+}
+
+function formatLogDate(date: Date): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function chartBuckets(
+	period: Exclude<RouterUsagePeriod, "all">,
+	now: Date,
+): Array<RouterUsageChartBucket & { endMs: number; startMs: number }> {
+	if (period === "today") {
+		const start = new Date(now);
+		start.setHours(0, 0, 0, 0);
+		return Array.from({ length: 24 }, (_, index) => {
+			const startMs = start.getTime() + index * 60 * 60 * 1000;
+			return {
+				label: new Date(startMs).toLocaleTimeString("en-US", {
+					hour: "2-digit",
+					hour12: false,
+					minute: "2-digit",
+				}),
+				startMs,
+				endMs: startMs + 60 * 60 * 1000,
+				tokens: 0,
+				cost: 0,
+			};
+		});
+	}
+
+	if (period === "24h") {
+		const bucketMs = 60 * 60 * 1000;
+		const startMs = now.getTime() - 24 * bucketMs;
+		return Array.from({ length: 24 }, (_, index) => {
+			const bucketStart = startMs + index * bucketMs;
+			return {
+				label: new Date(bucketStart).toLocaleTimeString("en-US", {
+					hour: "2-digit",
+					hour12: false,
+					minute: "2-digit",
+				}),
+				startMs: bucketStart,
+				endMs: bucketStart + bucketMs,
+				tokens: 0,
+				cost: 0,
+			};
+		});
+	}
+
+	const days = period === "7d" ? 7 : period === "30d" ? 30 : 60;
+	return Array.from({ length: days }, (_, index) => {
+		const day = new Date(now);
+		day.setHours(0, 0, 0, 0);
+		day.setDate(day.getDate() - (days - 1 - index));
+		return {
+			label: day.toLocaleDateString("en-US", {
+				day: "numeric",
+				month: "short",
+			}),
+			startMs: day.getTime(),
+			endMs: day.getTime() + 24 * 60 * 60 * 1000,
+			tokens: 0,
+			cost: 0,
+		};
+	});
 }
 
 function normalizeAlias(alias: RouterModelAlias): RouterModelAlias {

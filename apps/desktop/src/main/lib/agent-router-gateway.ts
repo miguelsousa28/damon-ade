@@ -48,8 +48,13 @@ import {
 	getRouterDisabledModels,
 	getRouterModelAvailability,
 	getRouterProviderNodes,
+	getRouterUsageChart,
+	getRouterUsageCompatStats,
+	getRouterUsageLogs,
+	getRouterUsageProviders,
 	getRouterUsageStats,
 	isRouterModelDisabled,
+	type RouterUsagePeriod,
 	recordRouterModelAvailability,
 	recordRouterUsage,
 	updateRouterProviderNode,
@@ -330,8 +335,30 @@ function createAgentRouterGatewayApp() {
 	app.post("/v1/search", handleSearch);
 	app.post("/v1/web/fetch", handleWebFetch);
 
-	app.get("/api/usage/stats", (_req, res) => {
-		res.json(getRouterUsageStats());
+	app.get("/api/usage/stats", (req, res) => {
+		const period = parseUsagePeriod(req.query.period, true);
+		if (!period) {
+			res.status(400).json({ error: "Invalid period" });
+			return;
+		}
+		res.json(getRouterUsageCompatStats(period));
+	});
+	app.get("/api/usage/history", (_req, res) => {
+		res.json(getRouterUsageCompatStats("all"));
+	});
+	app.get("/api/usage/providers", (_req, res) => {
+		res.json({ providers: getRouterUsageProviders() });
+	});
+	app.get(["/api/usage/logs", "/api/usage/request-logs"], (_req, res) => {
+		res.json(getRouterUsageLogs(200));
+	});
+	app.get("/api/usage/chart", (req, res) => {
+		const period = parseUsagePeriod(req.query.period, false);
+		if (!period || period === "all") {
+			res.status(400).json({ error: "Invalid period" });
+			return;
+		}
+		res.json(getRouterUsageChart(period));
 	});
 	app.delete("/api/usage", (_req, res) => {
 		res.json(clearRouterUsage());
@@ -2056,6 +2083,24 @@ function parseModelKind(value: unknown): RouterModelKind {
 		return value;
 	}
 	return "llm";
+}
+
+function parseUsagePeriod(
+	value: unknown,
+	allowAll: boolean,
+): RouterUsagePeriod | null {
+	const period = typeof value === "string" ? value : "7d";
+	if (
+		period === "today" ||
+		period === "24h" ||
+		period === "7d" ||
+		period === "30d" ||
+		period === "60d" ||
+		(allowAll && period === "all")
+	) {
+		return period;
+	}
+	return null;
 }
 
 function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {
