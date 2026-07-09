@@ -1,11 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import {
+	buildGeminiModelList,
 	buildOpenAIModelList,
 	buildRouterDashboardSnapshot,
+	buildRouterModelInfo,
 	previewRouterTokenSaver,
 	ROUTER_ENDPOINTS,
 	ROUTER_TOKEN_SAVERS,
 	resolveRouterModelTarget,
+	routerModelKindsForSlug,
 } from "./router-control-plane";
 
 describe("router control plane", () => {
@@ -131,5 +134,79 @@ describe("router control plane", () => {
 			"z-ai/glm-5.2",
 			"minimax/minimax-m3",
 		]);
+	});
+
+	it("filters model catalogues by kind and returns metadata", () => {
+		const list = buildOpenAIModelList({
+			customModels: [
+				{
+					providerAlias: "local",
+					id: "embedder",
+					type: "embedding",
+					name: "Local Embedder",
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
+			kindFilter: ["embedding"],
+			providerNodes: [
+				{
+					id: "custom-embedding-local",
+					type: "custom-embedding",
+					name: "Local Embeddings",
+					prefix: "emb",
+					baseUrl: "http://127.0.0.1:8080/v1",
+					apiKeyProvider: "openai",
+					apiKeyAccountId: null,
+					models: ["nomic-embed"],
+					isActive: true,
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
+		});
+		const ids = list.data.map((model) => model.id);
+		const info = buildRouterModelInfo("local/embedder", {
+			customModels: [
+				{
+					providerAlias: "local",
+					id: "embedder",
+					type: "embedding",
+					name: "Local Embedder",
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
+		});
+
+		expect(routerModelKindsForSlug("web")).toEqual(["webSearch", "webFetch"]);
+		expect(ids).toContain("local/embedder");
+		expect(ids).toContain("emb/nomic-embed");
+		expect(ids).not.toContain("premium-coding");
+		expect(info?.endpoint).toBe("/v1/embeddings");
+		expect(info?.name).toBe("Local Embedder");
+	});
+
+	it("exports Gemini-compatible model list entries", () => {
+		const list = buildGeminiModelList({
+			customModels: [
+				{
+					providerAlias: "gemini",
+					id: "gemini-test",
+					type: "llm",
+					name: "Gemini Test",
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
+		});
+		const names = list.models.map((model) => model.name);
+
+		expect(names).toContain("models/gemini/gemini-test");
+		expect(names).toContain("models/gemini-test");
+		expect(
+			list.models.find((model) => model.name === "models/gemini-test")
+				?.supportedGenerationMethods,
+		).toContain("streamGenerateContent");
 	});
 });

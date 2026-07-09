@@ -111,6 +111,27 @@ export interface OpenAIModelList {
 	data: OpenAIModelEntry[];
 }
 
+export interface RouterModelInfo {
+	id: string;
+	name: string;
+	kind: RouterModelKind;
+	owned_by: string;
+	endpoint: string | null;
+}
+
+export interface GeminiModelEntry {
+	name: string;
+	displayName: string;
+	description: string;
+	supportedGenerationMethods: string[];
+	inputTokenLimit: number;
+	outputTokenLimit: number;
+}
+
+export interface GeminiModelList {
+	models: GeminiModelEntry[];
+}
+
 export interface RouterModelTarget {
 	provider: "openrouter";
 	model: string;
@@ -149,6 +170,29 @@ export const ROUTER_MODEL_KINDS = [
 ] as const;
 
 export type RouterModelKind = (typeof ROUTER_MODEL_KINDS)[number];
+
+export const ROUTER_MODEL_KIND_SLUGS = {
+	image: ["image"],
+	tts: ["tts"],
+	stt: ["stt"],
+	embedding: ["embedding"],
+	"image-to-text": ["imageToText"],
+	web: ["webSearch", "webFetch"],
+} as const satisfies Record<string, readonly RouterModelKind[]>;
+
+const ROUTER_MODEL_KIND_ENDPOINTS: Record<RouterModelKind, string | null> = {
+	llm: "/v1/chat/completions",
+	image: "/v1/images/generations",
+	tts: "/v1/audio/speech",
+	stt: "/v1/audio/transcriptions",
+	embedding: "/v1/embeddings",
+	imageToText: "/v1/chat/completions",
+	webSearch: "/v1/search",
+	webFetch: "/v1/web/fetch",
+	video: null,
+	search: "/v1/search",
+	other: null,
+};
 
 export interface RouterCustomModel {
 	providerAlias: string;
@@ -222,6 +266,7 @@ export interface RouterModelResolutionOptions {
 	customCombos?: RouterCustomCombo[];
 	customModels?: RouterCustomModel[];
 	disabledModels?: RouterDisabledModel[];
+	kindFilter?: RouterModelKind[];
 	providerNodes?: RouterProviderNode[];
 }
 
@@ -451,6 +496,27 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		method: "GET",
 		compatibility: "OpenAI",
 		capability: "Model catalogue",
+		status: "gateway-live",
+	},
+	{
+		path: "/v1/models/{kind}",
+		method: "GET",
+		compatibility: "OpenAI",
+		capability: "Model catalogue filtered by capability",
+		status: "gateway-live",
+	},
+	{
+		path: "/v1/models/info",
+		method: "GET",
+		compatibility: "OpenAI",
+		capability: "Single-model metadata",
+		status: "gateway-live",
+	},
+	{
+		path: "/v1beta/models",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Gemini-compatible model catalogue",
 		status: "gateway-live",
 	},
 	{
@@ -738,6 +804,7 @@ export function buildOpenAIModelList({
 	customCombos = [],
 	customModels = [],
 	disabledModels = [],
+	kindFilter,
 	providerNodes = [],
 }: RouterModelResolutionOptions = {}): OpenAIModelList {
 	const entries: OpenAIModelEntry[] = [];
@@ -746,38 +813,47 @@ export function buildOpenAIModelList({
 		ownedBy: string,
 		metadata: Partial<Pick<OpenAIModelEntry, "kind" | "name">> = {},
 	) => {
+		const kind = metadata.kind ?? "llm";
+		if (!routerModelKindMatches(kind, kindFilter)) return;
 		if (entries.some((entry) => entry.id === id)) return;
-		entries.push({ id, object: "model", owned_by: ownedBy, ...metadata });
+		entries.push({
+			id,
+			object: "model",
+			owned_by: ownedBy,
+			kind,
+			...metadata,
+		});
 	};
 
 	for (const combo of Object.values(AGENT_COMBOS)) {
-		add(combo.name, "combo");
+		add(combo.name, "combo", { kind: "llm" });
 	}
 
 	for (const [agent, profile] of Object.entries(AGENT_ROUTER_PROFILES) as [
 		SpecialistAgentType,
 		(typeof AGENT_ROUTER_PROFILES)[SpecialistAgentType],
 	][]) {
-		add(agent, profile.provider);
-		add(profile.modelId, profile.provider);
+		add(agent, profile.provider, { kind: "llm", name: profile.agent });
+		add(profile.modelId, profile.provider, { kind: "llm" });
 		if (profile.provider.startsWith("OpenRouter/")) {
-			add(`openrouter/${profile.modelId}`, "openrouter");
+			add(`openrouter/${profile.modelId}`, "openrouter", { kind: "llm" });
 		}
 	}
 
 	for (const provider of ROUTER_PROVIDER_CATALOG) {
+		const kind = inferCatalogProviderModelKind(provider);
 		for (const model of provider.defaultModels) {
 			if (isRouterModelDisabled(disabledModels, provider.id, model)) continue;
-			add(`${provider.id}/${model}`, provider.id);
+			add(`${provider.id}/${model}`, provider.id, { kind });
 		}
 	}
 
 	for (const alias of aliases) {
-		add(alias.alias, "alias");
+		add(alias.alias, "alias", { kind: "llm" });
 	}
 
 	for (const combo of customCombos) {
-		add(combo.name, "custom-combo");
+		add(combo.name, "custom-combo", { kind: "llm" });
 	}
 
 	for (const model of customModels) {
@@ -792,6 +868,7 @@ export function buildOpenAIModelList({
 
 	for (const node of providerNodes) {
 		if (!node.isActive) continue;
+		const kind = node.type === "custom-embedding" ? "embedding" : "llm";
 		for (const model of node.models) {
 			if (
 				isRouterModelDisabled(disabledModels, node.prefix, model) ||
@@ -799,7 +876,7 @@ export function buildOpenAIModelList({
 			) {
 				continue;
 			}
-			add(`${node.prefix}/${model}`, node.id || node.prefix);
+			add(`${node.prefix}/${model}`, node.id || node.prefix, { kind });
 		}
 	}
 
@@ -807,6 +884,70 @@ export function buildOpenAIModelList({
 		object: "list",
 		data: entries.sort((a, b) => a.id.localeCompare(b.id)),
 	};
+}
+
+export function buildRouterModelInfo(
+	id: string,
+	options: RouterModelResolutionOptions = {},
+	requestedKind?: RouterModelKind,
+): RouterModelInfo | null {
+	const list = buildOpenAIModelList(
+		requestedKind ? { ...options, kindFilter: [requestedKind] } : options,
+	);
+	const entry = list.data.find((model) => model.id === id);
+	if (!entry) return null;
+	const kind = entry.kind ?? "llm";
+	return {
+		id: entry.id,
+		name: entry.name ?? entry.id.split("/").at(-1) ?? entry.id,
+		kind,
+		owned_by: entry.owned_by,
+		endpoint: ROUTER_MODEL_KIND_ENDPOINTS[kind] ?? null,
+	};
+}
+
+export function buildGeminiModelList(
+	options: RouterModelResolutionOptions = {},
+): GeminiModelList {
+	const models = new Map<string, GeminiModelEntry>();
+	const add = (entry: OpenAIModelEntry, name: string, nativeGemini = false) => {
+		if (models.has(name)) return;
+		const displayName = entry.name ?? entry.id.split("/").at(-1) ?? entry.id;
+		models.set(name, {
+			name,
+			displayName,
+			description: `${entry.owned_by} model: ${displayName}`,
+			supportedGenerationMethods: nativeGemini
+				? ["generateContent", "streamGenerateContent"]
+				: ["generateContent"],
+			inputTokenLimit: 128_000,
+			outputTokenLimit: 8192,
+		});
+	};
+
+	const list = buildOpenAIModelList(options);
+	for (const entry of list.data) {
+		const kind = entry.kind ?? "llm";
+		if (kind !== "llm" && kind !== "imageToText") continue;
+		add(entry, `models/${entry.id}`);
+		if (entry.id.startsWith("gemini/")) {
+			add(entry, `models/${entry.id.slice("gemini/".length)}`, true);
+		}
+	}
+
+	return {
+		models: Array.from(models.values()).sort((a, b) =>
+			a.name.localeCompare(b.name),
+		),
+	};
+}
+
+export function routerModelKindsForSlug(
+	slug: string,
+): RouterModelKind[] | null {
+	const kinds =
+		ROUTER_MODEL_KIND_SLUGS[slug as keyof typeof ROUTER_MODEL_KIND_SLUGS];
+	return kinds ? [...kinds] : null;
 }
 
 export function isRouterModelDisabled(
@@ -819,6 +960,35 @@ export function isRouterModelDisabled(
 			(entry) => entry.providerAlias === providerAlias && entry.id === modelId,
 		),
 	);
+}
+
+function routerModelKindMatches(
+	kind: RouterModelKind,
+	kindFilter: RouterModelKind[] | undefined,
+): boolean {
+	if (!kindFilter?.length) return true;
+	return kindFilter.includes(kind);
+}
+
+function inferCatalogProviderModelKind(
+	provider: RouterProviderCatalogItem,
+): RouterModelKind {
+	if (provider.id === "brave-search") return "webSearch";
+	if (provider.id === "perplexity") return "webSearch";
+	if (provider.capabilities.includes("embeddings")) return "embedding";
+	if (
+		provider.capabilities.includes("tts") ||
+		provider.capabilities.includes("speech")
+	) {
+		return "tts";
+	}
+	if (
+		provider.capabilities.includes("image-generation") ||
+		provider.capabilities.includes("image")
+	) {
+		return "image";
+	}
+	return "llm";
 }
 
 export function resolveRouterModelTarget(

@@ -2,8 +2,11 @@ import { createServer, type Server } from "node:http";
 import { Readable } from "node:stream";
 import { AGENT_COMBOS } from "@superset/shared/agent-router";
 import {
+	buildGeminiModelList,
 	buildOpenAIModelList,
+	buildRouterModelInfo,
 	previewRouterTokenSaver,
+	ROUTER_MODEL_KIND_SLUGS,
 	type RouterGatewayStatus,
 	type RouterModelKind,
 	type RouterModelResolutionOptions,
@@ -14,6 +17,7 @@ import {
 	type RouterProviderNodeType,
 	type RouterTokenSaverMode,
 	resolveRouterModelTarget,
+	routerModelKindsForSlug,
 	TOKEN_SAVER_MODES,
 } from "@superset/shared/router-control-plane";
 import express, {
@@ -234,6 +238,54 @@ function createAgentRouterGatewayApp() {
 
 	app.get("/v1/models", (_req, res) => {
 		res.json(buildOpenAIModelList(getResolutionOptions()));
+	});
+	app.get("/v1/models/info", (req, res) => {
+		const id = typeof req.query.id === "string" ? req.query.id : "";
+		const kind =
+			typeof req.query.kind === "string"
+				? parseModelKind(req.query.kind)
+				: undefined;
+		if (!id) {
+			res.status(400).json({
+				error: {
+					message: "Missing required query param: id.",
+					type: "invalid_request_error",
+				},
+			});
+			return;
+		}
+		const info = buildRouterModelInfo(id, getResolutionOptions(), kind);
+		if (!info) {
+			res.status(404).json({
+				error: {
+					message: `Model not found: ${id}`,
+					type: "not_found",
+				},
+			});
+			return;
+		}
+		res.json(info);
+	});
+	app.get("/v1/models/:kind", (req, res) => {
+		const kindFilter = routerModelKindsForSlug(req.params.kind);
+		if (!kindFilter) {
+			res.status(404).json({
+				error: {
+					message: `Unknown model kind: ${req.params.kind}. Supported: ${Object.keys(ROUTER_MODEL_KIND_SLUGS).join(", ")}`,
+					type: "invalid_request_error",
+				},
+			});
+			return;
+		}
+		res.json(
+			buildOpenAIModelList({
+				...getResolutionOptions(),
+				kindFilter,
+			}),
+		);
+	});
+	app.get("/v1beta/models", (_req, res) => {
+		res.json(buildGeminiModelList(getResolutionOptions()));
 	});
 
 	app.post("/v1/compress", (req, res) => {
