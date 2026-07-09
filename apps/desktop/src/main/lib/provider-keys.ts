@@ -21,6 +21,13 @@ import { localDb } from "./local-db";
 export const PROVIDER_IDS = ROUTER_PROVIDER_KEY_IDS;
 export type ProviderId = RouterProviderKeyId;
 
+export function getProviderAccountKeyId(
+	provider: ProviderId,
+	accountId: string,
+): string {
+	return `${provider}::${accountId}`;
+}
+
 function readKeyMap(): Record<string, string> {
 	const row = localDb.select().from(settings).get();
 	return (row?.providerApiKeys ?? {}) as Record<string, string>;
@@ -64,7 +71,11 @@ export function clearProviderKey(provider: ProviderId): void {
 
 /** Whether a key is stored for the provider (does not decrypt). */
 export function hasProviderKey(provider: ProviderId): boolean {
-	return Boolean(readKeyMap()[provider]);
+	const map = readKeyMap();
+	return (
+		Boolean(map[provider]) ||
+		Object.keys(map).some((key) => key.startsWith(`${provider}::`))
+	);
 }
 
 /**
@@ -72,7 +83,57 @@ export function hasProviderKey(provider: ProviderId): boolean {
  * decryption is unavailable/fails. Main-process only — never send this to the renderer.
  */
 export function getProviderKey(provider: ProviderId): string | null {
-	const blob = readKeyMap()[provider];
+	return decryptKeyBlob(readKeyMap()[provider]);
+}
+
+export function setProviderAccountKey(
+	provider: ProviderId,
+	accountId: string,
+	key: string,
+): void {
+	const trimmed = key.trim();
+	if (!trimmed) {
+		throw new Error("Provider API key must not be empty");
+	}
+	if (!safeStorage.isEncryptionAvailable()) {
+		throw new Error("Secure storage is not available on this system");
+	}
+
+	const encrypted = safeStorage.encryptString(trimmed).toString("base64");
+	const map = readKeyMap();
+	map[getProviderAccountKeyId(provider, accountId)] = encrypted;
+	writeKeyMap(map);
+}
+
+export function clearProviderAccountKey(
+	provider: ProviderId,
+	accountId: string,
+): void {
+	const map = readKeyMap();
+	const key = getProviderAccountKeyId(provider, accountId);
+	if (key in map) {
+		delete map[key];
+		writeKeyMap(map);
+	}
+}
+
+export function getProviderAccountKey(
+	provider: ProviderId,
+	accountId: string,
+): string | null {
+	return decryptKeyBlob(
+		readKeyMap()[getProviderAccountKeyId(provider, accountId)],
+	);
+}
+
+export function hasProviderAccountKey(
+	provider: ProviderId,
+	accountId: string,
+): boolean {
+	return Boolean(readKeyMap()[getProviderAccountKeyId(provider, accountId)]);
+}
+
+function decryptKeyBlob(blob: string | undefined): string | null {
 	if (!blob) return null;
 	if (!safeStorage.isEncryptionAvailable()) return null;
 
@@ -85,8 +146,7 @@ export function getProviderKey(provider: ProviderId): string | null {
 
 /** Presence-only status for every known provider (safe to return to the renderer). */
 export function getProviderKeyStatus(): Record<ProviderId, boolean> {
-	const map = readKeyMap();
 	return Object.fromEntries(
-		PROVIDER_IDS.map((id) => [id, Boolean(map[id])]),
+		PROVIDER_IDS.map((id) => [id, hasProviderKey(id)]),
 	) as Record<ProviderId, boolean>;
 }

@@ -46,6 +46,28 @@ export const ROUTER_PROVIDER_KEY_IDS = [
 
 export type RouterProviderKeyId = (typeof ROUTER_PROVIDER_KEY_IDS)[number];
 
+export interface RouterProviderAccount {
+	id: string;
+	provider: RouterProviderKeyId;
+	name: string;
+	authType: "api-key";
+	priority: number;
+	isActive: boolean;
+	createdAt: string;
+	updatedAt: string;
+	lastUsedAt: string | null;
+	consecutiveUseCount: number;
+	requestCount: number;
+	failureCount: number;
+	backoffLevel: number;
+	rateLimitedUntil: string | null;
+	lastError: {
+		status?: number;
+		message: string;
+		timestamp: string;
+	} | null;
+}
+
 export interface RouterProviderCatalogItem {
 	id: string;
 	label: string;

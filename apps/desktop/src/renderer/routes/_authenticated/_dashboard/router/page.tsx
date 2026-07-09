@@ -1,6 +1,7 @@
 import {
 	previewRouterTokenSaver,
 	type RouterDashboardSnapshot,
+	type RouterProviderAccount,
 	type RouterProviderKeyId,
 	type RouterTokenSaverMode,
 } from "@superset/shared/router-control-plane";
@@ -39,6 +40,8 @@ type TabId =
 	| "usage"
 	| "aliases";
 
+type ProviderAccountView = RouterProviderAccount & { hasKey: boolean };
+
 const TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Overview" },
 	{ id: "providers", label: "Providers" },
@@ -71,6 +74,16 @@ function RouterDashboardPage() {
 		electronTrpc.agentRouter.dashboard.useQuery(undefined, {
 			refetchInterval: 15_000,
 		});
+	const providerAccounts = electronTrpc.agentRouter.providerAccounts.useQuery(
+		undefined,
+		{
+			refetchInterval: 15_000,
+		},
+	);
+	const invalidateRouter = () => {
+		utils.agentRouter.dashboard.invalidate();
+		utils.agentRouter.providerAccounts.invalidate();
+	};
 	const invalidateDashboard = () => utils.agentRouter.dashboard.invalidate();
 	const startGateway = electronTrpc.agentRouter.startGateway.useMutation({
 		onSuccess: invalidateDashboard,
@@ -89,6 +102,18 @@ function RouterDashboardPage() {
 			onSuccess: invalidateDashboard,
 		},
 	);
+	const createProviderAccount =
+		electronTrpc.agentRouter.createProviderAccount.useMutation({
+			onSuccess: invalidateRouter,
+		});
+	const updateProviderAccount =
+		electronTrpc.agentRouter.updateProviderAccount.useMutation({
+			onSuccess: invalidateRouter,
+		});
+	const deleteProviderAccount =
+		electronTrpc.agentRouter.deleteProviderAccount.useMutation({
+			onSuccess: invalidateRouter,
+		});
 
 	if (isLoading) {
 		return (
@@ -203,9 +228,24 @@ function RouterDashboardPage() {
 						clearProviderKey={(provider) =>
 							clearProviderKey.mutateAsync({ provider })
 						}
+						createProviderAccount={(provider, name, key) =>
+							createProviderAccount.mutateAsync({ provider, name, key })
+						}
+						deleteProviderAccount={(id) =>
+							deleteProviderAccount.mutateAsync({ id })
+						}
 						isSavingKey={setProviderKey.isPending || clearProviderKey.isPending}
+						isSavingProviderAccount={
+							createProviderAccount.isPending ||
+							updateProviderAccount.isPending ||
+							deleteProviderAccount.isPending
+						}
+						providerAccounts={providerAccounts.data ?? []}
 						setProviderKey={(provider, key) =>
 							setProviderKey.mutateAsync({ provider, key })
+						}
+						updateProviderAccount={(id, updates) =>
+							updateProviderAccount.mutateAsync({ id, ...updates })
 						}
 					/>
 				)}
@@ -306,15 +346,37 @@ function OverviewTab({ data }: { data: RouterDashboardSnapshot }) {
 function ProvidersTab({
 	data,
 	clearProviderKey,
+	createProviderAccount,
+	deleteProviderAccount,
 	isSavingKey,
+	isSavingProviderAccount,
+	providerAccounts,
 	setProviderKey,
+	updateProviderAccount,
 }: {
 	data: RouterDashboardSnapshot;
 	clearProviderKey: (provider: RouterProviderKeyId) => Promise<unknown>;
+	createProviderAccount: (
+		provider: RouterProviderKeyId,
+		name: string | undefined,
+		key: string,
+	) => Promise<unknown>;
+	deleteProviderAccount: (id: string) => Promise<unknown>;
 	isSavingKey: boolean;
+	isSavingProviderAccount: boolean;
+	providerAccounts: ProviderAccountView[];
 	setProviderKey: (
 		provider: RouterProviderKeyId,
 		key: string,
+	) => Promise<unknown>;
+	updateProviderAccount: (
+		id: string,
+		updates: {
+			isActive?: boolean;
+			key?: string;
+			name?: string;
+			priority?: number;
+		},
 	) => Promise<unknown>;
 }) {
 	const [inputs, setInputs] = useState<Record<string, string>>({});
@@ -385,52 +447,196 @@ function ProvidersTab({
 					</div>
 
 					{provider.keyProvider && (
-						<div className="mt-3 grid grid-cols-[1fr_auto_auto] gap-2">
-							<input
-								type="password"
-								value={inputs[provider.keyProvider] ?? ""}
-								onChange={(event) =>
-									setInputs((current) => ({
-										...current,
-										[provider.keyProvider as string]: event.target.value,
-									}))
-								}
-								placeholder={`${provider.keyProvider} key`}
-								className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+						<div className="mt-3 flex flex-col gap-3">
+							<div className="grid grid-cols-[1fr_auto_auto] gap-2">
+								<input
+									type="password"
+									value={inputs[provider.keyProvider] ?? ""}
+									onChange={(event) =>
+										setInputs((current) => ({
+											...current,
+											[provider.keyProvider as string]: event.target.value,
+										}))
+									}
+									placeholder={`${provider.keyProvider} default key`}
+									className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+								/>
+								<button
+									type="button"
+									onClick={() =>
+										saveKey(provider.keyProvider as RouterProviderKeyId)
+									}
+									disabled={
+										isSavingKey ||
+										pendingProvider === provider.keyProvider ||
+										!inputs[provider.keyProvider]?.trim()
+									}
+									className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+								>
+									Save
+								</button>
+								<button
+									type="button"
+									onClick={() =>
+										clearKey(provider.keyProvider as RouterProviderKeyId)
+									}
+									disabled={
+										isSavingKey ||
+										pendingProvider === provider.keyProvider ||
+										!provider.keyConfigured
+									}
+									className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+								>
+									Clear
+								</button>
+							</div>
+							<ProviderAccountsPanel
+								accounts={providerAccounts.filter(
+									(account) => account.provider === provider.keyProvider,
+								)}
+								createProviderAccount={createProviderAccount}
+								deleteProviderAccount={deleteProviderAccount}
+								isBusy={isSavingProviderAccount}
+								provider={provider.keyProvider}
+								updateProviderAccount={updateProviderAccount}
 							/>
-							<button
-								type="button"
-								onClick={() =>
-									saveKey(provider.keyProvider as RouterProviderKeyId)
-								}
-								disabled={
-									isSavingKey ||
-									pendingProvider === provider.keyProvider ||
-									!inputs[provider.keyProvider]?.trim()
-								}
-								className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
-							>
-								Save
-							</button>
-							<button
-								type="button"
-								onClick={() =>
-									clearKey(provider.keyProvider as RouterProviderKeyId)
-								}
-								disabled={
-									isSavingKey ||
-									pendingProvider === provider.keyProvider ||
-									!provider.keyConfigured
-								}
-								className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
-							>
-								Clear
-							</button>
 						</div>
 					)}
 				</div>
 			))}
 		</section>
+	);
+}
+
+function ProviderAccountsPanel({
+	accounts,
+	createProviderAccount,
+	deleteProviderAccount,
+	isBusy,
+	provider,
+	updateProviderAccount,
+}: {
+	accounts: ProviderAccountView[];
+	createProviderAccount: (
+		provider: RouterProviderKeyId,
+		name: string | undefined,
+		key: string,
+	) => Promise<unknown>;
+	deleteProviderAccount: (id: string) => Promise<unknown>;
+	isBusy: boolean;
+	provider: RouterProviderKeyId;
+	updateProviderAccount: (
+		id: string,
+		updates: {
+			isActive?: boolean;
+			key?: string;
+			name?: string;
+			priority?: number;
+		},
+	) => Promise<unknown>;
+}) {
+	const [accountName, setAccountName] = useState("");
+	const [accountKey, setAccountKey] = useState("");
+
+	const addAccount = async () => {
+		if (!accountKey.trim()) return;
+		await createProviderAccount(
+			provider,
+			accountName.trim() || undefined,
+			accountKey.trim(),
+		);
+		setAccountName("");
+		setAccountKey("");
+	};
+
+	return (
+		<div className="rounded-md border bg-background/60 p-2">
+			<div className="mb-2 flex items-center justify-between gap-2">
+				<span className="text-xs font-medium">Accounts</span>
+				<Pill>{accounts.length} configured</Pill>
+			</div>
+			<div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+				<input
+					value={accountName}
+					onChange={(event) => setAccountName(event.target.value)}
+					placeholder="name"
+					className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<input
+					type="password"
+					value={accountKey}
+					onChange={(event) => setAccountKey(event.target.value)}
+					placeholder="api key"
+					className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<button
+					type="button"
+					onClick={addAccount}
+					disabled={isBusy || !accountKey.trim()}
+					className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+				>
+					Add
+				</button>
+			</div>
+
+			<div className="mt-2 flex flex-col gap-2">
+				{accounts.map((account) => {
+					const cooldownActive =
+						account.rateLimitedUntil &&
+						new Date(account.rateLimitedUntil).getTime() > Date.now();
+					return (
+						<div
+							key={account.id}
+							className="rounded-md border bg-card px-2 py-2 text-xs"
+						>
+							<div className="flex items-center justify-between gap-2">
+								<div className="min-w-0">
+									<div className="truncate font-medium">{account.name}</div>
+									<div className="text-muted-foreground">
+										priority {account.priority} / {account.requestCount} req
+									</div>
+								</div>
+								<div className="flex shrink-0 gap-1">
+									<button
+										type="button"
+										onClick={() =>
+											updateProviderAccount(account.id, {
+												isActive: !account.isActive,
+											})
+										}
+										disabled={isBusy}
+										className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+									>
+										{account.isActive ? "Pause" : "Enable"}
+									</button>
+									<button
+										type="button"
+										onClick={() => deleteProviderAccount(account.id)}
+										disabled={isBusy}
+										className="rounded border px-2 py-1 text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+									>
+										Delete
+									</button>
+								</div>
+							</div>
+							<div className="mt-2 flex flex-wrap gap-1.5">
+								<Pill>{account.hasKey ? "key stored" : "missing key"}</Pill>
+								<Pill>{account.isActive ? "active" : "paused"}</Pill>
+								{cooldownActive && <Pill>cooldown</Pill>}
+								{account.failureCount > 0 && (
+									<Pill>{account.failureCount} failures</Pill>
+								)}
+							</div>
+							{account.lastError && (
+								<div className="mt-2 truncate text-muted-foreground">
+									Last error: {account.lastError.message}
+								</div>
+							)}
+						</div>
+					);
+				})}
+			</div>
+		</div>
 	);
 }
 
@@ -672,18 +878,19 @@ function UsageTab() {
 			</div>
 
 			<div className="rounded-lg border bg-card">
-				<div className="grid grid-cols-[150px_90px_1fr_90px_90px] gap-3 border-b px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+				<div className="grid grid-cols-[140px_70px_1fr_100px_100px_80px] gap-3 border-b px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 					<span>Time</span>
 					<span>Status</span>
 					<span>Endpoint</span>
 					<span>Model</span>
+					<span>Account</span>
 					<span>Tokens</span>
 				</div>
 				<div className="divide-y">
 					{data.recentRequests.map((request) => (
 						<div
 							key={request.id}
-							className="grid grid-cols-[150px_90px_1fr_90px_90px] gap-3 px-4 py-3 text-xs"
+							className="grid grid-cols-[140px_70px_1fr_100px_100px_80px] gap-3 px-4 py-3 text-xs"
 						>
 							<span className="text-muted-foreground">
 								{new Date(request.timestamp).toLocaleTimeString()}
@@ -699,6 +906,9 @@ function UsageTab() {
 							</span>
 							<span className="truncate font-mono">{request.endpoint}</span>
 							<span className="truncate">{request.model}</span>
+							<span className="truncate text-muted-foreground">
+								{request.accountName ?? "-"}
+							</span>
 							<span>{request.totalTokens.toLocaleString()}</span>
 						</div>
 					))}

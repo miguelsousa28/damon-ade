@@ -2,8 +2,15 @@ import { classifyFallbackError } from "@superset/shared/agent-router";
 import {
 	buildRouterDashboardSnapshot,
 	previewRouterTokenSaver,
+	ROUTER_PROVIDER_KEY_IDS,
 	TOKEN_SAVER_MODES,
 } from "@superset/shared/router-control-plane";
+import {
+	createRouterProviderAccount,
+	deleteRouterProviderAccount,
+	listRouterProviderAccountViews,
+	updateRouterProviderAccount,
+} from "main/lib/agent-router-accounts";
 import {
 	getAgentRouterGatewayStatus,
 	startAgentRouterGateway,
@@ -24,6 +31,7 @@ import { z } from "zod";
 import { publicProcedure, router } from "../..";
 
 const tokenSaverModeSchema = z.enum(TOKEN_SAVER_MODES);
+const providerKeySchema = z.enum(ROUTER_PROVIDER_KEY_IDS);
 
 export const createAgentRouterRouter = () => {
 	return router({
@@ -47,6 +55,36 @@ export const createAgentRouterRouter = () => {
 			await stopAgentRouterGateway();
 			return startAgentRouterGateway();
 		}),
+
+		providerAccounts: publicProcedure
+			.input(z.object({ provider: providerKeySchema.optional() }).optional())
+			.query(({ input }) => listRouterProviderAccountViews(input?.provider)),
+
+		createProviderAccount: publicProcedure
+			.input(
+				z.object({
+					provider: providerKeySchema,
+					name: z.string().optional(),
+					key: z.string().min(1),
+				}),
+			)
+			.mutation(({ input }) => createRouterProviderAccount(input)),
+
+		updateProviderAccount: publicProcedure
+			.input(
+				z.object({
+					id: z.string().min(1),
+					name: z.string().optional(),
+					key: z.string().optional(),
+					isActive: z.boolean().optional(),
+					priority: z.number().int().positive().optional(),
+				}),
+			)
+			.mutation(({ input }) => updateRouterProviderAccount(input)),
+
+		deleteProviderAccount: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.mutation(({ input }) => deleteRouterProviderAccount(input.id)),
 
 		usageStats: publicProcedure.query(() => getRouterUsageStats()),
 

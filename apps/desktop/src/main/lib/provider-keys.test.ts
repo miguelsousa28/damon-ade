@@ -40,9 +40,13 @@ mock.module("./local-db", () => ({
 
 const {
 	setProviderKey,
+	setProviderAccountKey,
 	clearProviderKey,
+	clearProviderAccountKey,
 	hasProviderKey,
+	hasProviderAccountKey,
 	getProviderKey,
+	getProviderAccountKey,
 	getProviderKeyStatus,
 } = await import("./provider-keys");
 
@@ -91,6 +95,24 @@ describe("provider-keys", () => {
 		expect(getProviderKeyStatus()).toEqual(
 			expect.objectContaining({ openrouter: false, openai: false }),
 		);
+	});
+
+	it("stores independent account keys per provider", () => {
+		setProviderAccountKey("openrouter", "account-a", "sk-or-a");
+		setProviderAccountKey("openrouter", "account-b", "sk-or-b");
+
+		expect(hasProviderKey("openrouter")).toBe(true);
+		expect(hasProviderAccountKey("openrouter", "account-a")).toBe(true);
+		expect(getProviderAccountKey("openrouter", "account-a")).toBe("sk-or-a");
+		expect(getProviderAccountKey("openrouter", "account-b")).toBe("sk-or-b");
+		expect(getProviderKeyStatus()).toEqual(
+			expect.objectContaining({ openrouter: true }),
+		);
+
+		clearProviderAccountKey("openrouter", "account-a");
+
+		expect(getProviderAccountKey("openrouter", "account-a")).toBeNull();
+		expect(getProviderAccountKey("openrouter", "account-b")).toBe("sk-or-b");
 	});
 
 	it("degrades gracefully when secure storage is unavailable", () => {

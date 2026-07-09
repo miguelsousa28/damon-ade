@@ -8,6 +8,8 @@ import {
 import type {
 	RouterCustomCombo,
 	RouterModelAlias,
+	RouterProviderAccount,
+	RouterProviderKeyId,
 } from "@superset/shared/router-control-plane";
 import { app } from "electron";
 
@@ -18,6 +20,8 @@ export interface RouterUsageRecordInput {
 	method: string;
 	provider?: string | null;
 	model?: string | null;
+	accountId?: string | null;
+	accountName?: string | null;
 	status: number;
 	success: boolean;
 	durationMs: number;
@@ -33,6 +37,8 @@ export interface RouterUsageEntry {
 	method: string;
 	provider: string;
 	model: string;
+	accountId: string | null;
+	accountName: string | null;
 	status: number;
 	success: boolean;
 	durationMs: number;
@@ -61,12 +67,15 @@ export interface RouterUsageStats {
 export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
+	providerAccounts: RouterProviderAccount[];
 	usage: RouterUsageEntry[];
 }
 
 interface RouterStoreFile {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
+	providerAccounts: RouterProviderAccount[];
+	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
 	usage: RouterUsageEntry[];
 }
 
@@ -75,6 +84,7 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 	return {
 		aliases: data.aliases,
 		customCombos: data.customCombos,
+		providerAccounts: data.providerAccounts,
 		usage: data.usage,
 	};
 }
@@ -125,6 +135,175 @@ export function deleteRouterCustomCombo(name: string): RouterCustomCombo[] {
 	return next;
 }
 
+export function getRouterProviderAccounts(
+	provider?: RouterProviderKeyId,
+): RouterProviderAccount[] {
+	const accounts = readStore().providerAccounts;
+	return sortAccounts(
+		provider
+			? accounts.filter((account) => account.provider === provider)
+			: accounts,
+	);
+}
+
+export function createRouterProviderAccountMetadata({
+	name,
+	provider,
+}: {
+	name?: string;
+	provider: RouterProviderKeyId;
+}): RouterProviderAccount {
+	const data = readStore();
+	const providerAccounts = data.providerAccounts.filter(
+		(account) => account.provider === provider,
+	);
+	const now = new Date().toISOString();
+	const account: RouterProviderAccount = {
+		id: randomUUID(),
+		provider,
+		name: name?.trim() || `${provider} account ${providerAccounts.length + 1}`,
+		authType: "api-key",
+		priority:
+			providerAccounts.reduce(
+				(max, candidate) => Math.max(max, candidate.priority),
+				0,
+			) + 1,
+		isActive: true,
+		createdAt: now,
+		updatedAt: now,
+		lastUsedAt: null,
+		consecutiveUseCount: 0,
+		requestCount: 0,
+		failureCount: 0,
+		backoffLevel: 0,
+		rateLimitedUntil: null,
+		lastError: null,
+	};
+	writeStore({
+		...data,
+		providerAccounts: sortAccounts([...data.providerAccounts, account]),
+	});
+	return account;
+}
+
+export function updateRouterProviderAccountMetadata(
+	id: string,
+	updates: Partial<
+		Pick<
+			RouterProviderAccount,
+			| "backoffLevel"
+			| "consecutiveUseCount"
+			| "failureCount"
+			| "isActive"
+			| "lastError"
+			| "lastUsedAt"
+			| "name"
+			| "priority"
+			| "rateLimitedUntil"
+			| "requestCount"
+		>
+	>,
+): RouterProviderAccount[] {
+	const data = readStore();
+	const next = data.providerAccounts.map((account) =>
+		account.id === id
+			? {
+					...account,
+					...sanitizeProviderAccountUpdates(updates),
+					updatedAt: new Date().toISOString(),
+				}
+			: account,
+	);
+	writeStore({ ...data, providerAccounts: sortAccounts(next) });
+	return getRouterProviderAccounts();
+}
+
+export function deleteRouterProviderAccountMetadata(
+	id: string,
+): RouterProviderAccount[] {
+	const data = readStore();
+	writeStore({
+		...data,
+		providerAccounts: data.providerAccounts.filter(
+			(account) => account.id !== id,
+		),
+	});
+	return getRouterProviderAccounts();
+}
+
+export function recordRouterProviderAccountSuccess(id: string): void {
+	const account = getRouterProviderAccounts().find(
+		(candidate) => candidate.id === id,
+	);
+	if (!account) return;
+	updateRouterProviderAccountMetadata(id, {
+		backoffLevel: 0,
+		consecutiveUseCount: account.consecutiveUseCount + 1,
+		lastError: null,
+		lastUsedAt: new Date().toISOString(),
+		rateLimitedUntil: null,
+		requestCount: account.requestCount + 1,
+	});
+}
+
+export function recordRouterProviderAccountFailure({
+	backoffLevel,
+	cooldownMs,
+	id,
+	message,
+	status,
+}: {
+	backoffLevel: number;
+	cooldownMs: number;
+	id: string;
+	message: string;
+	status?: number;
+}): void {
+	const account = getRouterProviderAccounts().find(
+		(candidate) => candidate.id === id,
+	);
+	if (!account) return;
+	updateRouterProviderAccountMetadata(id, {
+		backoffLevel,
+		consecutiveUseCount: 0,
+		failureCount: account.failureCount + 1,
+		lastError: {
+			status,
+			message,
+			timestamp: new Date().toISOString(),
+		},
+		rateLimitedUntil:
+			cooldownMs > 0 ? new Date(Date.now() + cooldownMs).toISOString() : null,
+	});
+}
+
+export function selectRouterProviderAccounts(
+	provider: RouterProviderKeyId,
+): RouterProviderAccount[] {
+	const data = readStore();
+	const available = sortAccounts(
+		data.providerAccounts.filter(
+			(account) =>
+				account.provider === provider &&
+				account.isActive &&
+				!isCooldownActive(account.rateLimitedUntil),
+		),
+	);
+	if (available.length === 0) return [];
+
+	const cursor = data.accountCursor[provider] ?? 0;
+	const start = cursor % available.length;
+	const ordered = [...available.slice(start), ...available.slice(0, start)];
+	writeStore({
+		...data,
+		accountCursor: {
+			...data.accountCursor,
+			[provider]: (start + 1) % available.length,
+		},
+	});
+	return ordered;
+}
+
 export function recordRouterUsage(input: RouterUsageRecordInput): void {
 	const requestTokens = Math.max(0, Math.round(input.requestTokens ?? 0));
 	const responseTokens = Math.max(0, Math.round(input.responseTokens ?? 0));
@@ -139,6 +318,8 @@ export function recordRouterUsage(input: RouterUsageRecordInput): void {
 		method: input.method,
 		provider,
 		model,
+		accountId: input.accountId ?? null,
+		accountName: input.accountName ?? null,
 		status: input.status,
 		success: input.success,
 		durationMs: Math.max(0, Math.round(input.durationMs)),
@@ -252,7 +433,16 @@ function readStore(): RouterStoreFile {
 			customCombos: Array.isArray(parsed.customCombos)
 				? parsed.customCombos
 				: [],
-			usage: Array.isArray(parsed.usage) ? parsed.usage : [],
+			providerAccounts: Array.isArray(parsed.providerAccounts)
+				? parsed.providerAccounts
+				: [],
+			accountCursor:
+				parsed.accountCursor && typeof parsed.accountCursor === "object"
+					? parsed.accountCursor
+					: {},
+			usage: Array.isArray(parsed.usage)
+				? parsed.usage.map(normalizeUsageEntry)
+				: [],
 		};
 	} catch (error) {
 		console.error("[agent-router-store] Failed to read store:", error);
@@ -270,7 +460,34 @@ function emptyStore(): RouterStoreFile {
 	return {
 		aliases: [],
 		customCombos: [],
+		providerAccounts: [],
+		accountCursor: {},
 		usage: [],
+	};
+}
+
+function normalizeUsageEntry(
+	entry: Partial<RouterUsageEntry>,
+): RouterUsageEntry {
+	return {
+		id: entry.id ?? randomUUID(),
+		timestamp: entry.timestamp ?? new Date().toISOString(),
+		endpoint: entry.endpoint ?? "unknown",
+		method: entry.method ?? "POST",
+		provider: entry.provider ?? "router",
+		model: entry.model ?? "unknown",
+		accountId: entry.accountId ?? null,
+		accountName: entry.accountName ?? null,
+		status: entry.status ?? 0,
+		success: entry.success ?? false,
+		durationMs: entry.durationMs ?? 0,
+		requestTokens: entry.requestTokens ?? 0,
+		responseTokens: entry.responseTokens ?? 0,
+		error: entry.error ?? null,
+		totalTokens:
+			entry.totalTokens ??
+			(entry.requestTokens ?? 0) + (entry.responseTokens ?? 0),
+		estimatedCostUsd: entry.estimatedCostUsd ?? 0,
 	};
 }
 
@@ -312,4 +529,32 @@ function findPricing(model: string): AgentPricing | null {
 
 function roundCurrency(value: number): number {
 	return Math.round(value * 10_000) / 10_000;
+}
+
+function sortAccounts(
+	accounts: RouterProviderAccount[],
+): RouterProviderAccount[] {
+	return [...accounts].sort(
+		(a, b) => a.priority - b.priority || a.name.localeCompare(b.name),
+	);
+}
+
+function isCooldownActive(rateLimitedUntil: string | null): boolean {
+	if (!rateLimitedUntil) return false;
+	return new Date(rateLimitedUntil).getTime() > Date.now();
+}
+
+function sanitizeProviderAccountUpdates(
+	updates: Partial<RouterProviderAccount>,
+): Partial<RouterProviderAccount> {
+	const sanitized = Object.fromEntries(
+		Object.entries(updates).filter(([, value]) => value !== undefined),
+	) as Partial<RouterProviderAccount>;
+	if (sanitized.name !== undefined) {
+		sanitized.name = sanitized.name.trim();
+	}
+	if (sanitized.priority !== undefined) {
+		sanitized.priority = Math.max(1, Math.round(sanitized.priority));
+	}
+	return sanitized;
 }

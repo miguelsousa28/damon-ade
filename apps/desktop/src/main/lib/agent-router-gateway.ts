@@ -7,6 +7,7 @@ import {
 	type RouterGatewayStatus,
 	type RouterModelResolutionOptions,
 	type RouterModelTarget,
+	type RouterProviderKeyId,
 	type RouterTokenSaverMode,
 	resolveRouterModelTarget,
 	TOKEN_SAVER_MODES,
@@ -16,6 +17,12 @@ import express, {
 	type Response as ExpressResponse,
 	type Request,
 } from "express";
+import {
+	getProviderAccountCredentials,
+	markProviderAccountFailure,
+	markProviderAccountSuccess,
+	type RouterProviderCredential,
+} from "./agent-router-accounts";
 import {
 	clearRouterUsage,
 	deleteRouterAlias,
@@ -28,7 +35,6 @@ import {
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 } from "./agent-router-store";
-import { getProviderKey } from "./provider-keys";
 
 export const DEFAULT_AGENT_ROUTER_GATEWAY_PORT = 20128;
 const GATEWAY_HOST = "127.0.0.1";
@@ -49,6 +55,7 @@ type JsonObject = Record<string, unknown>;
 
 interface OpenRouterSuccess {
 	ok: true;
+	account: RouterProviderCredential;
 	upstream: globalThis.Response;
 	target: RouterModelTarget;
 	model: string;
@@ -265,6 +272,11 @@ async function handleChatCompletions(req: Request, res: ExpressResponse) {
 		return;
 	}
 
+	setUsageLocals(res, {
+		account: result.account,
+		model: result.model,
+		provider: "openrouter",
+	});
 	await pipeUpstreamResponse(result.upstream, res);
 }
 
@@ -288,6 +300,11 @@ async function handleResponses(req: Request, res: ExpressResponse) {
 		return;
 	}
 
+	setUsageLocals(res, {
+		account: result.account,
+		model: result.model,
+		provider: "openrouter",
+	});
 	const upstream = await readJson(result.upstream);
 	const text = extractAssistantText(upstream);
 	const usage = extractOpenAIUsage(upstream);
@@ -338,6 +355,11 @@ async function handleAnthropicMessages(req: Request, res: ExpressResponse) {
 		return;
 	}
 
+	setUsageLocals(res, {
+		account: result.account,
+		model: result.model,
+		provider: "openrouter",
+	});
 	const upstream = await readJson(result.upstream);
 	const text = extractAssistantText(upstream);
 	const usage = extractOpenAIUsage(upstream);
@@ -372,8 +394,8 @@ async function handleOpenAIProxy(
 	upstreamPath: string,
 	{ rawBody = false }: { rawBody?: boolean } = {},
 ) {
-	const openAiKey = getProviderKey("openai");
-	if (!openAiKey) {
+	const accounts = getProviderAccountCredentials("openai");
+	if (accounts.length === 0) {
 		res.status(401).json({
 			error: {
 				message:
@@ -384,22 +406,52 @@ async function handleOpenAIProxy(
 		return;
 	}
 
-	const headers: Record<string, string> = {
-		Authorization: `Bearer ${openAiKey}`,
-	};
 	const contentType = req.header("content-type");
-	if (contentType) headers["Content-Type"] = contentType;
-	if (!rawBody) headers["Content-Type"] = "application/json";
-
 	const body = rawBody
 		? (req.body as BodyInit)
 		: (JSON.stringify(req.body ?? {}) as BodyInit);
-	const upstream = await fetch(`${OPENAI_BASE_URL}${upstreamPath}`, {
-		method: "POST",
-		headers,
-		body,
+	let lastFailure: { status: number; text: string } | null = null;
+
+	for (const account of accounts) {
+		const headers: Record<string, string> = {
+			Authorization: `Bearer ${account.key}`,
+		};
+		if (contentType) headers["Content-Type"] = contentType;
+		if (!rawBody) headers["Content-Type"] = "application/json";
+
+		const upstream = await fetch(`${OPENAI_BASE_URL}${upstreamPath}`, {
+			method: "POST",
+			headers,
+			body,
+		});
+
+		if (upstream.ok) {
+			markProviderAccountSuccess(account);
+			setUsageLocals(res, {
+				account,
+				model: inferModelForRequest(req.path, req.body),
+				provider: "openai",
+			});
+			await pipeUpstreamResponse(upstream, res);
+			return;
+		}
+
+		const text = await upstream.text().catch(() => upstream.statusText);
+		lastFailure = { status: upstream.status, text };
+		markProviderAccountFailure({
+			credential: account,
+			status: upstream.status,
+			text,
+		});
+	}
+
+	res.status(lastFailure?.status ?? 502).json({
+		error: {
+			message: "All OpenAI accounts failed.",
+			type: "upstream_error",
+			details: lastFailure,
+		},
 	});
-	await pipeUpstreamResponse(upstream, res);
 }
 
 async function handleSearch(req: Request, res: ExpressResponse) {
@@ -415,28 +467,42 @@ async function handleSearch(req: Request, res: ExpressResponse) {
 		return;
 	}
 
-	const braveKey = getProviderKey("brave-search");
-	if (braveKey) {
+	const braveAccounts = getProviderAccountCredentials("brave-search");
+	for (const account of braveAccounts) {
 		const url = new URL(BRAVE_SEARCH_URL);
 		url.searchParams.set("q", query);
 		url.searchParams.set("count", String(Number(body.count ?? 10)));
 		const upstream = await fetch(url, {
 			headers: {
 				Accept: "application/json",
-				"X-Subscription-Token": braveKey,
+				"X-Subscription-Token": account.key,
 			},
 		});
-		await pipeUpstreamResponse(upstream, res);
-		return;
+		if (upstream.ok) {
+			markProviderAccountSuccess(account);
+			setUsageLocals(res, {
+				account,
+				model: "brave-search",
+				provider: "brave-search",
+			});
+			await pipeUpstreamResponse(upstream, res);
+			return;
+		}
+		const text = await upstream.text().catch(() => upstream.statusText);
+		markProviderAccountFailure({
+			credential: account,
+			status: upstream.status,
+			text,
+		});
 	}
 
-	const perplexityKey = getProviderKey("perplexity");
-	if (perplexityKey) {
+	const perplexityAccounts = getProviderAccountCredentials("perplexity");
+	for (const account of perplexityAccounts) {
 		const upstream = await fetch(PERPLEXITY_CHAT_COMPLETIONS_URL, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				Authorization: `Bearer ${perplexityKey}`,
+				Authorization: `Bearer ${account.key}`,
 			},
 			body: JSON.stringify({
 				model: typeof body.model === "string" ? body.model : "sonar",
@@ -448,8 +514,22 @@ async function handleSearch(req: Request, res: ExpressResponse) {
 				],
 			}),
 		});
-		await pipeUpstreamResponse(upstream, res);
-		return;
+		if (upstream.ok) {
+			markProviderAccountSuccess(account);
+			setUsageLocals(res, {
+				account,
+				model: typeof body.model === "string" ? body.model : "sonar",
+				provider: "perplexity",
+			});
+			await pipeUpstreamResponse(upstream, res);
+			return;
+		}
+		const text = await upstream.text().catch(() => upstream.statusText);
+		markProviderAccountFailure({
+			credential: account,
+			status: upstream.status,
+			text,
+		});
 	}
 
 	res.status(401).json({
@@ -522,8 +602,8 @@ async function fetchOpenRouterWithFallback(
 		};
 	}
 
-	const openRouterKey = getProviderKey("openrouter");
-	if (!openRouterKey) {
+	const accounts = getProviderAccountCredentials("openrouter");
+	if (accounts.length === 0) {
 		return {
 			ok: false,
 			status: 401,
@@ -537,35 +617,50 @@ async function fetchOpenRouterWithFallback(
 		};
 	}
 
-	let lastFailure: { status: number; text: string; model: string } | null =
-		null;
+	let lastFailure: {
+		account: string;
+		model: string;
+		status: number;
+		text: string;
+	} | null = null;
 	for (const model of target.fallbackModels) {
-		const upstreamBody = { ...body, model };
-		const upstream = await fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${openRouterKey}`,
-				"HTTP-Referer": "https://github.com/per-simmons/damon-ade",
-				"X-Title": "ADE Orchestrator Router",
-			},
-			body: JSON.stringify(upstreamBody),
-		});
+		for (const account of accounts) {
+			const upstreamBody = { ...body, model };
+			const upstream = await fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${account.key}`,
+					"HTTP-Referer": "https://github.com/per-simmons/damon-ade",
+					"X-Title": "ADE Orchestrator Router",
+				},
+				body: JSON.stringify(upstreamBody),
+			});
 
-		if (upstream.ok) {
-			return {
-				ok: true,
-				upstream,
-				target,
+			if (upstream.ok) {
+				markProviderAccountSuccess(account);
+				return {
+					ok: true,
+					account,
+					upstream,
+					target,
+					model,
+				};
+			}
+
+			const text = await upstream.text().catch(() => upstream.statusText);
+			lastFailure = {
+				account: account.name,
 				model,
+				status: upstream.status,
+				text,
 			};
+			markProviderAccountFailure({
+				credential: account,
+				status: upstream.status,
+				text,
+			});
 		}
-
-		lastFailure = {
-			status: upstream.status,
-			text: await upstream.text().catch(() => upstream.statusText),
-			model,
-		};
 	}
 
 	return {
@@ -762,6 +857,26 @@ function toJsonObject(value: unknown): JsonObject {
 	return value && typeof value === "object" ? (value as JsonObject) : {};
 }
 
+function setUsageLocals(
+	res: ExpressResponse,
+	{
+		account,
+		model,
+		provider,
+	}: {
+		account?: RouterProviderCredential;
+		model: string;
+		provider: RouterProviderKeyId | "router" | "search";
+	},
+) {
+	res.locals.routerProvider = provider;
+	res.locals.routerModel = model;
+	if (account) {
+		res.locals.routerAccountId = account.id;
+		res.locals.routerAccountName = account.name;
+	}
+}
+
 function attachUsageLogger(
 	req: Request,
 	res: ExpressResponse,
@@ -774,8 +889,22 @@ function attachUsageLogger(
 			recordRouterUsage({
 				endpoint: req.path,
 				method: req.method,
-				provider: inferProviderForRequest(req.path),
-				model: inferModelForRequest(req.path, req.body),
+				provider:
+					typeof res.locals.routerProvider === "string"
+						? res.locals.routerProvider
+						: inferProviderForRequest(req.path),
+				model:
+					typeof res.locals.routerModel === "string"
+						? res.locals.routerModel
+						: inferModelForRequest(req.path, req.body),
+				accountId:
+					typeof res.locals.routerAccountId === "string"
+						? res.locals.routerAccountId
+						: null,
+				accountName:
+					typeof res.locals.routerAccountName === "string"
+						? res.locals.routerAccountName
+						: null,
 				status: res.statusCode,
 				success: res.statusCode < 400,
 				durationMs: Date.now() - startedAtMs,
