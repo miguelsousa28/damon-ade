@@ -15,6 +15,7 @@ import type {
 	RouterPricingRate,
 	RouterPricingTable,
 	RouterProviderAccount,
+	RouterProviderAccountAuthType,
 	RouterProviderKeyId,
 	RouterProviderNode,
 	RouterProviderNodeApiType,
@@ -712,11 +713,19 @@ export function getRouterProviderAccounts(
 }
 
 export function createRouterProviderAccountMetadata({
+	authType = "api-key",
+	email = null,
+	expiresAt = null,
 	name,
 	provider,
+	providerSpecificData = {},
 }: {
+	authType?: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
 	name?: string;
 	provider: RouterProviderKeyId;
+	providerSpecificData?: Record<string, unknown>;
 }): RouterProviderAccount {
 	const data = readStore();
 	const providerAccounts = data.providerAccounts.filter(
@@ -727,7 +736,10 @@ export function createRouterProviderAccountMetadata({
 		id: randomUUID(),
 		provider,
 		name: name?.trim() || `${provider} account ${providerAccounts.length + 1}`,
-		authType: "api-key",
+		authType,
+		email,
+		expiresAt,
+		providerSpecificData,
 		priority:
 			providerAccounts.reduce(
 				(max, candidate) => Math.max(max, candidate.priority),
@@ -758,12 +770,16 @@ export function updateRouterProviderAccountMetadata(
 			RouterProviderAccount,
 			| "backoffLevel"
 			| "consecutiveUseCount"
+			| "authType"
+			| "email"
+			| "expiresAt"
 			| "failureCount"
 			| "isActive"
 			| "lastError"
 			| "lastUsedAt"
 			| "name"
 			| "priority"
+			| "providerSpecificData"
 			| "rateLimitedUntil"
 			| "requestCount"
 		>
@@ -1549,7 +1565,17 @@ function readStore(): RouterStoreFile {
 					)
 				: [],
 			providerAccounts: Array.isArray(parsed.providerAccounts)
-				? parsed.providerAccounts
+				? sortAccounts(
+						parsed.providerAccounts
+							.map((account) =>
+								normalizeProviderAccount(
+									account as Partial<RouterProviderAccount>,
+								),
+							)
+							.filter((account): account is RouterProviderAccount =>
+								Boolean(account),
+							),
+					)
 				: [],
 			providerNodes: Array.isArray(parsed.providerNodes)
 				? parsed.providerNodes
@@ -1855,6 +1881,77 @@ function sortProxyPools(pools: RouterProxyPool[]): RouterProxyPool[] {
 	);
 }
 
+function normalizeProviderAccount(
+	account: Partial<RouterProviderAccount>,
+): RouterProviderAccount | null {
+	if (!account.id || !account.provider) return null;
+	const provider = isRouterProviderKeyId(account.provider)
+		? account.provider
+		: null;
+	if (!provider) return null;
+	const now = new Date().toISOString();
+	const authType = normalizeProviderAccountAuthType(account.authType);
+	return {
+		id: String(account.id),
+		provider,
+		name: account.name?.trim() || `${provider} account`,
+		authType,
+		email: typeof account.email === "string" ? account.email : null,
+		expiresAt: typeof account.expiresAt === "string" ? account.expiresAt : null,
+		providerSpecificData:
+			account.providerSpecificData &&
+			typeof account.providerSpecificData === "object" &&
+			!Array.isArray(account.providerSpecificData)
+				? account.providerSpecificData
+				: {},
+		priority:
+			typeof account.priority === "number"
+				? Math.max(1, Math.round(account.priority))
+				: 1,
+		isActive: account.isActive !== false,
+		createdAt: account.createdAt || now,
+		updatedAt: account.updatedAt || now,
+		lastUsedAt: account.lastUsedAt ?? null,
+		consecutiveUseCount:
+			typeof account.consecutiveUseCount === "number"
+				? account.consecutiveUseCount
+				: 0,
+		requestCount:
+			typeof account.requestCount === "number" ? account.requestCount : 0,
+		failureCount:
+			typeof account.failureCount === "number" ? account.failureCount : 0,
+		backoffLevel:
+			typeof account.backoffLevel === "number" ? account.backoffLevel : 0,
+		rateLimitedUntil:
+			typeof account.rateLimitedUntil === "string"
+				? account.rateLimitedUntil
+				: null,
+		lastError:
+			account.lastError &&
+			typeof account.lastError === "object" &&
+			typeof account.lastError.message === "string"
+				? {
+						status:
+							typeof account.lastError.status === "number"
+								? account.lastError.status
+								: undefined,
+						message: account.lastError.message,
+						timestamp:
+							typeof account.lastError.timestamp === "string"
+								? account.lastError.timestamp
+								: now,
+					}
+				: null,
+	};
+}
+
+function normalizeProviderAccountAuthType(
+	value: unknown,
+): RouterProviderAccountAuthType {
+	if (value === "oauth" || value === "access-token") return value;
+	return "api-key";
+}
+
 function isCooldownActive(rateLimitedUntil: string | null): boolean {
 	if (!rateLimitedUntil) return false;
 	return new Date(rateLimitedUntil).getTime() > Date.now();
@@ -1871,6 +1968,17 @@ function sanitizeProviderAccountUpdates(
 	}
 	if (sanitized.priority !== undefined) {
 		sanitized.priority = Math.max(1, Math.round(sanitized.priority));
+	}
+	if (sanitized.authType !== undefined) {
+		sanitized.authType = normalizeProviderAccountAuthType(sanitized.authType);
+	}
+	if (
+		sanitized.providerSpecificData !== undefined &&
+		(!sanitized.providerSpecificData ||
+			typeof sanitized.providerSpecificData !== "object" ||
+			Array.isArray(sanitized.providerSpecificData))
+	) {
+		sanitized.providerSpecificData = {};
 	}
 	return sanitized;
 }

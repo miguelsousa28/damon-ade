@@ -1,6 +1,7 @@
 import { classifyFallbackError } from "@superset/shared/agent-router";
 import type {
 	RouterProviderAccount,
+	RouterProviderAccountAuthType,
 	RouterProviderKeyId,
 } from "@superset/shared/router-control-plane";
 import {
@@ -42,15 +43,30 @@ export function listRouterProviderAccountViews(
 }
 
 export function createRouterProviderAccount({
+	authType,
+	email,
+	expiresAt,
 	key,
 	name,
 	provider,
+	providerSpecificData,
 }: {
+	authType?: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
 	key: string;
 	name?: string;
 	provider: RouterProviderKeyId;
+	providerSpecificData?: Record<string, unknown>;
 }): RouterProviderAccountView[] {
-	const account = createRouterProviderAccountMetadata({ name, provider });
+	const account = createRouterProviderAccountMetadata({
+		authType,
+		email,
+		expiresAt,
+		name,
+		provider,
+		providerSpecificData,
+	});
 	try {
 		setProviderAccountKey(provider, account.id, key);
 	} catch (error) {
@@ -62,16 +78,24 @@ export function createRouterProviderAccount({
 
 export function updateRouterProviderAccount({
 	id,
+	authType,
+	email,
+	expiresAt,
 	isActive,
 	key,
 	name,
 	priority,
+	providerSpecificData,
 }: {
 	id: string;
+	authType?: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
 	isActive?: boolean;
 	key?: string;
 	name?: string;
 	priority?: number;
+	providerSpecificData?: Record<string, unknown>;
 }): RouterProviderAccountView[] {
 	const account = getRouterProviderAccounts().find(
 		(candidate) => candidate.id === id,
@@ -83,9 +107,13 @@ export function updateRouterProviderAccount({
 	}
 
 	updateRouterProviderAccountMetadata(id, {
+		authType,
+		email,
+		expiresAt,
 		isActive,
 		name,
 		priority,
+		providerSpecificData,
 	});
 	return listRouterProviderAccountViews(account.provider);
 }

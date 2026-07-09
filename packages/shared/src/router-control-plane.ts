@@ -45,12 +45,19 @@ export const ROUTER_PROVIDER_KEY_IDS = [
 ] as const;
 
 export type RouterProviderKeyId = (typeof ROUTER_PROVIDER_KEY_IDS)[number];
+export type RouterProviderAccountAuthType =
+	| "api-key"
+	| "oauth"
+	| "access-token";
 
 export interface RouterProviderAccount {
 	id: string;
 	provider: RouterProviderKeyId;
 	name: string;
-	authType: "api-key";
+	authType: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
+	providerSpecificData?: Record<string, unknown>;
 	priority: number;
 	isActive: boolean;
 	createdAt: string;

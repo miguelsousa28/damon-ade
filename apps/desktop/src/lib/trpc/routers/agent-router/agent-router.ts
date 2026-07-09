@@ -60,11 +60,17 @@ const tokenSaverModeSchema = z.enum(TOKEN_SAVER_MODES);
 const routerModelKindSchema = z.enum(ROUTER_MODEL_KINDS);
 const proxyPoolTypeSchema = z.enum(ROUTER_PROXY_POOL_TYPES);
 const providerKeySchema = z.enum(ROUTER_PROVIDER_KEY_IDS);
+const providerAccountAuthTypeSchema = z.enum([
+	"api-key",
+	"oauth",
+	"access-token",
+]);
 const providerNodeTypeSchema = z.enum([
 	"openai-compatible",
 	"anthropic-compatible",
 	"custom-embedding",
 ]);
+const providerSpecificDataSchema = z.record(z.string(), z.unknown());
 const providerNodeApiTypeSchema = z.enum(["chat", "responses"]);
 const providerNodeInputSchema = z.object({
 	apiKey: z.string().optional(),
@@ -139,6 +145,10 @@ export const createAgentRouterRouter = () => {
 					provider: providerKeySchema,
 					name: z.string().optional(),
 					key: z.string().min(1),
+					authType: providerAccountAuthTypeSchema.optional(),
+					email: z.string().nullable().optional(),
+					expiresAt: z.string().nullable().optional(),
+					providerSpecificData: providerSpecificDataSchema.optional(),
 				}),
 			)
 			.mutation(({ input }) => createRouterProviderAccount(input)),
@@ -149,8 +159,12 @@ export const createAgentRouterRouter = () => {
 					id: z.string().min(1),
 					name: z.string().optional(),
 					key: z.string().optional(),
+					authType: providerAccountAuthTypeSchema.optional(),
+					email: z.string().nullable().optional(),
+					expiresAt: z.string().nullable().optional(),
 					isActive: z.boolean().optional(),
 					priority: z.number().int().positive().optional(),
+					providerSpecificData: providerSpecificDataSchema.optional(),
 				}),
 			)
 			.mutation(({ input }) => updateRouterProviderAccount(input)),

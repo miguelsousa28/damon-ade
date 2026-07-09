@@ -27,6 +27,7 @@ import {
 	type RouterModelTestResult,
 	type RouterPricingTable,
 	type RouterProviderAccount,
+	type RouterProviderAccountAuthType,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
@@ -663,6 +664,83 @@ function createAgentRouterGatewayApp() {
 		}
 		deleteRouterProviderAccount(req.params.id);
 		res.json({ message: "Connection deleted successfully" });
+	});
+	app.get("/api/oauth/providers", (_req, res) => {
+		res.json({
+			providers: OAUTH_PROVIDER_COMPATIBILITY.map((provider) => ({
+				...provider,
+				connectionCount: listRouterProviderAccountViews(
+					provider.keyProvider,
+				).filter((account) => account.authType !== "api-key").length,
+			})),
+		});
+	});
+	app.get("/api/oauth/:provider/authorize", (req, res) => {
+		const provider = resolveOAuthProvider(req.params.provider);
+		if (!provider) {
+			res.status(404).json({ error: "OAuth provider not supported by ADE" });
+			return;
+		}
+		res.status(501).json({
+			error: "Browser OAuth authorize is not automated in ADE yet.",
+			provider,
+			importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
+		});
+	});
+	app.get("/api/oauth/:provider/device-code", (req, res) => {
+		const provider = resolveOAuthProvider(req.params.provider);
+		if (!provider) {
+			res.status(404).json({ error: "OAuth provider not supported by ADE" });
+			return;
+		}
+		res.status(501).json({
+			error: "Device-code OAuth is not automated in ADE yet.",
+			provider,
+			importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
+		});
+	});
+	app.post("/api/oauth/:provider/import-token", (req, res) => {
+		const result = importOAuthTokenConnection(req.params.provider, req.body);
+		res.status(result.ok ? 201 : result.status).json(result.body);
+	});
+	app.post("/api/oauth/:provider/exchange", (req, res) => {
+		const body = toJsonObject(req.body);
+		const code = typeof body.code === "string" ? body.code.trim() : "";
+		if (looksLikeJwt(code)) {
+			const result = importOAuthTokenConnection(req.params.provider, {
+				...body,
+				accessToken: code,
+				authType: "access-token",
+			});
+			res.status(result.ok ? 201 : result.status).json(result.body);
+			return;
+		}
+		const provider = resolveOAuthProvider(req.params.provider);
+		res.status(provider ? 501 : 404).json(
+			provider
+				? {
+						error:
+							"OAuth code exchange is not automated in ADE yet. Import an access token instead.",
+						provider,
+						importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
+					}
+				: { error: "OAuth provider not supported by ADE" },
+		);
+	});
+	app.post("/api/oauth/:provider/poll", (req, res) => {
+		const provider = resolveOAuthProvider(req.params.provider);
+		res.status(provider ? 501 : 404).json(
+			provider
+				? {
+						success: false,
+						pending: false,
+						error:
+							"Device-code polling is not automated in ADE yet. Import an access token instead.",
+						provider,
+						importTokenUrl: `/api/oauth/${req.params.provider}/import-token`,
+					}
+				: { error: "OAuth provider not supported by ADE" },
+		);
 	});
 	app.get("/api/cli-tools/all-statuses", (_req, res) => {
 		res.json(buildCliToolStatuses());
@@ -2427,6 +2505,211 @@ function errorTextFromBody(body: JsonObject): string | null {
 	return stringValue(body.message) ?? stringValue(body.msg) ?? null;
 }
 
+interface OAuthProviderCompatibility {
+	id: string;
+	aliases: string[];
+	keyProvider: RouterProviderKeyId;
+	label: string;
+	importToken: boolean;
+	authorize: boolean;
+	deviceCode: boolean;
+	notes: string;
+}
+
+const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
+	{
+		id: "codex",
+		aliases: ["openai", "chatgpt"],
+		keyProvider: "openai",
+		label: "Codex / OpenAI",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a Codex/OpenAI access token. Automated browser exchange is not bundled yet.",
+	},
+	{
+		id: "claude",
+		aliases: ["anthropic"],
+		keyProvider: "anthropic",
+		label: "Claude / Anthropic",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a Claude/Anthropic access token or API token as an OAuth-style account.",
+	},
+	{
+		id: "gemini",
+		aliases: ["google", "gemini-cli", "antigravity"],
+		keyProvider: "gemini",
+		label: "Gemini / Google",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a Gemini OAuth access token. Refresh/device-code flow is not automated yet.",
+	},
+];
+
+function resolveOAuthProvider(
+	providerId: string,
+): OAuthProviderCompatibility | null {
+	const normalized = providerId.trim().toLowerCase();
+	return (
+		OAUTH_PROVIDER_COMPATIBILITY.find(
+			(provider) =>
+				provider.id === normalized ||
+				provider.keyProvider === normalized ||
+				provider.aliases.includes(normalized),
+		) ?? null
+	);
+}
+
+function importOAuthTokenConnection(providerId: string, rawBody: unknown) {
+	const provider = resolveOAuthProvider(providerId);
+	if (!provider) {
+		return {
+			ok: false as const,
+			status: 404,
+			body: { error: "OAuth provider not supported by ADE" },
+		};
+	}
+	const body = toJsonObject(rawBody);
+	const token =
+		stringValue(body.accessToken) ??
+		stringValue(body.access_token) ??
+		stringValue(body.token) ??
+		stringValue(body.apiKey) ??
+		stringValue(body.key);
+	if (!token) {
+		return {
+			ok: false as const,
+			status: 400,
+			body: { error: "accessToken, token, apiKey, or key is required" },
+		};
+	}
+	const jwtInfo = looksLikeJwt(token) ? decodeJwtPayload(token) : {};
+	const providerSpecificData = {
+		...jsonObjectValue(body.providerSpecificData),
+		...jsonObjectValue(body.provider_specific_data),
+		importedFrom: "ade-oauth-compat",
+		oauthProvider: provider.id,
+		...(typeof jwtInfo.account_id === "string"
+			? { accountId: jwtInfo.account_id, chatgptAccountId: jwtInfo.account_id }
+			: {}),
+		...(typeof jwtInfo.plan_type === "string"
+			? { planType: jwtInfo.plan_type, chatgptPlanType: jwtInfo.plan_type }
+			: {}),
+	};
+	const name =
+		stringValue(body.name) ??
+		stringValue(body.email) ??
+		stringValue(jwtInfo.email) ??
+		`${provider.label} imported token`;
+	const account = createRouterProviderAccount({
+		authType: parseImportedAuthType(body.authType, token),
+		email: stringValue(body.email) ?? stringValue(jwtInfo.email) ?? null,
+		expiresAt: parseImportedExpiresAt(body),
+		key: token,
+		name,
+		provider: provider.keyProvider,
+		providerSpecificData,
+	})
+		.filter((candidate) => candidate.provider === provider.keyProvider)
+		.sort(
+			(a, b) =>
+				new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+		)[0];
+	if (!account) {
+		return {
+			ok: false as const,
+			status: 500,
+			body: { error: "Failed to create imported OAuth provider account" },
+		};
+	}
+	if (
+		typeof body.priority === "number" ||
+		typeof body.isActive === "boolean" ||
+		typeof body.is_active === "boolean"
+	) {
+		updateRouterProviderAccount({
+			id: account.id,
+			priority: typeof body.priority === "number" ? body.priority : undefined,
+			isActive:
+				typeof body.isActive === "boolean"
+					? body.isActive
+					: typeof body.is_active === "boolean"
+						? body.is_active
+						: undefined,
+		});
+	}
+	return {
+		ok: true as const,
+		status: 201,
+		body: {
+			success: true,
+			connection: providerConnectionView(account.id),
+			provider,
+		},
+	};
+}
+
+function parseImportedAuthType(
+	value: unknown,
+	token: string,
+): RouterProviderAccountAuthType {
+	if (value === "access-token" || value === "access_token")
+		return "access-token";
+	if (value === "oauth") return "oauth";
+	return looksLikeJwt(token) ? "access-token" : "oauth";
+}
+
+function parseImportedExpiresAt(body: JsonObject): string | null {
+	if (typeof body.expiresAt === "string") return body.expiresAt;
+	if (typeof body.expires_at === "string") return body.expires_at;
+	const expiresIn =
+		typeof body.expiresIn === "number"
+			? body.expiresIn
+			: typeof body.expires_in === "number"
+				? body.expires_in
+				: null;
+	return expiresIn
+		? new Date(Date.now() + expiresIn * 1000).toISOString()
+		: null;
+}
+
+function looksLikeJwt(value: string): boolean {
+	const parts = value.split(".");
+	return (
+		parts.length === 3 &&
+		parts[0].length > 0 &&
+		parts[1].length > 0 &&
+		parts.every((part) => /^[A-Za-z0-9_-]*$/.test(part))
+	);
+}
+
+function decodeJwtPayload(token: string): JsonObject {
+	try {
+		const payload = token.split(".")[1];
+		const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+		return JSON.parse(
+			Buffer.from(
+				padded.replace(/-/g, "+").replace(/_/g, "/"),
+				"base64",
+			).toString("utf8"),
+		) as JsonObject;
+	} catch {
+		return {};
+	}
+}
+
+function jsonObjectValue(value: unknown): JsonObject {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as JsonObject)
+		: {};
+}
+
 function listRouterProviderConnections() {
 	return listRouterProviderAccountViews().map(providerConnectionFromAccount);
 }
@@ -2444,11 +2727,13 @@ function providerConnectionFromAccount(account: RouterProviderAccountView) {
 		provider: account.provider,
 		name: account.name,
 		displayName: providerDisplayName(account.provider),
-		authType: "apikey",
+		authType: providerConnectionAuthType(account.authType),
+		email: account.email ?? null,
+		expiresAt: account.expiresAt ?? null,
 		priority: account.priority,
 		globalPriority: null,
 		defaultModel: null,
-		providerSpecificData: {},
+		providerSpecificData: account.providerSpecificData ?? {},
 		isActive: account.isActive,
 		testStatus: providerAccountTestStatus(account),
 		lastError: account.lastError?.message ?? null,
@@ -2462,6 +2747,12 @@ function providerConnectionFromAccount(account: RouterProviderAccountView) {
 		refreshToken: undefined,
 		idToken: undefined,
 	};
+}
+
+function providerConnectionAuthType(authType: RouterProviderAccountAuthType) {
+	if (authType === "access-token") return "access_token";
+	if (authType === "oauth") return "oauth";
+	return "apikey";
 }
 
 function providerDisplayName(provider: RouterProviderKeyId): string {

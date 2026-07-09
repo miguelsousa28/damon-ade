@@ -11,6 +11,7 @@ import {
 	type RouterModelTestResult,
 	type RouterPricingTable,
 	type RouterProviderAccount,
+	type RouterProviderAccountAuthType,
 	type RouterProviderKeyId,
 	type RouterProviderNode,
 	type RouterProviderNodeType,
@@ -58,6 +59,25 @@ type TabId =
 	| "aliases";
 
 type ProviderAccountView = RouterProviderAccount & { hasKey: boolean };
+type ProviderAccountInput = {
+	authType?: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
+	key: string;
+	name?: string;
+	provider: RouterProviderKeyId;
+	providerSpecificData?: Record<string, unknown>;
+};
+type ProviderAccountUpdates = {
+	authType?: RouterProviderAccountAuthType;
+	email?: string | null;
+	expiresAt?: string | null;
+	isActive?: boolean;
+	key?: string;
+	name?: string;
+	priority?: number;
+	providerSpecificData?: Record<string, unknown>;
+};
 type ProviderNodeValidationState = {
 	valid: boolean;
 	error?: string;
@@ -260,8 +280,8 @@ function RouterDashboardPage() {
 						clearProviderKey={(provider) =>
 							clearProviderKey.mutateAsync({ provider })
 						}
-						createProviderAccount={(provider, name, key) =>
-							createProviderAccount.mutateAsync({ provider, name, key })
+						createProviderAccount={(input) =>
+							createProviderAccount.mutateAsync(input)
 						}
 						deleteProviderAccount={(id) =>
 							deleteProviderAccount.mutateAsync({ id })
@@ -392,11 +412,7 @@ function ProvidersTab({
 }: {
 	data: RouterDashboardSnapshot;
 	clearProviderKey: (provider: RouterProviderKeyId) => Promise<unknown>;
-	createProviderAccount: (
-		provider: RouterProviderKeyId,
-		name: string | undefined,
-		key: string,
-	) => Promise<unknown>;
+	createProviderAccount: (input: ProviderAccountInput) => Promise<unknown>;
 	deleteProviderAccount: (id: string) => Promise<unknown>;
 	isSavingKey: boolean;
 	isSavingProviderAccount: boolean;
@@ -407,12 +423,7 @@ function ProvidersTab({
 	) => Promise<unknown>;
 	updateProviderAccount: (
 		id: string,
-		updates: {
-			isActive?: boolean;
-			key?: string;
-			name?: string;
-			priority?: number;
-		},
+		updates: ProviderAccountUpdates,
 	) => Promise<unknown>;
 }) {
 	const [inputs, setInputs] = useState<Record<string, string>>({});
@@ -553,36 +564,46 @@ function ProviderAccountsPanel({
 	updateProviderAccount,
 }: {
 	accounts: ProviderAccountView[];
-	createProviderAccount: (
-		provider: RouterProviderKeyId,
-		name: string | undefined,
-		key: string,
-	) => Promise<unknown>;
+	createProviderAccount: (input: ProviderAccountInput) => Promise<unknown>;
 	deleteProviderAccount: (id: string) => Promise<unknown>;
 	isBusy: boolean;
 	provider: RouterProviderKeyId;
 	updateProviderAccount: (
 		id: string,
-		updates: {
-			isActive?: boolean;
-			key?: string;
-			name?: string;
-			priority?: number;
-		},
+		updates: ProviderAccountUpdates,
 	) => Promise<unknown>;
 }) {
 	const [accountName, setAccountName] = useState("");
 	const [accountKey, setAccountKey] = useState("");
+	const [accountAuthType, setAccountAuthType] =
+		useState<RouterProviderAccountAuthType>("api-key");
+	const [accountEmail, setAccountEmail] = useState("");
+	const [accountExpiresAt, setAccountExpiresAt] = useState("");
+	const [accountMetadata, setAccountMetadata] = useState("");
+	const [accountError, setAccountError] = useState<string | null>(null);
 
 	const addAccount = async () => {
 		if (!accountKey.trim()) return;
-		await createProviderAccount(
+		const parsedMetadata = parseDashboardJsonObject(accountMetadata);
+		if (parsedMetadata.error) {
+			setAccountError(parsedMetadata.error);
+			return;
+		}
+		setAccountError(null);
+		await createProviderAccount({
+			authType: accountAuthType,
+			email: accountEmail.trim() || null,
+			expiresAt: accountExpiresAt.trim() || null,
+			key: accountKey.trim(),
+			name: accountName.trim() || undefined,
 			provider,
-			accountName.trim() || undefined,
-			accountKey.trim(),
-		);
+			providerSpecificData: parsedMetadata.value,
+		});
 		setAccountName("");
 		setAccountKey("");
+		setAccountEmail("");
+		setAccountExpiresAt("");
+		setAccountMetadata("");
 	};
 
 	return (
@@ -591,28 +612,69 @@ function ProviderAccountsPanel({
 				<span className="text-xs font-medium">Accounts</span>
 				<Pill>{accounts.length} configured</Pill>
 			</div>
-			<div className="grid grid-cols-[1fr_1fr_auto] gap-2">
-				<input
-					value={accountName}
-					onChange={(event) => setAccountName(event.target.value)}
-					placeholder="name"
-					className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
-				/>
+			<div className="grid gap-2">
+				<div className="grid gap-2 sm:grid-cols-2">
+					<input
+						value={accountName}
+						onChange={(event) => setAccountName(event.target.value)}
+						placeholder="name"
+						className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<select
+						value={accountAuthType}
+						onChange={(event) =>
+							setAccountAuthType(
+								event.target.value as RouterProviderAccountAuthType,
+							)
+						}
+						className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+					>
+						<option value="api-key">API key</option>
+						<option value="oauth">OAuth token</option>
+						<option value="access-token">Access token</option>
+					</select>
+				</div>
 				<input
 					type="password"
 					value={accountKey}
 					onChange={(event) => setAccountKey(event.target.value)}
-					placeholder="api key"
+					placeholder={providerAccountSecretPlaceholder(accountAuthType)}
 					className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
 				/>
-				<button
-					type="button"
-					onClick={addAccount}
-					disabled={isBusy || !accountKey.trim()}
-					className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
-				>
-					Add
-				</button>
+				<div className="grid gap-2 sm:grid-cols-2">
+					<input
+						value={accountEmail}
+						onChange={(event) => setAccountEmail(event.target.value)}
+						placeholder="email (optional)"
+						className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<input
+						value={accountExpiresAt}
+						onChange={(event) => setAccountExpiresAt(event.target.value)}
+						placeholder="expires ISO (optional)"
+						className="min-w-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+					/>
+				</div>
+				<textarea
+					value={accountMetadata}
+					onChange={(event) => setAccountMetadata(event.target.value)}
+					placeholder='metadata JSON, e.g. {"scope":"chatgpt"}'
+					rows={2}
+					className="min-h-14 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<div className="flex items-center justify-between gap-2">
+					<div className="min-w-0 truncate text-xs text-destructive">
+						{accountError}
+					</div>
+					<button
+						type="button"
+						onClick={addAccount}
+						disabled={isBusy || !accountKey.trim()}
+						className="rounded-md border px-2 py-1.5 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Add
+					</button>
+				</div>
 			</div>
 
 			<div className="mt-2 flex flex-col gap-2">
@@ -629,7 +691,8 @@ function ProviderAccountsPanel({
 								<div className="min-w-0">
 									<div className="truncate font-medium">{account.name}</div>
 									<div className="text-muted-foreground">
-										priority {account.priority} / {account.requestCount} req
+										{providerAccountAuthLabel(account.authType)} / priority{" "}
+										{account.priority} / {account.requestCount} req
 									</div>
 								</div>
 								<div className="flex shrink-0 gap-1">
@@ -657,7 +720,16 @@ function ProviderAccountsPanel({
 							</div>
 							<div className="mt-2 flex flex-wrap gap-1.5">
 								<Pill>{account.hasKey ? "key stored" : "missing key"}</Pill>
+								<Pill>{providerAccountAuthLabel(account.authType)}</Pill>
 								<Pill>{account.isActive ? "active" : "paused"}</Pill>
+								{account.email && <Pill>{account.email}</Pill>}
+								{account.expiresAt && (
+									<Pill>expires {formatDashboardDate(account.expiresAt)}</Pill>
+								)}
+								{account.providerSpecificData &&
+									Object.keys(account.providerSpecificData).length > 0 && (
+										<Pill>metadata</Pill>
+									)}
 								{cooldownActive && <Pill>cooldown</Pill>}
 								{account.failureCount > 0 && (
 									<Pill>{account.failureCount} failures</Pill>
@@ -2547,6 +2619,44 @@ function Pill({ children }: { children: ReactNode }) {
 function defaultNodeBaseUrl(type: RouterProviderNodeType): string {
 	if (type === "anthropic-compatible") return "https://api.anthropic.com/v1";
 	return "https://api.openai.com/v1";
+}
+
+function providerAccountAuthLabel(
+	authType: RouterProviderAccountAuthType,
+): string {
+	if (authType === "oauth") return "OAuth";
+	if (authType === "access-token") return "access token";
+	return "API key";
+}
+
+function providerAccountSecretPlaceholder(
+	authType: RouterProviderAccountAuthType,
+): string {
+	if (authType === "oauth") return "oauth token";
+	if (authType === "access-token") return "access token";
+	return "api key";
+}
+
+function parseDashboardJsonObject(value: string): {
+	error?: string;
+	value?: Record<string, unknown>;
+} {
+	const trimmed = value.trim();
+	if (!trimmed) return {};
+	try {
+		const parsed = JSON.parse(trimmed);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return { value: parsed as Record<string, unknown> };
+		}
+		return { error: "Metadata JSON must be an object." };
+	} catch {
+		return { error: "Metadata JSON is invalid." };
+	}
+}
+
+function formatDashboardDate(value: string): string {
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
 function parseDashboardModels(value: string): string[] {
