@@ -1124,13 +1124,10 @@ async function handleProviderNodeChat(
 		return;
 	}
 
-	if (body.stream === true) {
-		writeStreamingTranslationError(res, "Anthropic-compatible provider node");
-		return;
-	}
-
 	const result = await fetchProviderNodeWithFallback({
-		body: openAiChatToAnthropicBody(body, nodeTarget.model),
+		body: openAiChatToAnthropicBody(body, nodeTarget.model, {
+			stream: body.stream === true,
+		}),
 		nodeTarget,
 		path: "/messages",
 		req,
@@ -1140,6 +1137,10 @@ async function handleProviderNodeChat(
 		return;
 	}
 	setProviderNodeUsageLocals(res, result);
+	if (body.stream === true) {
+		await pipeAnthropicStreamAsOpenAiChat(result.upstream, res, nodeTarget);
+		return;
+	}
 	const upstream = await readJson(result.upstream);
 	res.json(anthropicToOpenAiChatResponse(upstream, nodeTarget));
 }
@@ -1232,12 +1233,11 @@ async function handleProviderNodeAnthropicMessages(
 		return;
 	}
 
-	if (body.stream === true) {
-		writeStreamingTranslationError(res, "OpenAI-compatible provider node");
-		return;
-	}
-
 	if (node.apiType === "responses") {
+		if (body.stream === true) {
+			writeStreamingTranslationError(res, "OpenAI Responses provider node");
+			return;
+		}
 		const result = await fetchProviderNodeWithFallback({
 			body: anthropicBodyToResponsesBody(body, nodeTarget.model),
 			nodeTarget,
@@ -1260,7 +1260,7 @@ async function handleProviderNodeAnthropicMessages(
 			messages: anthropicMessagesToOpenAiMessages(body),
 			max_tokens: body.max_tokens,
 			temperature: body.temperature,
-			stream: false,
+			stream: body.stream === true,
 		},
 		nodeTarget,
 		path: "/chat/completions",
@@ -1271,6 +1271,10 @@ async function handleProviderNodeAnthropicMessages(
 		return;
 	}
 	setProviderNodeUsageLocals(res, result);
+	if (body.stream === true) {
+		await pipeOpenAiChatStreamAsAnthropic(result.upstream, res, nodeTarget);
+		return;
+	}
 	const upstream = await readJson(result.upstream);
 	res.json(openAiChatToAnthropicMessage(upstream, nodeTarget));
 }
@@ -1923,9 +1927,11 @@ async function fetchProviderNodeWithFallback({
 		null;
 
 	for (const account of attempts) {
+		const headers = providerNodeHeaders(node, account, req);
+		if (body.stream === true) headers.Accept = "text/event-stream";
 		const upstream = await fetch(providerNodeUrl(node, path), {
 			method: "POST",
-			headers: providerNodeHeaders(node, account, req),
+			headers,
 			body: JSON.stringify(body),
 		});
 
@@ -3621,6 +3627,7 @@ function withModel(body: JsonObject, model: string): JsonObject {
 function openAiChatToAnthropicBody(
 	body: JsonObject,
 	model: string,
+	{ stream = false }: { stream?: boolean } = {},
 ): JsonObject {
 	const messages: JsonObject[] = [];
 	const systemParts: string[] = [];
@@ -3630,19 +3637,23 @@ function openAiChatToAnthropicBody(
 		if (!item || typeof item !== "object") continue;
 		const value = item as JsonObject;
 		const role = typeof value.role === "string" ? value.role : "user";
-		const text = extractContentText(value.content);
-		if (!text) continue;
 		if (role === "system") {
+			const text = extractContentText(value.content);
+			if (!text) continue;
 			systemParts.push(text);
 			continue;
 		}
-		messages.push({
-			role: role === "assistant" ? "assistant" : "user",
-			content: text,
-		});
+
+		const content = openAiMessageToAnthropicContent(value);
+		if (content.length === 0) continue;
+		appendAnthropicMessage(
+			messages,
+			role === "assistant" ? "assistant" : "user",
+			content,
+		);
 	}
 
-	return {
+	const result: JsonObject = {
 		model,
 		messages: messages.length > 0 ? messages : [{ role: "user", content: "" }],
 		max_tokens: Number(body.max_tokens ?? body.max_output_tokens ?? 1024),
@@ -3655,8 +3666,178 @@ function openAiChatToAnthropicBody(
 		temperature: body.temperature,
 		top_p: body.top_p,
 		stop_sequences: parseStopSequences(body.stop),
-		stream: false,
+		stream,
 	};
+	const tools = openAiToolsToAnthropicTools(body.tools);
+	if (tools.length > 0) result.tools = tools;
+	const toolChoice = openAiToolChoiceToAnthropic(body.tool_choice);
+	if (toolChoice) result.tool_choice = toolChoice;
+	return result;
+}
+
+function appendAnthropicMessage(
+	messages: JsonObject[],
+	role: "assistant" | "user",
+	content: JsonObject[],
+): void {
+	const previous = messages[messages.length - 1];
+	if (previous?.role === role && Array.isArray(previous.content)) {
+		previous.content.push(...content);
+		return;
+	}
+	messages.push({ role, content });
+}
+
+function openAiMessageToAnthropicContent(message: JsonObject): JsonObject[] {
+	const role = typeof message.role === "string" ? message.role : "user";
+	if (role === "tool") {
+		return [
+			{
+				type: "tool_result",
+				tool_use_id:
+					typeof message.tool_call_id === "string"
+						? message.tool_call_id
+						: `toolu_${cryptoId()}`,
+				content: extractContentText(message.content),
+			},
+		];
+	}
+
+	const blocks: JsonObject[] = [];
+	const content = message.content;
+	if (typeof content === "string") {
+		if (content) blocks.push({ type: "text", text: content });
+	} else if (Array.isArray(content)) {
+		for (const part of content) {
+			const block = openAiContentPartToAnthropicBlock(part);
+			if (block) blocks.push(block);
+		}
+	}
+
+	if (Array.isArray(message.tool_calls)) {
+		for (const call of message.tool_calls) {
+			if (!call || typeof call !== "object") continue;
+			const toolCall = call as JsonObject;
+			const fn = toolCall.function as JsonObject | undefined;
+			const name =
+				typeof fn?.name === "string"
+					? fn.name
+					: typeof toolCall.name === "string"
+						? toolCall.name
+						: "tool";
+			blocks.push({
+				type: "tool_use",
+				id:
+					typeof toolCall.id === "string" ? toolCall.id : `call_${cryptoId()}`,
+				name,
+				input: parseJsonObject(fn?.arguments),
+			});
+		}
+	}
+
+	return blocks;
+}
+
+function openAiContentPartToAnthropicBlock(part: unknown): JsonObject | null {
+	if (typeof part === "string")
+		return part ? { type: "text", text: part } : null;
+	if (!part || typeof part !== "object") return null;
+	const value = part as JsonObject;
+	if (value.type === "text" && typeof value.text === "string") {
+		return { type: "text", text: value.text };
+	}
+	if (value.type === "image_url") {
+		const imageUrl = value.image_url as JsonObject | undefined;
+		const url = typeof imageUrl?.url === "string" ? imageUrl.url : "";
+		if (!url) return null;
+		const parsed = parseDataUri(url);
+		return {
+			type: "image",
+			source: parsed
+				? {
+						type: "base64",
+						media_type: parsed.mimeType,
+						data: parsed.base64,
+					}
+				: { type: "url", url },
+		};
+	}
+	if (value.type === "tool_result") {
+		return {
+			type: "tool_result",
+			tool_use_id: value.tool_use_id,
+			content: value.content ?? "",
+			...(value.is_error === true ? { is_error: true } : {}),
+		};
+	}
+	if (value.type === "image" && value.source) {
+		return { type: "image", source: value.source };
+	}
+	if (value.type === "file") {
+		const file = value.file as JsonObject | undefined;
+		const parsed = parseDataUri(file?.file_data);
+		if (parsed?.mimeType === "application/pdf") {
+			return {
+				type: "document",
+				source: {
+					type: "base64",
+					media_type: parsed.mimeType,
+					data: parsed.base64,
+				},
+			};
+		}
+	}
+	return null;
+}
+
+function openAiToolsToAnthropicTools(tools: unknown): JsonObject[] {
+	if (!Array.isArray(tools)) return [];
+	const converted: JsonObject[] = [];
+	for (const tool of tools) {
+		if (!tool || typeof tool !== "object") continue;
+		const value = tool as JsonObject;
+		const fn =
+			value.type === "function" &&
+			value.function &&
+			typeof value.function === "object"
+				? (value.function as JsonObject)
+				: value;
+		if (typeof fn.name !== "string") {
+			if (typeof value.type === "string" && value.type !== "function") {
+				converted.push(value);
+			}
+			continue;
+		}
+		converted.push({
+			name: fn.name,
+			description: typeof fn.description === "string" ? fn.description : "",
+			input_schema:
+				fn.parameters && typeof fn.parameters === "object"
+					? fn.parameters
+					: { type: "object", properties: {}, required: [] },
+		});
+	}
+	return converted;
+}
+
+function openAiToolChoiceToAnthropic(choice: unknown): JsonObject | undefined {
+	if (!choice) return undefined;
+	if (choice === "required") return { type: "any" };
+	if (choice === "auto" || choice === "none") return { type: choice };
+	if (typeof choice === "object") {
+		const value = choice as JsonObject;
+		const fn = value.function as JsonObject | undefined;
+		if (typeof fn?.name === "string") return { type: "tool", name: fn.name };
+		if (
+			value.type === "auto" ||
+			value.type === "any" ||
+			value.type === "tool" ||
+			value.type === "none"
+		) {
+			return value;
+		}
+	}
+	return { type: "auto" };
 }
 
 function chatBodyToResponsesBody(body: JsonObject, model: string): JsonObject {
@@ -4126,6 +4307,541 @@ async function pipeUpstreamResponse(
 	});
 }
 
+interface SseBlock {
+	event?: string;
+	data: string;
+}
+
+interface AnthropicToOpenAiSseState {
+	id: string;
+	model: string;
+	created: number;
+	finishSent: boolean;
+	doneSent: boolean;
+	toolBlockIndexes: Map<number, number>;
+	nextToolIndex: number;
+	usage?: JsonObject;
+}
+
+interface OpenAiToAnthropicSseState {
+	id: string;
+	model: string;
+	messageStartSent: boolean;
+	messageStopSent: boolean;
+	nextBlockIndex: number;
+	textBlockIndex: number | null;
+	thinkingBlockIndex: number | null;
+	toolBlocks: Map<number, number>;
+	usage?: JsonObject;
+}
+
+async function pipeAnthropicStreamAsOpenAiChat(
+	upstream: globalThis.Response,
+	res: ExpressResponse,
+	nodeTarget: ProviderNodeTarget,
+) {
+	const state: AnthropicToOpenAiSseState = {
+		id: `chatcmpl_${cryptoId()}`,
+		model: nodeTarget.requestedModel,
+		created: Math.floor(Date.now() / 1000),
+		finishSent: false,
+		doneSent: false,
+		toolBlockIndexes: new Map(),
+		nextToolIndex: 0,
+	};
+	await pipeTranslatedSseBlocks(upstream, res, (block) =>
+		translateAnthropicSseBlockToOpenAi(block, state),
+	);
+	if (!state.doneSent && !res.writableEnded) {
+		if (!state.finishSent) {
+			res.write(openAiChatSseChunk(state, {}, "stop", state.usage));
+		}
+		res.write("data: [DONE]\n\n");
+	}
+	if (!res.writableEnded) res.end();
+}
+
+async function pipeOpenAiChatStreamAsAnthropic(
+	upstream: globalThis.Response,
+	res: ExpressResponse,
+	nodeTarget: ProviderNodeTarget,
+) {
+	const state: OpenAiToAnthropicSseState = {
+		id: `msg_${cryptoId()}`,
+		model: nodeTarget.requestedModel,
+		messageStartSent: false,
+		messageStopSent: false,
+		nextBlockIndex: 0,
+		textBlockIndex: null,
+		thinkingBlockIndex: null,
+		toolBlocks: new Map(),
+	};
+	await pipeTranslatedSseBlocks(upstream, res, (block) =>
+		translateOpenAiSseBlockToAnthropic(block, state),
+	);
+	if (!state.messageStopSent && !res.writableEnded) {
+		for (const output of finishAnthropicStream(state, "end_turn")) {
+			res.write(output);
+		}
+	}
+	if (!res.writableEnded) res.end();
+}
+
+async function pipeTranslatedSseBlocks(
+	upstream: globalThis.Response,
+	res: ExpressResponse,
+	translate: (block: SseBlock) => string[],
+) {
+	res.status(upstream.status);
+	res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+	res.setHeader("Cache-Control", "no-cache, no-transform");
+	res.setHeader("Connection", "keep-alive");
+	res.setHeader("X-Accel-Buffering", "no");
+	res.flushHeaders?.();
+
+	let buffer = "";
+	const processText = (text: string) => {
+		buffer += text;
+		const blocks = buffer.split(/\r?\n\r?\n/);
+		buffer = blocks.pop() ?? "";
+		for (const rawBlock of blocks) {
+			for (const output of translate(parseSseBlock(rawBlock))) {
+				res.write(output);
+			}
+		}
+	};
+
+	if (!upstream.body) {
+		processText(await upstream.text());
+	} else {
+		const decoder = new TextDecoder("utf-8", { fatal: false });
+		const nodeStream = Readable.fromWeb(upstream.body as never);
+		for await (const chunk of nodeStream) {
+			processText(decoder.decode(chunk as Buffer, { stream: true }));
+		}
+		processText(decoder.decode());
+	}
+
+	if (buffer.trim()) {
+		for (const output of translate(parseSseBlock(buffer))) {
+			res.write(output);
+		}
+	}
+}
+
+function parseSseBlock(rawBlock: string): SseBlock {
+	let event: string | undefined;
+	const data: string[] = [];
+	for (const line of rawBlock.split(/\r?\n/)) {
+		if (line.startsWith("event:")) event = line.slice("event:".length).trim();
+		else if (line.startsWith("data:"))
+			data.push(line.slice("data:".length).trimStart());
+	}
+	return { event, data: data.join("\n") };
+}
+
+function translateAnthropicSseBlockToOpenAi(
+	block: SseBlock,
+	state: AnthropicToOpenAiSseState,
+): string[] {
+	if (!block.data || block.data === "[DONE]") return [];
+	const payload = parseSseJson(block.data);
+	if (!payload) return [];
+	const type = typeof payload.type === "string" ? payload.type : block.event;
+	const outputs: string[] = [];
+
+	if (type === "message_start") {
+		const message = payload.message as JsonObject | undefined;
+		if (typeof message?.id === "string") state.id = `chatcmpl_${message.id}`;
+		if (typeof message?.model === "string") state.model = message.model;
+		if (message?.usage && typeof message.usage === "object") {
+			state.usage = mergeAnthropicUsageToOpenAiUsage(
+				state.usage,
+				message.usage as JsonObject,
+			);
+		}
+		outputs.push(openAiChatSseChunk(state, { role: "assistant" }));
+		return outputs;
+	}
+
+	if (type === "content_block_start") {
+		const index = Number(payload.index ?? 0);
+		const blockValue = payload.content_block as JsonObject | undefined;
+		if (blockValue?.type === "tool_use") {
+			const toolIndex = state.nextToolIndex++;
+			state.toolBlockIndexes.set(index, toolIndex);
+			outputs.push(
+				openAiChatSseChunk(state, {
+					tool_calls: [
+						{
+							index: toolIndex,
+							id:
+								typeof blockValue.id === "string"
+									? blockValue.id
+									: `call_${cryptoId()}`,
+							type: "function",
+							function: {
+								name:
+									typeof blockValue.name === "string"
+										? blockValue.name
+										: "tool",
+								arguments: "",
+							},
+						},
+					],
+				}),
+			);
+		} else if (
+			blockValue?.type === "text" &&
+			typeof blockValue.text === "string"
+		) {
+			outputs.push(openAiChatSseChunk(state, { content: blockValue.text }));
+		} else if (
+			blockValue?.type === "thinking" &&
+			typeof blockValue.thinking === "string"
+		) {
+			outputs.push(
+				openAiChatSseChunk(state, { reasoning_content: blockValue.thinking }),
+			);
+		}
+		return outputs;
+	}
+
+	if (type === "content_block_delta") {
+		const delta = payload.delta as JsonObject | undefined;
+		const index = Number(payload.index ?? 0);
+		if (delta?.type === "text_delta" && typeof delta.text === "string") {
+			outputs.push(openAiChatSseChunk(state, { content: delta.text }));
+		} else if (
+			delta?.type === "thinking_delta" &&
+			typeof delta.thinking === "string"
+		) {
+			outputs.push(
+				openAiChatSseChunk(state, { reasoning_content: delta.thinking }),
+			);
+		} else if (
+			delta?.type === "input_json_delta" &&
+			typeof delta.partial_json === "string"
+		) {
+			outputs.push(
+				openAiChatSseChunk(state, {
+					tool_calls: [
+						{
+							index: state.toolBlockIndexes.get(index) ?? 0,
+							function: { arguments: delta.partial_json },
+						},
+					],
+				}),
+			);
+		}
+		return outputs;
+	}
+
+	if (type === "message_delta") {
+		if (payload.usage && typeof payload.usage === "object") {
+			state.usage = mergeAnthropicUsageToOpenAiUsage(
+				state.usage,
+				payload.usage as JsonObject,
+			);
+		}
+		const delta = payload.delta as JsonObject | undefined;
+		if (typeof delta?.stop_reason === "string") {
+			state.finishSent = true;
+			outputs.push(
+				openAiChatSseChunk(
+					state,
+					{},
+					openAiFinishReasonFromAnthropic(delta.stop_reason),
+					state.usage,
+				),
+			);
+		}
+		return outputs;
+	}
+
+	if (type === "message_stop") {
+		if (!state.finishSent) {
+			state.finishSent = true;
+			outputs.push(openAiChatSseChunk(state, {}, "stop", state.usage));
+		}
+		state.doneSent = true;
+		outputs.push("data: [DONE]\n\n");
+	}
+
+	return outputs;
+}
+
+function translateOpenAiSseBlockToAnthropic(
+	block: SseBlock,
+	state: OpenAiToAnthropicSseState,
+): string[] {
+	if (!block.data) return [];
+	if (block.data === "[DONE]") {
+		return state.messageStopSent
+			? []
+			: finishAnthropicStream(state, "end_turn");
+	}
+	const payload = parseSseJson(block.data);
+	if (!payload) return [];
+	const choice = Array.isArray(payload.choices)
+		? (payload.choices[0] as JsonObject | undefined)
+		: undefined;
+	if (!choice) return [];
+
+	const outputs = ensureAnthropicMessageStart(state, payload);
+	const delta = (choice.delta as JsonObject | undefined) ?? {};
+	if (typeof delta.content === "string" && delta.content) {
+		closeAnthropicThinkingBlock(state, outputs);
+		if (state.textBlockIndex === null) {
+			state.textBlockIndex = state.nextBlockIndex++;
+			outputs.push(
+				anthropicSseEvent("content_block_start", {
+					type: "content_block_start",
+					index: state.textBlockIndex,
+					content_block: { type: "text", text: "" },
+				}),
+			);
+		}
+		outputs.push(
+			anthropicSseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: state.textBlockIndex,
+				delta: { type: "text_delta", text: delta.content },
+			}),
+		);
+	}
+
+	const reasoning =
+		typeof delta.reasoning_content === "string"
+			? delta.reasoning_content
+			: typeof delta.thinking === "string"
+				? delta.thinking
+				: "";
+	if (reasoning) {
+		closeAnthropicTextBlock(state, outputs);
+		if (state.thinkingBlockIndex === null) {
+			state.thinkingBlockIndex = state.nextBlockIndex++;
+			outputs.push(
+				anthropicSseEvent("content_block_start", {
+					type: "content_block_start",
+					index: state.thinkingBlockIndex,
+					content_block: { type: "thinking", thinking: "" },
+				}),
+			);
+		}
+		outputs.push(
+			anthropicSseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: state.thinkingBlockIndex,
+				delta: { type: "thinking_delta", thinking: reasoning },
+			}),
+		);
+	}
+
+	if (Array.isArray(delta.tool_calls)) {
+		closeAnthropicTextBlock(state, outputs);
+		closeAnthropicThinkingBlock(state, outputs);
+		for (const rawToolCall of delta.tool_calls) {
+			if (!rawToolCall || typeof rawToolCall !== "object") continue;
+			const toolCall = rawToolCall as JsonObject;
+			const index = Number(toolCall.index ?? 0);
+			const fn = toolCall.function as JsonObject | undefined;
+			if (!state.toolBlocks.has(index)) {
+				const blockIndex = state.nextBlockIndex++;
+				state.toolBlocks.set(index, blockIndex);
+				outputs.push(
+					anthropicSseEvent("content_block_start", {
+						type: "content_block_start",
+						index: blockIndex,
+						content_block: {
+							type: "tool_use",
+							id:
+								typeof toolCall.id === "string"
+									? toolCall.id
+									: `call_${cryptoId()}`,
+							name: typeof fn?.name === "string" ? fn.name : "tool",
+							input: {},
+						},
+					}),
+				);
+			}
+			if (typeof fn?.arguments === "string" && fn.arguments) {
+				outputs.push(
+					anthropicSseEvent("content_block_delta", {
+						type: "content_block_delta",
+						index: state.toolBlocks.get(index),
+						delta: { type: "input_json_delta", partial_json: fn.arguments },
+					}),
+				);
+			}
+		}
+	}
+
+	if (payload.usage && typeof payload.usage === "object") {
+		state.usage = openAiUsageToAnthropicUsage(payload.usage as JsonObject);
+	}
+	if (typeof choice.finish_reason === "string" && choice.finish_reason) {
+		outputs.push(
+			...finishAnthropicStream(
+				state,
+				anthropicStopReasonFromOpenAi(choice.finish_reason),
+			),
+		);
+	}
+	return outputs;
+}
+
+function ensureAnthropicMessageStart(
+	state: OpenAiToAnthropicSseState,
+	payload: JsonObject,
+): string[] {
+	if (state.messageStartSent) return [];
+	state.messageStartSent = true;
+	if (typeof payload.id === "string")
+		state.id = payload.id.replace(/^chatcmpl[-_]?/, "msg_");
+	if (typeof payload.model === "string") state.model = payload.model;
+	return [
+		anthropicSseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: state.id,
+				type: "message",
+				role: "assistant",
+				model: state.model,
+				content: [],
+				stop_reason: null,
+				stop_sequence: null,
+				usage: { input_tokens: 0, output_tokens: 0 },
+			},
+		}),
+	];
+}
+
+function finishAnthropicStream(
+	state: OpenAiToAnthropicSseState,
+	stopReason: string,
+): string[] {
+	if (state.messageStopSent) return [];
+	const outputs: string[] = [];
+	outputs.push(...ensureAnthropicMessageStart(state, {}));
+	closeAnthropicTextBlock(state, outputs);
+	closeAnthropicThinkingBlock(state, outputs);
+	for (const blockIndex of state.toolBlocks.values()) {
+		outputs.push(
+			anthropicSseEvent("content_block_stop", {
+				type: "content_block_stop",
+				index: blockIndex,
+			}),
+		);
+	}
+	state.toolBlocks.clear();
+	outputs.push(
+		anthropicSseEvent("message_delta", {
+			type: "message_delta",
+			delta: { stop_reason: stopReason, stop_sequence: null },
+			usage: state.usage ?? { input_tokens: 0, output_tokens: 0 },
+		}),
+	);
+	outputs.push(anthropicSseEvent("message_stop", { type: "message_stop" }));
+	state.messageStopSent = true;
+	return outputs;
+}
+
+function closeAnthropicTextBlock(
+	state: OpenAiToAnthropicSseState,
+	outputs: string[],
+): void {
+	if (state.textBlockIndex === null) return;
+	outputs.push(
+		anthropicSseEvent("content_block_stop", {
+			type: "content_block_stop",
+			index: state.textBlockIndex,
+		}),
+	);
+	state.textBlockIndex = null;
+}
+
+function closeAnthropicThinkingBlock(
+	state: OpenAiToAnthropicSseState,
+	outputs: string[],
+): void {
+	if (state.thinkingBlockIndex === null) return;
+	outputs.push(
+		anthropicSseEvent("content_block_stop", {
+			type: "content_block_stop",
+			index: state.thinkingBlockIndex,
+		}),
+	);
+	state.thinkingBlockIndex = null;
+}
+
+function openAiChatSseChunk(
+	state: AnthropicToOpenAiSseState,
+	delta: JsonObject,
+	finishReason: string | null = null,
+	usage?: JsonObject,
+): string {
+	return `data: ${JSON.stringify({
+		id: state.id,
+		object: "chat.completion.chunk",
+		created: state.created,
+		model: state.model,
+		choices: [{ index: 0, delta, finish_reason: finishReason }],
+		...(usage ? { usage } : {}),
+	})}\n\n`;
+}
+
+function anthropicSseEvent(event: string, data: JsonObject): string {
+	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function parseSseJson(value: string): JsonObject | null {
+	try {
+		const parsed = JSON.parse(value);
+		return parsed && typeof parsed === "object" ? (parsed as JsonObject) : null;
+	} catch {
+		return null;
+	}
+}
+
+function mergeAnthropicUsageToOpenAiUsage(
+	existing: JsonObject | undefined,
+	usage: JsonObject,
+): JsonObject {
+	const existingPrompt = Number(existing?.prompt_tokens ?? 0);
+	const existingCompletion = Number(existing?.completion_tokens ?? 0);
+	const input = Number(usage.input_tokens ?? existingPrompt);
+	const output = Number(usage.output_tokens ?? existingCompletion);
+	const promptTokens = Number.isFinite(input) ? input : 0;
+	const completionTokens = Number.isFinite(output) ? output : 0;
+	return {
+		prompt_tokens: promptTokens,
+		completion_tokens: completionTokens,
+		total_tokens: promptTokens + completionTokens,
+	};
+}
+
+function openAiUsageToAnthropicUsage(usage: JsonObject): JsonObject {
+	const input = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+	const output = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+	return {
+		input_tokens: Number.isFinite(input) ? input : 0,
+		output_tokens: Number.isFinite(output) ? output : 0,
+	};
+}
+
+function openAiFinishReasonFromAnthropic(reason: string): string {
+	if (reason === "tool_use") return "tool_calls";
+	if (reason === "max_tokens") return "length";
+	return "stop";
+}
+
+function anthropicStopReasonFromOpenAi(reason: string): string {
+	if (reason === "tool_calls") return "tool_use";
+	if (reason === "length") return "max_tokens";
+	return "end_turn";
+}
+
 async function readJson(response: globalThis.Response): Promise<JsonObject> {
 	const text = await response.text();
 	try {
@@ -4194,22 +4910,146 @@ function anthropicMessagesToOpenAiMessages(body: JsonObject): JsonObject[] {
 	const messages: JsonObject[] = [];
 	if (typeof body.system === "string") {
 		messages.push({ role: "system", content: body.system });
+	} else if (Array.isArray(body.system)) {
+		const systemText = extractContentText(body.system);
+		if (systemText) messages.push({ role: "system", content: systemText });
 	}
 
 	if (Array.isArray(body.messages)) {
 		for (const item of body.messages) {
 			if (!item || typeof item !== "object") continue;
 			const value = item as JsonObject;
-			messages.push({
-				role: typeof value.role === "string" ? value.role : "user",
-				content: extractContentText(value.content),
-			});
+			const role = typeof value.role === "string" ? value.role : "user";
+			if (Array.isArray(value.content)) {
+				const toolResults = value.content.filter(
+					(part): part is JsonObject =>
+						!!part &&
+						typeof part === "object" &&
+						(part as JsonObject).type === "tool_result",
+				);
+				if (toolResults.length > 0) {
+					for (const toolResult of toolResults) {
+						messages.push({
+							role: "tool",
+							tool_call_id:
+								typeof toolResult.tool_use_id === "string"
+									? toolResult.tool_use_id
+									: `call_${cryptoId()}`,
+							content: extractContentText(toolResult.content),
+						});
+					}
+					continue;
+				}
+			}
+
+			const message = anthropicMessageToOpenAiMessage(role, value.content);
+			if (message) messages.push(message);
 		}
 	}
 
 	return messages.length > 0
 		? messages
 		: [{ role: "user", content: "Continue." }];
+}
+
+function anthropicMessageToOpenAiMessage(
+	role: string,
+	content: unknown,
+): JsonObject | null {
+	if (!Array.isArray(content)) {
+		return {
+			role: role === "assistant" ? "assistant" : "user",
+			content: extractContentText(content),
+		};
+	}
+
+	const openAiContent: JsonObject[] = [];
+	const toolCalls: JsonObject[] = [];
+	for (const part of content) {
+		if (!part || typeof part !== "object") continue;
+		const value = part as JsonObject;
+		if (value.type === "tool_use") {
+			toolCalls.push({
+				id: typeof value.id === "string" ? value.id : `call_${cryptoId()}`,
+				type: "function",
+				function: {
+					name: typeof value.name === "string" ? value.name : "tool",
+					arguments: JSON.stringify(value.input ?? {}),
+				},
+			});
+			continue;
+		}
+		const openAiPart = anthropicContentPartToOpenAi(value);
+		if (openAiPart) openAiContent.push(openAiPart);
+	}
+
+	if (role === "assistant") {
+		return {
+			role: "assistant",
+			content: extractContentText(openAiContent),
+			...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+		};
+	}
+
+	return {
+		role: "user",
+		content:
+			openAiContent.length === 1 && openAiContent[0]?.type === "text"
+				? openAiContent[0].text
+				: openAiContent,
+	};
+}
+
+function anthropicContentPartToOpenAi(part: JsonObject): JsonObject | null {
+	if (part.type === "text" && typeof part.text === "string") {
+		return { type: "text", text: part.text };
+	}
+	if (part.type === "image") {
+		const source = part.source as JsonObject | undefined;
+		const url = anthropicSourceToOpenAiUrl(source);
+		return url ? { type: "image_url", image_url: { url } } : null;
+	}
+	return null;
+}
+
+function anthropicSourceToOpenAiUrl(
+	source: JsonObject | undefined,
+): string | null {
+	if (!source) return null;
+	if (source.type === "url" && typeof source.url === "string")
+		return source.url;
+	if (
+		source.type === "base64" &&
+		typeof source.media_type === "string" &&
+		typeof source.data === "string"
+	) {
+		return `data:${source.media_type};base64,${source.data}`;
+	}
+	return null;
+}
+
+function parseJsonObject(value: unknown): JsonObject {
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		return value as JsonObject;
+	}
+	if (typeof value !== "string" || !value.trim()) return {};
+	try {
+		const parsed = JSON.parse(value);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as JsonObject)
+			: {};
+	} catch {
+		return {};
+	}
+}
+
+function parseDataUri(
+	value: unknown,
+): { mimeType: string; base64: string } | null {
+	if (typeof value !== "string") return null;
+	const match = /^data:([^;,]+);base64,(.+)$/i.exec(value);
+	if (!match) return null;
+	return { mimeType: match[1], base64: match[2] };
 }
 
 function extractContentText(content: unknown): string {
