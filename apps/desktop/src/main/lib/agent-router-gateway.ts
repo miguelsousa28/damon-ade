@@ -90,8 +90,10 @@ import {
 	getRouterStoreSnapshot,
 	getRouterUsageChart,
 	getRouterUsageCompatStats,
+	getRouterUsageForConnection,
 	getRouterUsageLogs,
 	getRouterUsageProviders,
+	getRouterUsageRequestDetails,
 	getRouterUsageStats,
 	isRouterModelDisabled,
 	type RouterGatewayApiKey,
@@ -827,6 +829,31 @@ function createAgentRouterGatewayApp() {
 	app.get(["/api/usage/logs", "/api/usage/request-logs"], (_req, res) => {
 		res.json(getRouterUsageLogs(200));
 	});
+	app.get("/api/usage/request-details", (req, res) => {
+		const page = parsePositiveIntegerQuery(req.query.page, 1);
+		const pageSize = parsePositiveIntegerQuery(req.query.pageSize, 20);
+		if (page < 1) {
+			res.status(400).json({ error: "Page must be >= 1" });
+			return;
+		}
+		if (pageSize < 1 || pageSize > 100) {
+			res.status(400).json({ error: "PageSize must be between 1 and 100" });
+			return;
+		}
+		res.json(
+			getRouterUsageRequestDetails({
+				connectionId: stringQuery(req.query.connectionId),
+				endDate: stringQuery(req.query.endDate),
+				model: stringQuery(req.query.model),
+				page,
+				pageSize,
+				provider: stringQuery(req.query.provider),
+				startDate: stringQuery(req.query.startDate),
+				status: stringQuery(req.query.status),
+			}),
+		);
+	});
+	app.get("/api/usage/stream", streamRouterUsageStats);
 	app.get("/api/usage/chart", (req, res) => {
 		const period = parseUsagePeriod(req.query.period, false);
 		if (!period || period === "all") {
@@ -837,6 +864,18 @@ function createAgentRouterGatewayApp() {
 	});
 	app.delete("/api/usage", (_req, res) => {
 		res.json(clearRouterUsage());
+	});
+	app.get("/api/usage/:connectionId/codex-reset-credits", (req, res) => {
+		const result = getRouterCodexResetCredits(req.params.connectionId, false);
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/usage/:connectionId/codex-reset-credits", (req, res) => {
+		const result = getRouterCodexResetCredits(req.params.connectionId, true);
+		res.status(result.status).json(result.body);
+	});
+	app.get("/api/usage/:connectionId", (req, res) => {
+		const result = getRouterConnectionUsage(req.params.connectionId);
+		res.status(result.status).json(result.body);
 	});
 	app.get("/api/pricing/defaults", (_req, res) => {
 		res.json(getRouterDefaultPricing());
@@ -5856,6 +5895,123 @@ function parseUsagePeriod(
 		return period;
 	}
 	return null;
+}
+
+function parsePositiveIntegerQuery(value: unknown, fallback: number): number {
+	const raw = Array.isArray(value) ? value[0] : value;
+	if (raw === undefined || raw === null || raw === "") return fallback;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? Math.round(parsed) : fallback;
+}
+
+function streamRouterUsageStats(req: Request, res: ExpressResponse): void {
+	res.setHeader("Content-Type", "text/event-stream");
+	res.setHeader("Cache-Control", "no-cache");
+	res.setHeader("Connection", "keep-alive");
+	res.flushHeaders?.();
+
+	const writeStats = () => {
+		res.write(`data: ${JSON.stringify(getRouterUsageCompatStats("all"))}\n\n`);
+	};
+	const writePing = () => {
+		res.write(": ping\n\n");
+	};
+
+	writeStats();
+	const statsTimer = setInterval(writeStats, 5000);
+	const pingTimer = setInterval(writePing, 25_000);
+	req.on("close", () => {
+		clearInterval(statsTimer);
+		clearInterval(pingTimer);
+		res.end();
+	});
+}
+
+function getRouterConnectionUsage(connectionId: string): {
+	body: JsonObject;
+	status: number;
+} {
+	const connection = listRouterProviderAccountViews().find(
+		(account) => account.id === connectionId,
+	);
+	if (!connection) {
+		return { status: 404, body: { error: "Connection not found" } };
+	}
+	const localUsage = getRouterUsageForConnection(connectionId);
+	return {
+		status: 200,
+		body: {
+			connectionId,
+			provider: connection.provider,
+			name: connection.name,
+			authType: providerConnectionAuthType(connection.authType),
+			plan: null,
+			quotas: [],
+			available: false,
+			message:
+				"Live upstream quota usage is not available in ADE for this provider yet; returning local router usage.",
+			localUsage,
+		},
+	};
+}
+
+function getRouterCodexResetCredits(
+	connectionId: string,
+	consume: boolean,
+): { body: JsonObject; status: number } {
+	const connection = listRouterProviderAccountViews().find(
+		(account) => account.id === connectionId,
+	);
+	if (!connection) {
+		return { status: 404, body: { error: "Connection not found" } };
+	}
+	const oauthProvider = stringValue(
+		connection.providerSpecificData?.oauthProvider,
+	);
+	if (connection.provider !== "openai" || oauthProvider !== "codex") {
+		return {
+			status: 400,
+			body: {
+				error: "Codex reset credits are only available for Codex connections.",
+			},
+		};
+	}
+	if (
+		connection.authType !== "oauth" &&
+		connection.authType !== "access-token"
+	) {
+		return {
+			status: 400,
+			body: {
+				error:
+					"Codex reset credits require an OAuth or access-token connection.",
+			},
+		};
+	}
+	if (!consume) {
+		return {
+			status: 200,
+			body: {
+				code: "unsupported",
+				available: false,
+				credits: [],
+				windows_reset: false,
+				message:
+					"ADE does not bundle the 9router Codex reset-credit executor yet.",
+			},
+		};
+	}
+	return {
+		status: 501,
+		body: {
+			code: "unsupported",
+			reset: false,
+			windows_reset: false,
+			redeemRequestId: `ade-${randomBytes(8).toString("hex")}`,
+			message:
+				"ADE cannot consume Codex reset credits until the 9router Codex executor is vendored.",
+		},
+	};
 }
 
 function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {

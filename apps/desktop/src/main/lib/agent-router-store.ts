@@ -185,6 +185,67 @@ export interface RouterUsageChartBucket {
 	cost: number;
 }
 
+export interface RouterUsageRequestDetailsFilter {
+	connectionId?: string | null;
+	endDate?: string | null;
+	model?: string | null;
+	page?: number;
+	pageSize?: number;
+	provider?: string | null;
+	startDate?: string | null;
+	status?: string | null;
+}
+
+export interface RouterUsageRequestDetail {
+	id: string;
+	timestamp: string;
+	provider: string;
+	model: string;
+	connectionId: string | null;
+	accountName: string | null;
+	apiKeyMasked: string | null;
+	endpoint: string;
+	method: string;
+	status: string;
+	statusCode: number;
+	success: boolean;
+	durationMs: number;
+	cost: number;
+	error: string | null;
+	tokens: {
+		prompt_tokens: number;
+		completion_tokens: number;
+		cached_tokens: number;
+		total_tokens: number;
+	};
+}
+
+export interface RouterUsageRequestDetailsResult {
+	details: RouterUsageRequestDetail[];
+	pagination: {
+		page: number;
+		pageSize: number;
+		totalItems: number;
+		totalPages: number;
+		hasNext: boolean;
+		hasPrev: boolean;
+	};
+}
+
+export interface RouterConnectionUsageSummary {
+	connectionId: string;
+	totalRequests: number;
+	successfulRequests: number;
+	failedRequests: number;
+	totalPromptTokens: number;
+	totalCompletionTokens: number;
+	totalCachedTokens: number;
+	totalTokens: number;
+	totalCost: number;
+	lastUsed: string | null;
+	recentRequests: RouterUsageRequestDetail[];
+}
+
 export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
 	apiKeys: RouterGatewayApiKey[];
@@ -1292,6 +1353,66 @@ export function getRouterUsageChart(
 	return buckets.map(({ cost, label, tokens }) => ({ cost, label, tokens }));
 }
 
+export function getRouterUsageRequestDetails(
+	filter: RouterUsageRequestDetailsFilter = {},
+): RouterUsageRequestDetailsResult {
+	const page = Math.max(1, Math.round(filter.page ?? 1));
+	const pageSize = Math.min(
+		100,
+		Math.max(1, Math.round(filter.pageSize ?? 20)),
+	);
+	const filtered = filterUsageEntries(readStore().usage, filter);
+	const totalItems = filtered.length;
+	const totalPages = Math.ceil(totalItems / pageSize);
+	const offset = (page - 1) * pageSize;
+	const details = filtered
+		.slice(offset, offset + pageSize)
+		.map(toRequestDetail);
+	return {
+		details,
+		pagination: {
+			page,
+			pageSize,
+			totalItems,
+			totalPages,
+			hasNext: page < totalPages,
+			hasPrev: page > 1,
+		},
+	};
+}
+
+export function getRouterUsageForConnection(
+	connectionId: string,
+): RouterConnectionUsageSummary {
+	const usage = readStore().usage.filter(
+		(entry) => entry.accountId === connectionId,
+	);
+	const promptTokens = usage.reduce(
+		(sum, entry) => sum + entry.requestTokens,
+		0,
+	);
+	const completionTokens = usage.reduce(
+		(sum, entry) => sum + entry.responseTokens,
+		0,
+	);
+	const totalCost = roundCurrency(
+		usage.reduce((sum, entry) => sum + entry.estimatedCostUsd, 0),
+	);
+	return {
+		connectionId,
+		totalRequests: usage.length,
+		successfulRequests: usage.filter((entry) => entry.success).length,
+		failedRequests: usage.filter((entry) => !entry.success).length,
+		totalPromptTokens: promptTokens,
+		totalCompletionTokens: completionTokens,
+		totalCachedTokens: 0,
+		totalTokens: promptTokens + completionTokens,
+		totalCost,
+		lastUsed: usage[0]?.timestamp ?? null,
+		recentRequests: usage.slice(0, 20).map(toRequestDetail),
+	};
+}
+
 export function clearRouterUsage(): RouterUsageStats {
 	const data = readStore();
 	writeStore({ ...data, usage: [] });
@@ -1311,6 +1432,64 @@ function filterUsageForPeriod(
 	const startMs = usagePeriodStartMs(period);
 	if (startMs === null) return usage;
 	return usage.filter((entry) => timestampMs(entry) >= startMs);
+}
+
+function filterUsageEntries(
+	usage: RouterUsageEntry[],
+	filter: RouterUsageRequestDetailsFilter,
+): RouterUsageEntry[] {
+	const startMs = filter.startDate
+		? new Date(filter.startDate).getTime()
+		: null;
+	const endMs = filter.endDate ? new Date(filter.endDate).getTime() : null;
+	const status = filter.status?.trim().toLowerCase() ?? "";
+	return usage.filter((entry) => {
+		if (filter.provider && entry.provider !== filter.provider) return false;
+		if (filter.model && entry.model !== filter.model) return false;
+		if (filter.connectionId && entry.accountId !== filter.connectionId) {
+			return false;
+		}
+		if (Number.isFinite(startMs) && timestampMs(entry) < Number(startMs)) {
+			return false;
+		}
+		if (Number.isFinite(endMs) && timestampMs(entry) > Number(endMs)) {
+			return false;
+		}
+		if (!status) return true;
+		if ((status === "ok" || status === "success") && entry.success) {
+			return true;
+		}
+		if ((status === "error" || status === "failed") && !entry.success) {
+			return true;
+		}
+		return String(entry.status) === status;
+	});
+}
+
+function toRequestDetail(entry: RouterUsageEntry): RouterUsageRequestDetail {
+	return {
+		id: entry.id,
+		timestamp: entry.timestamp,
+		provider: entry.provider,
+		model: entry.model,
+		connectionId: entry.accountId,
+		accountName: entry.accountName,
+		apiKeyMasked: entry.accountId ? `...${entry.accountId.slice(-6)}` : null,
+		endpoint: entry.endpoint,
+		method: entry.method,
+		status: entry.success ? "ok" : "error",
+		statusCode: entry.status,
+		success: entry.success,
+		durationMs: entry.durationMs,
+		cost: roundCurrency(entry.estimatedCostUsd),
+		error: entry.error,
+		tokens: {
+			prompt_tokens: entry.requestTokens,
+			completion_tokens: entry.responseTokens,
+			cached_tokens: 0,
+			total_tokens: entry.totalTokens,
+		},
+	};
 }
 
 function usagePeriodStartMs(period: RouterUsagePeriod): number | null {
