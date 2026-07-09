@@ -1,8 +1,11 @@
 import {
 	previewRouterTokenSaver,
+	ROUTER_PROVIDER_KEY_IDS,
 	type RouterDashboardSnapshot,
 	type RouterProviderAccount,
 	type RouterProviderKeyId,
+	type RouterProviderNode,
+	type RouterProviderNodeType,
 	type RouterTokenSaverMode,
 } from "@superset/shared/router-control-plane";
 import { cn } from "@superset/ui/utils";
@@ -33,6 +36,7 @@ export const Route = createFileRoute("/_authenticated/_dashboard/router/")({
 type TabId =
 	| "overview"
 	| "providers"
+	| "nodes"
 	| "combos"
 	| "endpoints"
 	| "token-savers"
@@ -45,6 +49,7 @@ type ProviderAccountView = RouterProviderAccount & { hasKey: boolean };
 const TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Overview" },
 	{ id: "providers", label: "Providers" },
+	{ id: "nodes", label: "Nodes" },
 	{ id: "combos", label: "Combos" },
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
@@ -249,6 +254,7 @@ function RouterDashboardPage() {
 						}
 					/>
 				)}
+				{activeTab === "nodes" && <NodesTab />}
 				{activeTab === "combos" && <CombosTab data={data} />}
 				{activeTab === "endpoints" && <EndpointsTab data={data} />}
 				{activeTab === "token-savers" && <TokenSaversTab data={data} />}
@@ -635,6 +641,303 @@ function ProviderAccountsPanel({
 						</div>
 					);
 				})}
+			</div>
+		</div>
+	);
+}
+
+function NodesTab() {
+	const utils = electronTrpc.useUtils();
+	const nodes = electronTrpc.agentRouter.providerNodes.useQuery(undefined, {
+		refetchInterval: 15_000,
+	});
+	const providerAccounts = electronTrpc.agentRouter.providerAccounts.useQuery(
+		undefined,
+		{ refetchInterval: 15_000 },
+	);
+	const invalidate = () => {
+		utils.agentRouter.providerNodes.invalidate();
+		utils.agentRouter.dashboard.invalidate();
+	};
+	const createProviderNode =
+		electronTrpc.agentRouter.createProviderNode.useMutation({
+			onSuccess: invalidate,
+		});
+	const updateProviderNode =
+		electronTrpc.agentRouter.updateProviderNode.useMutation({
+			onSuccess: invalidate,
+		});
+	const deleteProviderNode =
+		electronTrpc.agentRouter.deleteProviderNode.useMutation({
+			onSuccess: invalidate,
+		});
+
+	const [type, setType] = useState<RouterProviderNodeType>("openai-compatible");
+	const [name, setName] = useState("");
+	const [prefix, setPrefix] = useState("");
+	const [baseUrl, setBaseUrl] = useState(defaultNodeBaseUrl(type));
+	const [apiType, setApiType] = useState<"chat" | "responses">("chat");
+	const [apiKeyProvider, setApiKeyProvider] =
+		useState<RouterProviderKeyId>("openai");
+	const [apiKeyAccountId, setApiKeyAccountId] = useState("");
+	const [models, setModels] = useState("");
+
+	const accounts = providerAccounts.data ?? [];
+	const matchingAccounts = accounts.filter(
+		(account) => account.provider === apiKeyProvider,
+	);
+
+	const changeType = (nextType: RouterProviderNodeType) => {
+		setType(nextType);
+		setBaseUrl(defaultNodeBaseUrl(nextType));
+		setApiKeyProvider(
+			nextType === "anthropic-compatible" ? "anthropic" : "openai",
+		);
+		if (nextType !== "openai-compatible") setApiType("chat");
+		setApiKeyAccountId("");
+	};
+
+	const saveNode = async () => {
+		if (!name.trim() || !prefix.trim() || !baseUrl.trim()) return;
+		await createProviderNode.mutateAsync({
+			apiKeyAccountId: apiKeyAccountId || null,
+			apiKeyProvider,
+			apiType: type === "openai-compatible" ? apiType : undefined,
+			baseUrl: baseUrl.trim(),
+			models: parseDashboardModels(models),
+			name: name.trim(),
+			prefix: prefix.trim(),
+			type,
+		});
+		setName("");
+		setPrefix("");
+		setModels("");
+		setApiKeyAccountId("");
+	};
+
+	return (
+		<section className="grid gap-4 xl:grid-cols-[0.85fr_1.15fr]">
+			<div className="rounded-lg border bg-card p-4">
+				<h2 className="text-sm font-semibold">Add provider node</h2>
+				<div className="mt-4 grid gap-3">
+					<label className="grid gap-1.5 text-xs font-medium">
+						Type
+						<select
+							value={type}
+							onChange={(event) =>
+								changeType(event.target.value as RouterProviderNodeType)
+							}
+							className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+						>
+							<option value="openai-compatible">OpenAI-compatible</option>
+							<option value="anthropic-compatible">Anthropic-compatible</option>
+							<option value="custom-embedding">Custom embedding</option>
+						</select>
+					</label>
+
+					<div className="grid gap-3 md:grid-cols-2">
+						<label className="grid gap-1.5 text-xs font-medium">
+							Name
+							<input
+								value={name}
+								onChange={(event) => setName(event.target.value)}
+								placeholder="Local LM Studio"
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							/>
+						</label>
+						<label className="grid gap-1.5 text-xs font-medium">
+							Prefix
+							<input
+								value={prefix}
+								onChange={(event) => setPrefix(event.target.value)}
+								placeholder="lmstudio"
+								className="rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+							/>
+						</label>
+					</div>
+
+					<label className="grid gap-1.5 text-xs font-medium">
+						Base URL
+						<input
+							value={baseUrl}
+							onChange={(event) => setBaseUrl(event.target.value)}
+							placeholder="http://127.0.0.1:1234/v1"
+							className="rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+						/>
+					</label>
+
+					<div className="grid gap-3 md:grid-cols-2">
+						<label className="grid gap-1.5 text-xs font-medium">
+							Key provider
+							<select
+								value={apiKeyProvider}
+								onChange={(event) => {
+									setApiKeyProvider(event.target.value as RouterProviderKeyId);
+									setApiKeyAccountId("");
+								}}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							>
+								{ROUTER_PROVIDER_KEY_IDS.map((provider) => (
+									<option key={provider} value={provider}>
+										{provider}
+									</option>
+								))}
+							</select>
+						</label>
+						<label className="grid gap-1.5 text-xs font-medium">
+							Account
+							<select
+								value={apiKeyAccountId}
+								onChange={(event) => setApiKeyAccountId(event.target.value)}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							>
+								<option value="">auto / no key for local nodes</option>
+								{matchingAccounts.map((account) => (
+									<option key={account.id} value={account.id}>
+										{account.name}
+									</option>
+								))}
+							</select>
+						</label>
+					</div>
+
+					{type === "openai-compatible" && (
+						<label className="grid gap-1.5 text-xs font-medium">
+							OpenAI API type
+							<select
+								value={apiType}
+								onChange={(event) =>
+									setApiType(event.target.value as "chat" | "responses")
+								}
+								className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							>
+								<option value="chat">/chat/completions</option>
+								<option value="responses">/responses</option>
+							</select>
+						</label>
+					)}
+
+					<label className="grid gap-1.5 text-xs font-medium">
+						Models
+						<textarea
+							value={models}
+							onChange={(event) => setModels(event.target.value)}
+							placeholder="gpt-oss-20b, qwen3-coder"
+							className="min-h-24 rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-ring"
+						/>
+					</label>
+
+					<button
+						type="button"
+						onClick={saveNode}
+						disabled={
+							createProviderNode.isPending ||
+							!name.trim() ||
+							!prefix.trim() ||
+							!baseUrl.trim()
+						}
+						className="w-fit rounded-md border px-3 py-2 text-sm text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Add node
+					</button>
+				</div>
+			</div>
+
+			<div className="rounded-lg border bg-card p-4">
+				<div className="flex items-center justify-between gap-3">
+					<h2 className="text-sm font-semibold">Configured nodes</h2>
+					<Pill>{nodes.data?.length ?? 0} nodes</Pill>
+				</div>
+				<div className="mt-4 flex flex-col gap-3">
+					{(nodes.data ?? []).length === 0 ? (
+						<p className="text-sm text-muted-foreground">
+							No provider nodes configured yet.
+						</p>
+					) : (
+						(nodes.data ?? []).map((node) => (
+							<ProviderNodeRow
+								key={node.id}
+								accounts={accounts}
+								deleteNode={(id) => deleteProviderNode.mutate({ id })}
+								isBusy={
+									updateProviderNode.isPending || deleteProviderNode.isPending
+								}
+								node={node}
+								toggleNode={(id, isActive) =>
+									updateProviderNode.mutate({ id, isActive })
+								}
+							/>
+						))
+					)}
+				</div>
+			</div>
+		</section>
+	);
+}
+
+function ProviderNodeRow({
+	accounts,
+	deleteNode,
+	isBusy,
+	node,
+	toggleNode,
+}: {
+	accounts: ProviderAccountView[];
+	deleteNode: (id: string) => void;
+	isBusy: boolean;
+	node: RouterProviderNode;
+	toggleNode: (id: string, isActive: boolean) => void;
+}) {
+	const accountName =
+		accounts.find((account) => account.id === node.apiKeyAccountId)?.name ??
+		(node.apiKeyAccountId ? "selected account" : "auto / no key");
+
+	return (
+		<div className="rounded-md border bg-background px-3 py-3">
+			<div className="flex flex-wrap items-start justify-between gap-3">
+				<div className="min-w-0">
+					<div className="flex flex-wrap items-center gap-2">
+						<span className="truncate text-sm font-medium">{node.name}</span>
+						<Pill>{node.isActive ? "active" : "paused"}</Pill>
+						<Pill>{node.type}</Pill>
+						{node.apiType && <Pill>{node.apiType}</Pill>}
+					</div>
+					<div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+						{`${node.prefix}/* -> ${node.baseUrl}`}
+					</div>
+				</div>
+				<div className="flex shrink-0 gap-2">
+					<button
+						type="button"
+						onClick={() => toggleNode(node.id, !node.isActive)}
+						disabled={isBusy}
+						className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						{node.isActive ? "Pause" : "Enable"}
+					</button>
+					<button
+						type="button"
+						onClick={() => deleteNode(node.id)}
+						disabled={isBusy}
+						className="rounded border px-2 py-1 text-xs text-muted-foreground enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
+					>
+						Delete
+					</button>
+				</div>
+			</div>
+
+			<div className="mt-3 flex flex-wrap gap-1.5">
+				<Pill>key: {node.apiKeyProvider ?? "none"}</Pill>
+				<Pill>{accountName}</Pill>
+				{node.models.length === 0 ? (
+					<Pill>routes any {node.prefix}/model</Pill>
+				) : (
+					node.models.map((model) => (
+						<Pill key={`${node.id}-${model}`}>
+							{node.prefix}/{model}
+						</Pill>
+					))
+				)}
 			</div>
 		</div>
 	);
@@ -1170,6 +1473,18 @@ function Pill({ children }: { children: ReactNode }) {
 			{children}
 		</span>
 	);
+}
+
+function defaultNodeBaseUrl(type: RouterProviderNodeType): string {
+	if (type === "anthropic-compatible") return "https://api.anthropic.com/v1";
+	return "https://api.openai.com/v1";
+}
+
+function parseDashboardModels(value: string): string[] {
+	return value
+		.split(/[\n,]+/)
+		.map((model) => model.trim())
+		.filter(Boolean);
 }
 
 function TierBadge({ tier }: { tier: string }) {

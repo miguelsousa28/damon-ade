@@ -8,6 +8,8 @@ import {
 	type RouterModelResolutionOptions,
 	type RouterModelTarget,
 	type RouterProviderKeyId,
+	type RouterProviderNode,
+	type RouterProviderNodeType,
 	type RouterTokenSaverMode,
 	resolveRouterModelTarget,
 	TOKEN_SAVER_MODES,
@@ -25,13 +27,17 @@ import {
 } from "./agent-router-accounts";
 import {
 	clearRouterUsage,
+	createRouterProviderNode,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
+	deleteRouterProviderNode,
 	estimateTokens,
 	getRouterAliases,
 	getRouterCustomCombos,
+	getRouterProviderNodes,
 	getRouterUsageStats,
 	recordRouterUsage,
+	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 } from "./agent-router-store";
@@ -58,6 +64,20 @@ interface OpenRouterSuccess {
 	account: RouterProviderCredential;
 	upstream: globalThis.Response;
 	target: RouterModelTarget;
+	model: string;
+}
+
+interface ProviderNodeTarget {
+	node: RouterProviderNode;
+	model: string;
+	requestedModel: string;
+}
+
+interface ProviderNodeSuccess {
+	ok: true;
+	account?: RouterProviderCredential;
+	upstream: globalThis.Response;
+	node: RouterProviderNode;
 	model: string;
 }
 
@@ -127,7 +147,10 @@ function createAgentRouterGatewayApp() {
 	app.disable("x-powered-by");
 	app.use((req, res, next) => {
 		res.setHeader("Access-Control-Allow-Origin", "*");
-		res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+		res.setHeader(
+			"Access-Control-Allow-Methods",
+			"GET,POST,PUT,DELETE,OPTIONS",
+		);
 		res.setHeader("Access-Control-Allow-Headers", "*");
 		if (req.method === "OPTIONS") {
 			res.status(204).end();
@@ -200,9 +223,7 @@ function createAgentRouterGatewayApp() {
 	app.post("/v1/responses", handleResponses);
 	app.post("/v1/messages", handleAnthropicMessages);
 	app.post("/v1/messages/count_tokens", handleCountTokens);
-	app.post("/v1/embeddings", (req, res) =>
-		handleOpenAIProxy(req, res, "/embeddings"),
-	);
+	app.post("/v1/embeddings", handleEmbeddings);
 	app.post("/v1/images/generations", (req, res) =>
 		handleOpenAIProxy(req, res, "/images/generations"),
 	);
@@ -249,6 +270,24 @@ function createAgentRouterGatewayApp() {
 	app.delete("/api/combos/:name", (req, res) => {
 		res.json({ customCombos: deleteRouterCustomCombo(req.params.name) });
 	});
+	app.get("/api/provider-nodes", (_req, res) => {
+		res.json({ nodes: getRouterProviderNodes() });
+	});
+	app.post("/api/provider-nodes", (req, res) => {
+		const node = createRouterProviderNode(parseProviderNodeBody(req.body));
+		res.status(201).json({ node });
+	});
+	app.put("/api/provider-nodes/:id", (req, res) => {
+		res.json({
+			nodes: updateRouterProviderNode(
+				req.params.id,
+				parseProviderNodeBody(req.body),
+			),
+		});
+	});
+	app.delete("/api/provider-nodes/:id", (req, res) => {
+		res.json({ nodes: deleteRouterProviderNode(req.params.id) });
+	});
 
 	const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
 		const message = error instanceof Error ? error.message : String(error);
@@ -266,7 +305,17 @@ function createAgentRouterGatewayApp() {
 }
 
 async function handleChatCompletions(req: Request, res: ExpressResponse) {
-	const result = await fetchOpenRouterWithFallback(req.body ?? {});
+	const body = toJsonObject(req.body);
+	const nodeTarget = resolveProviderNodeTarget(body.model, [
+		"openai-compatible",
+		"anthropic-compatible",
+	]);
+	if (nodeTarget) {
+		await handleProviderNodeChat(nodeTarget, body, req, res);
+		return;
+	}
+
+	const result = await fetchOpenRouterWithFallback(body);
 	if (!result.ok) {
 		res.status(result.status).json(result.body);
 		return;
@@ -282,6 +331,15 @@ async function handleChatCompletions(req: Request, res: ExpressResponse) {
 
 async function handleResponses(req: Request, res: ExpressResponse) {
 	const body = toJsonObject(req.body);
+	const nodeTarget = resolveProviderNodeTarget(body.model, [
+		"openai-compatible",
+		"anthropic-compatible",
+	]);
+	if (nodeTarget) {
+		await handleProviderNodeResponses(nodeTarget, body, req, res);
+		return;
+	}
+
 	const { input, instructions, max_output_tokens, ...rest } = body;
 	const messages = responsesInputToMessages(body);
 	const chatBody = {
@@ -340,6 +398,15 @@ async function handleResponses(req: Request, res: ExpressResponse) {
 
 async function handleAnthropicMessages(req: Request, res: ExpressResponse) {
 	const body = toJsonObject(req.body);
+	const nodeTarget = resolveProviderNodeTarget(body.model, [
+		"openai-compatible",
+		"anthropic-compatible",
+	]);
+	if (nodeTarget) {
+		await handleProviderNodeAnthropicMessages(nodeTarget, body, req, res);
+		return;
+	}
+
 	const messages = anthropicMessagesToOpenAiMessages(body);
 	const chatBody = {
 		model: typeof body.model === "string" ? body.model : "budget-coding",
@@ -386,6 +453,228 @@ function handleCountTokens(req: Request, res: ExpressResponse) {
 		tools: body.tools,
 	});
 	res.json({ input_tokens: inputTokens });
+}
+
+async function handleEmbeddings(req: Request, res: ExpressResponse) {
+	const body = toJsonObject(req.body);
+	const nodeTarget = resolveProviderNodeTarget(body.model, [
+		"custom-embedding",
+		"openai-compatible",
+	]);
+	if (!nodeTarget) {
+		await handleOpenAIProxy(req, res, "/embeddings");
+		return;
+	}
+
+	const result = await fetchProviderNodeWithFallback({
+		body: withModel(body, nodeTarget.model),
+		nodeTarget,
+		path: "/embeddings",
+		req,
+	});
+	if (!result.ok) {
+		res.status(result.status).json(result.body);
+		return;
+	}
+
+	setProviderNodeUsageLocals(res, result);
+	await pipeUpstreamResponse(result.upstream, res);
+}
+
+async function handleProviderNodeChat(
+	nodeTarget: ProviderNodeTarget,
+	body: JsonObject,
+	req: Request,
+	res: ExpressResponse,
+) {
+	const { node } = nodeTarget;
+
+	if (node.type === "openai-compatible" && node.apiType === "responses") {
+		if (body.stream === true) {
+			writeStreamingTranslationError(res, "OpenAI Responses provider node");
+			return;
+		}
+		const result = await fetchProviderNodeWithFallback({
+			body: chatBodyToResponsesBody(body, nodeTarget.model),
+			nodeTarget,
+			path: "/responses",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		const upstream = await readJson(result.upstream);
+		res.json(responsesToOpenAiChatResponse(upstream, nodeTarget));
+		return;
+	}
+
+	if (node.type === "openai-compatible") {
+		const result = await fetchProviderNodeWithFallback({
+			body: withModel(body, nodeTarget.model),
+			nodeTarget,
+			path: "/chat/completions",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		await pipeUpstreamResponse(result.upstream, res);
+		return;
+	}
+
+	if (body.stream === true) {
+		writeStreamingTranslationError(res, "Anthropic-compatible provider node");
+		return;
+	}
+
+	const result = await fetchProviderNodeWithFallback({
+		body: openAiChatToAnthropicBody(body, nodeTarget.model),
+		nodeTarget,
+		path: "/messages",
+		req,
+	});
+	if (!result.ok) {
+		res.status(result.status).json(result.body);
+		return;
+	}
+	setProviderNodeUsageLocals(res, result);
+	const upstream = await readJson(result.upstream);
+	res.json(anthropicToOpenAiChatResponse(upstream, nodeTarget));
+}
+
+async function handleProviderNodeResponses(
+	nodeTarget: ProviderNodeTarget,
+	body: JsonObject,
+	req: Request,
+	res: ExpressResponse,
+) {
+	const { node } = nodeTarget;
+
+	if (node.type === "openai-compatible" && node.apiType === "responses") {
+		const result = await fetchProviderNodeWithFallback({
+			body: withModel(body, nodeTarget.model),
+			nodeTarget,
+			path: "/responses",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		await pipeUpstreamResponse(result.upstream, res);
+		return;
+	}
+
+	if (body.stream === true) {
+		writeStreamingTranslationError(res, `${node.type} provider node`);
+		return;
+	}
+
+	if (node.type === "openai-compatible") {
+		const result = await fetchProviderNodeWithFallback({
+			body: responsesBodyToChatBody(body, nodeTarget.model),
+			nodeTarget,
+			path: "/chat/completions",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		const upstream = await readJson(result.upstream);
+		res.json(openAiChatToResponsesResponse(upstream, nodeTarget));
+		return;
+	}
+
+	const result = await fetchProviderNodeWithFallback({
+		body: openAiChatToAnthropicBody(
+			responsesBodyToChatBody(body, nodeTarget.model),
+			nodeTarget.model,
+		),
+		nodeTarget,
+		path: "/messages",
+		req,
+	});
+	if (!result.ok) {
+		res.status(result.status).json(result.body);
+		return;
+	}
+	setProviderNodeUsageLocals(res, result);
+	const upstream = await readJson(result.upstream);
+	res.json(anthropicToResponsesResponse(upstream, nodeTarget));
+}
+
+async function handleProviderNodeAnthropicMessages(
+	nodeTarget: ProviderNodeTarget,
+	body: JsonObject,
+	req: Request,
+	res: ExpressResponse,
+) {
+	const { node } = nodeTarget;
+
+	if (node.type === "anthropic-compatible") {
+		const result = await fetchProviderNodeWithFallback({
+			body: withModel(body, nodeTarget.model),
+			nodeTarget,
+			path: "/messages",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		await pipeUpstreamResponse(result.upstream, res);
+		return;
+	}
+
+	if (body.stream === true) {
+		writeStreamingTranslationError(res, "OpenAI-compatible provider node");
+		return;
+	}
+
+	if (node.apiType === "responses") {
+		const result = await fetchProviderNodeWithFallback({
+			body: anthropicBodyToResponsesBody(body, nodeTarget.model),
+			nodeTarget,
+			path: "/responses",
+			req,
+		});
+		if (!result.ok) {
+			res.status(result.status).json(result.body);
+			return;
+		}
+		setProviderNodeUsageLocals(res, result);
+		const upstream = await readJson(result.upstream);
+		res.json(responsesToAnthropicMessage(upstream, nodeTarget));
+		return;
+	}
+
+	const result = await fetchProviderNodeWithFallback({
+		body: {
+			model: nodeTarget.model,
+			messages: anthropicMessagesToOpenAiMessages(body),
+			max_tokens: body.max_tokens,
+			temperature: body.temperature,
+			stream: false,
+		},
+		nodeTarget,
+		path: "/chat/completions",
+		req,
+	});
+	if (!result.ok) {
+		res.status(result.status).json(result.body);
+		return;
+	}
+	setProviderNodeUsageLocals(res, result);
+	const upstream = await readJson(result.upstream);
+	res.json(openAiChatToAnthropicMessage(upstream, nodeTarget));
 }
 
 async function handleOpenAIProxy(
@@ -580,6 +869,591 @@ async function handleWebFetch(req: Request, res: ExpressResponse) {
 	});
 }
 
+async function fetchProviderNodeWithFallback({
+	body,
+	nodeTarget,
+	path,
+	req,
+}: {
+	body: JsonObject;
+	nodeTarget: ProviderNodeTarget;
+	path: string;
+	req: Request;
+}): Promise<ProviderNodeSuccess | GatewayFailure> {
+	const { node } = nodeTarget;
+	const credentials = getProviderNodeCredentials(node);
+	if (node.apiKeyAccountId && credentials.length === 0) {
+		return {
+			ok: false,
+			status: 401,
+			body: {
+				error: {
+					message:
+						"Provider node account is selected but no active credential is available.",
+					type: "authentication_error",
+				},
+			},
+		};
+	}
+
+	const attempts: Array<RouterProviderCredential | undefined> =
+		credentials.length > 0 ? credentials : [undefined];
+	let lastFailure: { account: string; status: number; text: string } | null =
+		null;
+
+	for (const account of attempts) {
+		const upstream = await fetch(providerNodeUrl(node, path), {
+			method: "POST",
+			headers: providerNodeHeaders(node, account, req),
+			body: JSON.stringify(body),
+		});
+
+		if (upstream.ok) {
+			if (account) markProviderAccountSuccess(account);
+			return {
+				ok: true,
+				account,
+				upstream,
+				node,
+				model: nodeTarget.model,
+			};
+		}
+
+		const text = await upstream.text().catch(() => upstream.statusText);
+		lastFailure = {
+			account: account?.name ?? "no-auth",
+			status: upstream.status,
+			text,
+		};
+		if (account) {
+			markProviderAccountFailure({
+				credential: account,
+				status: upstream.status,
+				text,
+			});
+		}
+	}
+
+	return {
+		ok: false,
+		status: lastFailure?.status ?? 502,
+		body: {
+			error: {
+				message: "Provider node request failed.",
+				type: "upstream_error",
+				details: lastFailure,
+				node: node.id,
+			},
+		},
+	};
+}
+
+function resolveProviderNodeTarget(
+	model: unknown,
+	allowedTypes: RouterProviderNodeType[],
+): ProviderNodeTarget | null {
+	const requestedModel = resolveRequestedModel(model);
+	if (!requestedModel) return null;
+
+	const slashIndex = requestedModel.indexOf("/");
+	if (slashIndex <= 0 || slashIndex === requestedModel.length - 1) return null;
+
+	const prefix = requestedModel.slice(0, slashIndex);
+	const modelId = requestedModel.slice(slashIndex + 1);
+	const node = getRouterProviderNodes().find(
+		(candidate) =>
+			candidate.isActive &&
+			allowedTypes.includes(candidate.type) &&
+			candidate.prefix === prefix,
+	);
+	if (!node) return null;
+
+	return {
+		node,
+		model: modelId,
+		requestedModel,
+	};
+}
+
+function resolveRequestedModel(model: unknown): string | null {
+	if (typeof model !== "string") return null;
+	let requestedModel = model.trim();
+	if (!requestedModel) return null;
+
+	for (let depth = 0; depth < 8; depth++) {
+		const alias = getRouterAliases().find(
+			(candidate) => candidate.alias === requestedModel,
+		);
+		if (!alias) return requestedModel;
+		const next = alias.targetModel.trim();
+		if (!next || next === requestedModel) return requestedModel;
+		requestedModel = next;
+	}
+
+	return requestedModel;
+}
+
+function getProviderNodeCredentials(
+	node: RouterProviderNode,
+): RouterProviderCredential[] {
+	if (!node.apiKeyProvider) return [];
+	const credentials = getProviderAccountCredentials(node.apiKeyProvider);
+	if (!node.apiKeyAccountId) return credentials;
+	return credentials.filter(
+		(credential) => credential.id === node.apiKeyAccountId,
+	);
+}
+
+function providerNodeHeaders(
+	node: RouterProviderNode,
+	account: RouterProviderCredential | undefined,
+	req: Request,
+): Record<string, string> {
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+	};
+	if (!account?.key) return headers;
+
+	if (node.type === "anthropic-compatible") {
+		headers["x-api-key"] = account.key;
+		headers.Authorization = `Bearer ${account.key}`;
+		headers["anthropic-version"] =
+			req.header("anthropic-version") ?? "2023-06-01";
+		return headers;
+	}
+
+	headers.Authorization = `Bearer ${account.key}`;
+	return headers;
+}
+
+function providerNodeUrl(node: RouterProviderNode, path: string): string {
+	const baseUrl = node.baseUrl.replace(/\/+$/g, "");
+	return baseUrl.endsWith(path) ? baseUrl : `${baseUrl}${path}`;
+}
+
+function setProviderNodeUsageLocals(
+	res: ExpressResponse,
+	result: ProviderNodeSuccess,
+) {
+	res.locals.routerProvider = result.node.id;
+	res.locals.routerModel = `${result.node.prefix}/${result.model}`;
+	if (result.account) {
+		res.locals.routerAccountId = result.account.id;
+		res.locals.routerAccountName = result.account.name;
+	}
+}
+
+function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {
+	const body = toJsonObject(value);
+	return {
+		apiKeyAccountId:
+			typeof body.apiKeyAccountId === "string"
+				? body.apiKeyAccountId
+				: body.apiKeyAccountId === null
+					? null
+					: undefined,
+		apiKeyProvider:
+			typeof body.apiKeyProvider === "string"
+				? (body.apiKeyProvider as RouterProviderKeyId)
+				: undefined,
+		apiType:
+			body.apiType === "responses" || body.apiType === "chat"
+				? body.apiType
+				: undefined,
+		baseUrl: typeof body.baseUrl === "string" ? body.baseUrl : undefined,
+		isActive: typeof body.isActive === "boolean" ? body.isActive : undefined,
+		models: parseModelList(body.models),
+		name: typeof body.name === "string" ? body.name : undefined,
+		prefix: typeof body.prefix === "string" ? body.prefix : undefined,
+		type: parseProviderNodeType(body.type),
+	};
+}
+
+function parseModelList(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) return value.map(String);
+	if (typeof value === "string") {
+		return value
+			.split(/[\n,]+/)
+			.map((model) => model.trim())
+			.filter(Boolean);
+	}
+	return undefined;
+}
+
+function parseProviderNodeType(
+	value: unknown,
+): RouterProviderNodeType | undefined {
+	if (
+		value === "openai-compatible" ||
+		value === "anthropic-compatible" ||
+		value === "custom-embedding"
+	) {
+		return value;
+	}
+	return undefined;
+}
+
+function withModel(body: JsonObject, model: string): JsonObject {
+	return { ...body, model };
+}
+
+function openAiChatToAnthropicBody(
+	body: JsonObject,
+	model: string,
+): JsonObject {
+	const messages: JsonObject[] = [];
+	const systemParts: string[] = [];
+	const sourceMessages = Array.isArray(body.messages) ? body.messages : [];
+
+	for (const item of sourceMessages) {
+		if (!item || typeof item !== "object") continue;
+		const value = item as JsonObject;
+		const role = typeof value.role === "string" ? value.role : "user";
+		const text = extractContentText(value.content);
+		if (!text) continue;
+		if (role === "system") {
+			systemParts.push(text);
+			continue;
+		}
+		messages.push({
+			role: role === "assistant" ? "assistant" : "user",
+			content: text,
+		});
+	}
+
+	return {
+		model,
+		messages: messages.length > 0 ? messages : [{ role: "user", content: "" }],
+		max_tokens: Number(body.max_tokens ?? body.max_output_tokens ?? 1024),
+		system:
+			typeof body.system === "string"
+				? body.system
+				: systemParts.length > 0
+					? systemParts.join("\n\n")
+					: undefined,
+		temperature: body.temperature,
+		top_p: body.top_p,
+		stop_sequences: parseStopSequences(body.stop),
+		stream: false,
+	};
+}
+
+function chatBodyToResponsesBody(body: JsonObject, model: string): JsonObject {
+	const { max_tokens, messages, stream, ...rest } = body;
+	const sourceMessages = Array.isArray(messages) ? messages : [];
+	const systemParts: string[] = [];
+	const inputParts: string[] = [];
+	for (const item of sourceMessages) {
+		if (!item || typeof item !== "object") continue;
+		const value = item as JsonObject;
+		const role = typeof value.role === "string" ? value.role : "user";
+		const text = extractContentText(value.content);
+		if (!text) continue;
+		if (role === "system") systemParts.push(text);
+		else inputParts.push(`${role}: ${text}`);
+	}
+	void stream;
+	return {
+		...rest,
+		model,
+		instructions: systemParts.join("\n\n") || rest.instructions,
+		input: inputParts.join("\n\n") || rest.input || "Continue.",
+		max_output_tokens: rest.max_output_tokens ?? max_tokens,
+		stream: false,
+	};
+}
+
+function anthropicBodyToResponsesBody(
+	body: JsonObject,
+	model: string,
+): JsonObject {
+	const messages = anthropicMessagesToOpenAiMessages(body);
+	return chatBodyToResponsesBody(
+		{
+			...body,
+			messages,
+			max_tokens: body.max_tokens,
+		},
+		model,
+	);
+}
+
+function responsesBodyToChatBody(body: JsonObject, model: string): JsonObject {
+	const { input, instructions, max_output_tokens, ...rest } = body;
+	void input;
+	void instructions;
+	return {
+		...rest,
+		model,
+		messages: responsesInputToMessages(body),
+		max_tokens: max_output_tokens ?? body.max_tokens,
+		stream: false,
+	};
+}
+
+function openAiChatToResponsesResponse(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const text = extractAssistantText(upstream);
+	const usage = extractOpenAIUsage(upstream);
+	return buildResponsesResponse({
+		inputTokens: usage.prompt_tokens,
+		model: nodeTarget.requestedModel,
+		outputTokens: usage.completion_tokens,
+		text,
+	});
+}
+
+function anthropicToResponsesResponse(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const usage = extractAnthropicUsage(upstream);
+	return buildResponsesResponse({
+		inputTokens: usage.input_tokens,
+		model: nodeTarget.requestedModel,
+		outputTokens: usage.output_tokens,
+		text: extractAnthropicText(upstream),
+	});
+}
+
+function responsesToOpenAiChatResponse(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const usage = extractResponsesUsage(upstream);
+	return buildOpenAiChatResponse({
+		completionTokens: usage.output_tokens,
+		finishReason: "stop",
+		model: nodeTarget.requestedModel,
+		promptTokens: usage.input_tokens,
+		text: extractResponsesText(upstream),
+	});
+}
+
+function anthropicToOpenAiChatResponse(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const usage = extractAnthropicUsage(upstream);
+	return buildOpenAiChatResponse({
+		completionTokens: usage.output_tokens,
+		finishReason:
+			typeof upstream.stop_reason === "string" ? upstream.stop_reason : "stop",
+		model: nodeTarget.requestedModel,
+		promptTokens: usage.input_tokens,
+		text: extractAnthropicText(upstream),
+	});
+}
+
+function openAiChatToAnthropicMessage(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const usage = extractOpenAIUsage(upstream);
+	return buildAnthropicMessage({
+		inputTokens: usage.prompt_tokens,
+		model: nodeTarget.requestedModel,
+		outputTokens: usage.completion_tokens,
+		stopReason: extractStopReason(upstream),
+		text: extractAssistantText(upstream),
+	});
+}
+
+function responsesToAnthropicMessage(
+	upstream: JsonObject,
+	nodeTarget: ProviderNodeTarget,
+): JsonObject {
+	const usage = extractResponsesUsage(upstream);
+	return buildAnthropicMessage({
+		inputTokens: usage.input_tokens,
+		model: nodeTarget.requestedModel,
+		outputTokens: usage.output_tokens,
+		stopReason: "end_turn",
+		text: extractResponsesText(upstream),
+	});
+}
+
+function buildOpenAiChatResponse({
+	completionTokens,
+	finishReason,
+	model,
+	promptTokens,
+	text,
+}: {
+	completionTokens: number;
+	finishReason: string | null;
+	model: string;
+	promptTokens: number;
+	text: string;
+}): JsonObject {
+	return {
+		id: `chatcmpl_${cryptoId()}`,
+		object: "chat.completion",
+		created: Math.floor(Date.now() / 1000),
+		model,
+		choices: [
+			{
+				index: 0,
+				message: { role: "assistant", content: text },
+				finish_reason: finishReason ?? "stop",
+			},
+		],
+		usage: {
+			prompt_tokens: promptTokens,
+			completion_tokens: completionTokens,
+			total_tokens: promptTokens + completionTokens,
+		},
+	};
+}
+
+function buildResponsesResponse({
+	inputTokens,
+	model,
+	outputTokens,
+	text,
+}: {
+	inputTokens: number;
+	model: string;
+	outputTokens: number;
+	text: string;
+}): JsonObject {
+	return {
+		id: `resp_${cryptoId()}`,
+		object: "response",
+		created_at: Math.floor(Date.now() / 1000),
+		status: "completed",
+		model,
+		output_text: text,
+		output: [
+			{
+				id: `msg_${cryptoId()}`,
+				type: "message",
+				status: "completed",
+				role: "assistant",
+				content: [
+					{
+						type: "output_text",
+						text,
+						annotations: [],
+					},
+				],
+			},
+		],
+		usage: {
+			input_tokens: inputTokens,
+			output_tokens: outputTokens,
+			total_tokens: inputTokens + outputTokens,
+		},
+	};
+}
+
+function buildAnthropicMessage({
+	inputTokens,
+	model,
+	outputTokens,
+	stopReason,
+	text,
+}: {
+	inputTokens: number;
+	model: string;
+	outputTokens: number;
+	stopReason: string | null;
+	text: string;
+}): JsonObject {
+	return {
+		id: `msg_${cryptoId()}`,
+		type: "message",
+		role: "assistant",
+		model,
+		content: [{ type: "text", text }],
+		stop_reason: stopReason ?? "end_turn",
+		stop_sequence: null,
+		usage: {
+			input_tokens: inputTokens,
+			output_tokens: outputTokens,
+		},
+	};
+}
+
+function extractAnthropicText(upstream: JsonObject): string {
+	const content = upstream.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const value = part as JsonObject;
+			return typeof value.text === "string" ? value.text : "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+function extractResponsesText(upstream: JsonObject): string {
+	if (typeof upstream.output_text === "string") return upstream.output_text;
+	const output = upstream.output;
+	if (!Array.isArray(output)) return "";
+	return output
+		.flatMap((item) => {
+			if (!item || typeof item !== "object") return [];
+			const content = (item as JsonObject).content;
+			return Array.isArray(content) ? content : [];
+		})
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const value = part as JsonObject;
+			return typeof value.text === "string" ? value.text : "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+function extractAnthropicUsage(upstream: JsonObject) {
+	const usage = upstream.usage as JsonObject | undefined;
+	const inputTokens = Number(usage?.input_tokens ?? 0);
+	const outputTokens = Number(usage?.output_tokens ?? 0);
+	return {
+		input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+		output_tokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+	};
+}
+
+function extractResponsesUsage(upstream: JsonObject) {
+	const usage = upstream.usage as JsonObject | undefined;
+	const inputTokens = Number(usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
+	const outputTokens = Number(
+		usage?.output_tokens ?? usage?.completion_tokens ?? 0,
+	);
+	return {
+		input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+		output_tokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+	};
+}
+
+function parseStopSequences(value: unknown): string[] | undefined {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value)) {
+		const stop = value.filter(
+			(entry): entry is string => typeof entry === "string",
+		);
+		return stop.length > 0 ? stop : undefined;
+	}
+	return undefined;
+}
+
+function writeStreamingTranslationError(
+	res: ExpressResponse,
+	target: string,
+): void {
+	res.status(501).json({
+		error: {
+			message: `Streaming format translation for ${target} is not available yet. Use stream=false or call the provider-native endpoint.`,
+			type: "unsupported_feature",
+		},
+	});
+}
+
 async function fetchOpenRouterWithFallback(
 	body: JsonObject,
 ): Promise<OpenRouterSuccess | GatewayFailure> {
@@ -742,6 +1616,7 @@ function getResolutionOptions(): RouterModelResolutionOptions {
 	return {
 		aliases: getRouterAliases(),
 		customCombos: getRouterCustomCombos(),
+		providerNodes: getRouterProviderNodes(),
 	};
 }
 

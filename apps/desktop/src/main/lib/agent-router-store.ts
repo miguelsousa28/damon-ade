@@ -10,7 +10,11 @@ import type {
 	RouterModelAlias,
 	RouterProviderAccount,
 	RouterProviderKeyId,
+	RouterProviderNode,
+	RouterProviderNodeApiType,
+	RouterProviderNodeType,
 } from "@superset/shared/router-control-plane";
+import { ROUTER_PROVIDER_KEY_IDS } from "@superset/shared/router-control-plane";
 import { app } from "electron";
 
 const MAX_USAGE_ENTRIES = 2000;
@@ -68,6 +72,7 @@ export interface RouterStoreSnapshot {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
 	providerAccounts: RouterProviderAccount[];
+	providerNodes: RouterProviderNode[];
 	usage: RouterUsageEntry[];
 }
 
@@ -75,6 +80,7 @@ interface RouterStoreFile {
 	aliases: RouterModelAlias[];
 	customCombos: RouterCustomCombo[];
 	providerAccounts: RouterProviderAccount[];
+	providerNodes: RouterProviderNode[];
 	accountCursor: Partial<Record<RouterProviderKeyId, number>>;
 	usage: RouterUsageEntry[];
 }
@@ -85,6 +91,7 @@ export function getRouterStoreSnapshot(): RouterStoreSnapshot {
 		aliases: data.aliases,
 		customCombos: data.customCombos,
 		providerAccounts: data.providerAccounts,
+		providerNodes: data.providerNodes,
 		usage: data.usage,
 	};
 }
@@ -133,6 +140,90 @@ export function deleteRouterCustomCombo(name: string): RouterCustomCombo[] {
 	const next = data.customCombos.filter((entry) => entry.name !== name);
 	writeStore({ ...data, customCombos: next });
 	return next;
+}
+
+export function getRouterProviderNodes(
+	type?: RouterProviderNodeType,
+): RouterProviderNode[] {
+	const nodes = readStore().providerNodes;
+	return sortProviderNodes(
+		type ? nodes.filter((node) => node.type === type) : nodes,
+	);
+}
+
+export function createRouterProviderNode(
+	node: Omit<Partial<RouterProviderNode>, "id" | "createdAt" | "updatedAt"> & {
+		baseUrl?: string;
+		name?: string;
+		prefix?: string;
+		type?: RouterProviderNodeType;
+	},
+): RouterProviderNode {
+	const data = readStore();
+	const now = new Date().toISOString();
+	const type = node.type ?? "openai-compatible";
+	const normalized = normalizeProviderNode({
+		id: providerNodeId(type, node.apiType),
+		type,
+		name: node.name ?? "",
+		prefix: node.prefix ?? "",
+		baseUrl: node.baseUrl ?? defaultProviderNodeBaseUrl(type),
+		apiType: node.apiType,
+		apiKeyProvider: node.apiKeyProvider,
+		apiKeyAccountId: node.apiKeyAccountId,
+		models: node.models ?? [],
+		isActive: node.isActive ?? true,
+		createdAt: now,
+		updatedAt: now,
+	});
+	writeStore({
+		...data,
+		providerNodes: sortProviderNodes([...data.providerNodes, normalized]),
+	});
+	return normalized;
+}
+
+export function updateRouterProviderNode(
+	id: string,
+	updates: Partial<
+		Pick<
+			RouterProviderNode,
+			| "apiKeyAccountId"
+			| "apiKeyProvider"
+			| "apiType"
+			| "baseUrl"
+			| "isActive"
+			| "models"
+			| "name"
+			| "prefix"
+			| "type"
+		>
+	>,
+): RouterProviderNode[] {
+	const data = readStore();
+	const sanitizedUpdates = removeUndefinedValues(updates);
+	let found = false;
+	const next = data.providerNodes.map((node) => {
+		if (node.id !== id) return node;
+		found = true;
+		return normalizeProviderNode({
+			...node,
+			...sanitizedUpdates,
+			updatedAt: new Date().toISOString(),
+		});
+	});
+	if (!found) throw new Error("Provider node not found");
+	writeStore({ ...data, providerNodes: sortProviderNodes(next) });
+	return getRouterProviderNodes();
+}
+
+export function deleteRouterProviderNode(id: string): RouterProviderNode[] {
+	const data = readStore();
+	writeStore({
+		...data,
+		providerNodes: data.providerNodes.filter((node) => node.id !== id),
+	});
+	return getRouterProviderNodes();
 }
 
 export function getRouterProviderAccounts(
@@ -420,6 +511,116 @@ function normalizeCustomCombo(combo: RouterCustomCombo): RouterCustomCombo {
 	return normalized;
 }
 
+function normalizeProviderNode(node: RouterProviderNode): RouterProviderNode {
+	const type = isProviderNodeType(node.type) ? node.type : "openai-compatible";
+	const prefix = node.prefix.trim().replace(/^\/+|\/+$/g, "");
+	const normalized: RouterProviderNode = {
+		id: node.id || providerNodeId(type, node.apiType),
+		type,
+		name: node.name.trim() || prefix || "Provider node",
+		prefix,
+		baseUrl: sanitizeProviderNodeBaseUrl(
+			node.baseUrl || defaultProviderNodeBaseUrl(type),
+			type,
+		),
+		apiKeyProvider: isRouterProviderKeyId(node.apiKeyProvider)
+			? node.apiKeyProvider
+			: defaultProviderNodeKeyProvider(type),
+		apiKeyAccountId: node.apiKeyAccountId?.trim() || null,
+		models: Array.from(
+			new Set(
+				(Array.isArray(node.models) ? node.models : [])
+					.map((model) => model.trim())
+					.filter(Boolean),
+			),
+		).sort((a, b) => a.localeCompare(b)),
+		isActive: node.isActive !== false,
+		createdAt: node.createdAt || new Date().toISOString(),
+		updatedAt: node.updatedAt || new Date().toISOString(),
+	};
+
+	if (type === "openai-compatible") {
+		normalized.apiType =
+			node.apiType === "responses" || node.apiType === "chat"
+				? node.apiType
+				: "chat";
+	}
+
+	if (!normalized.prefix) throw new Error("Provider node prefix is required");
+	if (!normalized.baseUrl)
+		throw new Error("Provider node base URL is required");
+
+	return normalized;
+}
+
+function sanitizeProviderNodeBaseUrl(
+	baseUrl: string,
+	type: RouterProviderNodeType,
+): string {
+	let sanitized = baseUrl.trim().replace(/\/+$/g, "");
+	if (type === "anthropic-compatible" && sanitized.endsWith("/messages")) {
+		sanitized = sanitized.slice(0, -"/messages".length);
+	}
+	if (type === "custom-embedding" && sanitized.endsWith("/embeddings")) {
+		sanitized = sanitized.slice(0, -"/embeddings".length);
+	}
+	return sanitized;
+}
+
+function defaultProviderNodeBaseUrl(type: RouterProviderNodeType): string {
+	if (type === "anthropic-compatible") return "https://api.anthropic.com/v1";
+	return "https://api.openai.com/v1";
+}
+
+function defaultProviderNodeKeyProvider(
+	type: RouterProviderNodeType,
+): RouterProviderKeyId | undefined {
+	if (type === "anthropic-compatible") return "anthropic";
+	if (type === "openai-compatible" || type === "custom-embedding")
+		return "openai";
+	return undefined;
+}
+
+function providerNodeId(
+	type: RouterProviderNodeType,
+	apiType?: RouterProviderNodeApiType,
+): string {
+	if (type === "openai-compatible") {
+		return `openai-compatible-${apiType === "responses" ? "responses" : "chat"}-${randomUUID()}`;
+	}
+	if (type === "anthropic-compatible") {
+		return `anthropic-compatible-${randomUUID()}`;
+	}
+	return `custom-embedding-${randomUUID()}`;
+}
+
+function isProviderNodeType(value: unknown): value is RouterProviderNodeType {
+	return (
+		value === "openai-compatible" ||
+		value === "anthropic-compatible" ||
+		value === "custom-embedding"
+	);
+}
+
+function isRouterProviderKeyId(value: unknown): value is RouterProviderKeyId {
+	return (
+		typeof value === "string" &&
+		ROUTER_PROVIDER_KEY_IDS.includes(value as RouterProviderKeyId)
+	);
+}
+
+function sortProviderNodes(nodes: RouterProviderNode[]): RouterProviderNode[] {
+	return [...nodes].sort(
+		(a, b) => a.prefix.localeCompare(b.prefix) || a.name.localeCompare(b.name),
+	);
+}
+
+function removeUndefinedValues<T extends object>(value: T): Partial<T> {
+	return Object.fromEntries(
+		Object.entries(value).filter(([, entry]) => entry !== undefined),
+	) as Partial<T>;
+}
+
 function readStore(): RouterStoreFile {
 	const path = getStorePath();
 	if (!existsSync(path)) return emptyStore();
@@ -435,6 +636,11 @@ function readStore(): RouterStoreFile {
 				: [],
 			providerAccounts: Array.isArray(parsed.providerAccounts)
 				? parsed.providerAccounts
+				: [],
+			providerNodes: Array.isArray(parsed.providerNodes)
+				? parsed.providerNodes
+						.map((node) => normalizeProviderNode(node as RouterProviderNode))
+						.filter(Boolean)
 				: [],
 			accountCursor:
 				parsed.accountCursor && typeof parsed.accountCursor === "object"
@@ -461,6 +667,7 @@ function emptyStore(): RouterStoreFile {
 		aliases: [],
 		customCombos: [],
 		providerAccounts: [],
+		providerNodes: [],
 		accountCursor: {},
 		usage: [],
 	};

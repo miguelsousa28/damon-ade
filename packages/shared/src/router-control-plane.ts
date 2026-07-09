@@ -132,9 +132,32 @@ export interface RouterCustomCombo {
 	models: string[];
 }
 
+export type RouterProviderNodeType =
+	| "openai-compatible"
+	| "anthropic-compatible"
+	| "custom-embedding";
+
+export type RouterProviderNodeApiType = "chat" | "responses";
+
+export interface RouterProviderNode {
+	id: string;
+	type: RouterProviderNodeType;
+	name: string;
+	prefix: string;
+	baseUrl: string;
+	apiType?: RouterProviderNodeApiType;
+	apiKeyProvider?: RouterProviderKeyId;
+	apiKeyAccountId?: string | null;
+	models: string[];
+	isActive: boolean;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface RouterModelResolutionOptions {
 	aliases?: RouterModelAlias[];
 	customCombos?: RouterCustomCombo[];
+	providerNodes?: RouterProviderNode[];
 }
 
 export type RouterTokenSaverMode = "rtk" | "headroom" | "caveman" | "ponytail";
@@ -418,7 +441,14 @@ export const ROUTER_ENDPOINTS: RouterEndpoint[] = [
 		path: "/v1/embeddings",
 		method: "POST",
 		compatibility: "OpenAI",
-		capability: "Embeddings",
+		capability: "OpenAI/custom embedding proxy",
+		status: "gateway-live",
+	},
+	{
+		path: "/api/provider-nodes",
+		method: "GET",
+		compatibility: "Router",
+		capability: "Custom OpenAI/Anthropic-compatible provider nodes",
 		status: "gateway-live",
 	},
 	{
@@ -510,6 +540,13 @@ export const ROUTER_FEATURES: RouterFeature[] = [
 			"9router-style provider catalogue exposed in the native dashboard.",
 	},
 	{
+		id: "provider-nodes",
+		label: "Provider nodes",
+		status: "active",
+		description:
+			"Custom OpenAI-compatible, Anthropic-compatible, and embedding nodes route by prefix.",
+	},
+	{
 		id: "fallback-classifier",
 		label: "Fallback classifier",
 		status: "router-core",
@@ -592,6 +629,7 @@ export function buildRouterDashboardSnapshot({
 export function buildOpenAIModelList({
 	aliases = [],
 	customCombos = [],
+	providerNodes = [],
 }: RouterModelResolutionOptions = {}): OpenAIModelList {
 	const entries: OpenAIModelEntry[] = [];
 	const add = (id: string, ownedBy: string) => {
@@ -626,6 +664,13 @@ export function buildOpenAIModelList({
 
 	for (const combo of customCombos) {
 		add(combo.name, "custom-combo");
+	}
+
+	for (const node of providerNodes) {
+		if (!node.isActive) continue;
+		for (const model of node.models) {
+			add(`${node.prefix}/${model}`, node.id || node.prefix);
+		}
 	}
 
 	return {

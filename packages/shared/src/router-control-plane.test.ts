@@ -43,6 +43,35 @@ describe("router control plane", () => {
 		const list = buildOpenAIModelList({
 			aliases: [{ alias: "fast-code", targetModel: "openrouter/z-ai/glm-5.2" }],
 			customCombos: [{ name: "my-budget-stack", models: ["glm", "minimax"] }],
+			providerNodes: [
+				{
+					id: "openai-compatible-chat-local",
+					type: "openai-compatible",
+					name: "Local OpenAI",
+					prefix: "local",
+					baseUrl: "http://127.0.0.1:1234/v1",
+					apiType: "chat",
+					apiKeyProvider: "openai",
+					apiKeyAccountId: null,
+					models: ["qwen3-coder"],
+					isActive: true,
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+				{
+					id: "anthropic-compatible-paused",
+					type: "anthropic-compatible",
+					name: "Paused Anthropic",
+					prefix: "paused",
+					baseUrl: "http://127.0.0.1:3000/v1",
+					apiKeyProvider: "anthropic",
+					apiKeyAccountId: null,
+					models: ["claude-local"],
+					isActive: false,
+					createdAt: "2026-07-09T00:00:00.000Z",
+					updatedAt: "2026-07-09T00:00:00.000Z",
+				},
+			],
 		});
 		const ids = list.data.map((model) => model.id);
 
@@ -52,6 +81,8 @@ describe("router control plane", () => {
 		expect(ids).toContain("openrouter/z-ai/glm-5.2");
 		expect(ids).toContain("fast-code");
 		expect(ids).toContain("my-budget-stack");
+		expect(ids).toContain("local/qwen3-coder");
+		expect(ids).not.toContain("paused/claude-local");
 	});
 
 	it("resolves OpenRouter-backed combos into fallback models", () => {

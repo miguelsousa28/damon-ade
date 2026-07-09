@@ -18,11 +18,15 @@ import {
 } from "main/lib/agent-router-gateway";
 import {
 	clearRouterUsage,
+	createRouterProviderNode,
 	deleteRouterAlias,
 	deleteRouterCustomCombo,
+	deleteRouterProviderNode,
 	getRouterAliases,
 	getRouterCustomCombos,
+	getRouterProviderNodes,
 	getRouterUsageStats,
+	updateRouterProviderNode,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 } from "main/lib/agent-router-store";
@@ -32,6 +36,23 @@ import { publicProcedure, router } from "../..";
 
 const tokenSaverModeSchema = z.enum(TOKEN_SAVER_MODES);
 const providerKeySchema = z.enum(ROUTER_PROVIDER_KEY_IDS);
+const providerNodeTypeSchema = z.enum([
+	"openai-compatible",
+	"anthropic-compatible",
+	"custom-embedding",
+]);
+const providerNodeApiTypeSchema = z.enum(["chat", "responses"]);
+const providerNodeInputSchema = z.object({
+	apiKeyAccountId: z.string().nullable().optional(),
+	apiKeyProvider: providerKeySchema.optional(),
+	apiType: providerNodeApiTypeSchema.optional(),
+	baseUrl: z.string().min(1).optional(),
+	isActive: z.boolean().optional(),
+	models: z.array(z.string()).optional(),
+	name: z.string().min(1).optional(),
+	prefix: z.string().min(1).optional(),
+	type: providerNodeTypeSchema.optional(),
+});
 
 export const createAgentRouterRouter = () => {
 	return router({
@@ -106,6 +127,35 @@ export const createAgentRouterRouter = () => {
 			.mutation(({ input }) => deleteRouterAlias(input.alias)),
 
 		customCombos: publicProcedure.query(() => getRouterCustomCombos()),
+
+		providerNodes: publicProcedure
+			.input(z.object({ type: providerNodeTypeSchema.optional() }).optional())
+			.query(({ input }) => getRouterProviderNodes(input?.type)),
+
+		createProviderNode: publicProcedure
+			.input(
+				providerNodeInputSchema.extend({
+					baseUrl: z.string().min(1),
+					name: z.string().min(1),
+					prefix: z.string().min(1),
+				}),
+			)
+			.mutation(({ input }) => createRouterProviderNode(input)),
+
+		updateProviderNode: publicProcedure
+			.input(
+				providerNodeInputSchema.extend({
+					id: z.string().min(1),
+				}),
+			)
+			.mutation(({ input }) => {
+				const { id, ...updates } = input;
+				return updateRouterProviderNode(id, updates);
+			}),
+
+		deleteProviderNode: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.mutation(({ input }) => deleteRouterProviderNode(input.id)),
 
 		upsertCustomCombo: publicProcedure
 			.input(
