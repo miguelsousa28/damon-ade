@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	mkdirSync,
@@ -137,6 +138,17 @@ const CLI_TOOL_IDS = [
 ] as const;
 const CODEX_MANAGED_START = "# ADE 9router managed start";
 const CODEX_MANAGED_END = "# ADE 9router managed end";
+const TRANSLATOR_LOG_FILES = new Set([
+	"1_req_client.json",
+	"2_req_source.json",
+	"3_req_openai.json",
+	"4_req_target.json",
+	"5_res_provider.txt",
+	"6_res_openai.txt",
+	"7_res_client.txt",
+	"7_res_client.json",
+]);
+const MAX_TRANSLATOR_CONSOLE_LOGS = 1000;
 
 type CliToolId = (typeof CLI_TOOL_IDS)[number];
 type ConfigurableCliToolId = "claude" | "cline" | "codex";
@@ -146,6 +158,16 @@ let activePort = DEFAULT_AGENT_ROUTER_GATEWAY_PORT;
 let startedAt: string | null = null;
 let lastError: string | null = null;
 let requestCount = 0;
+let translatorConsolePatched = false;
+const translatorConsoleEmitter = new EventEmitter();
+const translatorConsoleLogs: string[] = [];
+const translatorConsoleOriginals: Partial<
+	Record<
+		"debug" | "error" | "info" | "log" | "warn",
+		(...args: unknown[]) => void
+	>
+> = {};
+translatorConsoleEmitter.setMaxListeners(50);
 
 type JsonObject = Record<string, unknown>;
 
@@ -876,6 +898,38 @@ function createAgentRouterGatewayApp() {
 	app.get("/api/usage/:connectionId", (req, res) => {
 		const result = getRouterConnectionUsage(req.params.connectionId);
 		res.status(result.status).json(result.body);
+	});
+	app.get("/api/translator/console-logs", (_req, res) => {
+		initTranslatorConsoleCapture();
+		res.json({ success: true, logs: translatorConsoleLogs });
+	});
+	app.delete("/api/translator/console-logs", (_req, res) => {
+		translatorConsoleLogs.splice(0, translatorConsoleLogs.length);
+		translatorConsoleEmitter.emit("clear");
+		res.json({ success: true });
+	});
+	app.get("/api/translator/console-logs/stream", streamTranslatorConsoleLogs);
+	app.get("/api/translator/load", (req, res) => {
+		const result = loadTranslatorLogFile(stringQuery(req.query.file));
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/translator/save", (req, res) => {
+		const result = saveTranslatorLogFile(
+			stringValue(req.body?.file),
+			req.body?.content,
+		);
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/translator/translate", (req, res) => {
+		const result = translateRouterDebugRequest(req.body);
+		res.status(result.status).json(result.body);
+	});
+	app.post("/api/translator/send", (_req, res) => {
+		res.status(501).json({
+			success: false,
+			error:
+				"ADE does not bundle the full 9router open-sse executor debugger yet; use the router /v1 endpoints for live provider calls.",
+		});
 	});
 	app.get("/api/pricing/defaults", (_req, res) => {
 		res.json(getRouterDefaultPricing());
@@ -6012,6 +6066,254 @@ function getRouterCodexResetCredits(
 				"ADE cannot consume Codex reset credits until the 9router Codex executor is vendored.",
 		},
 	};
+}
+
+function initTranslatorConsoleCapture(): void {
+	if (translatorConsolePatched) return;
+	for (const level of ["log", "info", "warn", "error", "debug"] as const) {
+		translatorConsoleOriginals[level] = console[level].bind(console) as (
+			...args: unknown[]
+		) => void;
+		console[level] = (...args: unknown[]) => {
+			appendTranslatorConsoleLine(formatTranslatorConsoleLine(args));
+			translatorConsoleOriginals[level]?.(...args);
+		};
+	}
+	translatorConsolePatched = true;
+}
+
+function appendTranslatorConsoleLine(line: string): void {
+	translatorConsoleLogs.push(line);
+	if (translatorConsoleLogs.length > MAX_TRANSLATOR_CONSOLE_LOGS) {
+		translatorConsoleLogs.splice(
+			0,
+			translatorConsoleLogs.length - MAX_TRANSLATOR_CONSOLE_LOGS,
+		);
+	}
+	translatorConsoleEmitter.emit("line", line);
+}
+
+function formatTranslatorConsoleLine(args: unknown[]): string {
+	return args.map(formatTranslatorConsoleArg).join(" ");
+}
+
+function formatTranslatorConsoleArg(value: unknown): string {
+	if (typeof value === "string") return stripAnsi(value);
+	if (value instanceof Error) {
+		return stripAnsi(value.stack || value.message || String(value));
+	}
+	try {
+		return stripAnsi(JSON.stringify(value));
+	} catch {
+		return stripAnsi(String(value));
+	}
+}
+
+function stripAnsi(value: string): string {
+	return value.replace(
+		new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"),
+		"",
+	);
+}
+
+function streamTranslatorConsoleLogs(req: Request, res: ExpressResponse): void {
+	initTranslatorConsoleCapture();
+	res.setHeader("Content-Type", "text/event-stream");
+	res.setHeader("Cache-Control", "no-cache");
+	res.setHeader("Connection", "keep-alive");
+	res.flushHeaders?.();
+
+	if (translatorConsoleLogs.length > 0) {
+		res.write(
+			`data: ${JSON.stringify({ type: "init", logs: translatorConsoleLogs })}\n\n`,
+		);
+	}
+	const sendLine = (line: string) => {
+		res.write(`data: ${JSON.stringify({ type: "line", line })}\n\n`);
+	};
+	const sendClear = () => {
+		res.write(`data: ${JSON.stringify({ type: "clear" })}\n\n`);
+	};
+	translatorConsoleEmitter.on("line", sendLine);
+	translatorConsoleEmitter.on("clear", sendClear);
+	const pingTimer = setInterval(() => {
+		res.write(": ping\n\n");
+	}, 25_000);
+	req.on("close", () => {
+		clearInterval(pingTimer);
+		translatorConsoleEmitter.off("line", sendLine);
+		translatorConsoleEmitter.off("clear", sendClear);
+		res.end();
+	});
+}
+
+function loadTranslatorLogFile(file: string | null | undefined): {
+	body: JsonObject;
+	status: number;
+} {
+	const valid = validateTranslatorLogFile(file);
+	if (!valid.ok) return valid;
+	const path = translatorLogFilePath(valid.file);
+	if (!existsSync(path)) {
+		return { status: 404, body: { success: false, error: "File not found" } };
+	}
+	return {
+		status: 200,
+		body: { success: true, content: readFileSync(path, "utf8") },
+	};
+}
+
+function saveTranslatorLogFile(
+	file: string | null | undefined,
+	content: unknown,
+): { body: JsonObject; status: number } {
+	const valid = validateTranslatorLogFile(file);
+	if (!valid.ok) return valid;
+	if (content === undefined) {
+		return {
+			status: 400,
+			body: { success: false, error: "File and content required" },
+		};
+	}
+	const dir = translatorLogDir();
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		translatorLogFilePath(valid.file),
+		typeof content === "string" ? content : JSON.stringify(content, null, 2),
+		"utf8",
+	);
+	return { status: 200, body: { success: true } };
+}
+
+function validateTranslatorLogFile(
+	file: string | null | undefined,
+):
+	| { file: string; ok: true }
+	| { body: JsonObject; ok: false; status: number } {
+	if (!file) {
+		return {
+			ok: false,
+			status: 400,
+			body: { success: false, error: "File parameter required" },
+		};
+	}
+	if (!TRANSLATOR_LOG_FILES.has(file)) {
+		return {
+			ok: false,
+			status: 400,
+			body: { success: false, error: "Invalid file name" },
+		};
+	}
+	return { file, ok: true };
+}
+
+function translatorLogDir(): string {
+	return join(electronApp.getPath("userData"), "router", "logs", "translator");
+}
+
+function translatorLogFilePath(file: string): string {
+	return join(translatorLogDir(), file);
+}
+
+function translateRouterDebugRequest(input: unknown): {
+	body: JsonObject;
+	status: number;
+} {
+	const request = toJsonObject(input);
+	const step = Number(request.step);
+	if (!Number.isFinite(step) || !request.body) {
+		return {
+			status: 400,
+			body: { success: false, error: "Step and body required" },
+		};
+	}
+	const body = toJsonObject(request.body);
+	const clientBody = toJsonObject(body.body ?? body);
+	if (step === 1) {
+		const requestedModel = stringValue(clientBody.model) ?? "";
+		const target = resolveRouterModelTarget(
+			requestedModel,
+			getResolutionOptions(),
+		);
+		const provider = target?.provider ?? inferProviderFromModel(requestedModel);
+		return {
+			status: 200,
+			body: {
+				success: true,
+				result: {
+					provider,
+					model: target?.model ?? requestedModel,
+					sourceFormat: detectTranslatorRequestFormat(clientBody),
+					targetFormat: translatorTargetFormat(provider),
+				},
+			},
+		};
+	}
+	if (step === 2) {
+		const sourceFormat = detectTranslatorRequestFormat(clientBody);
+		if (sourceFormat !== "openai") {
+			return {
+				status: 501,
+				body: {
+					success: false,
+					error:
+						"ADE translator debug currently supports OpenAI-source request inspection only.",
+				},
+			};
+		}
+		return {
+			status: 200,
+			body: { success: true, result: { body: clientBody } },
+		};
+	}
+	if (step === 3) {
+		const provider = stringValue(body.provider);
+		const model = stringValue(body.model);
+		if (!provider || !model) {
+			return {
+				status: 400,
+				body: { success: false, error: "provider and model required" },
+			};
+		}
+		const targetFormat = translatorTargetFormat(provider);
+		const stream = clientBody.stream !== false;
+		const translatedBody =
+			targetFormat === "anthropic"
+				? openAiChatToAnthropicBody(clientBody, model, { stream })
+				: withModel(clientBody, model);
+		return {
+			status: 200,
+			body: {
+				success: true,
+				result: {
+					url: null,
+					headers: {},
+					body: translatedBody,
+					targetFormat,
+					warning:
+						"ADE returned the translated request body; full executor URL/header debug requires vendoring 9router open-sse executors.",
+				},
+			},
+		};
+	}
+	return {
+		status: 400,
+		body: { success: false, error: "Invalid step (1-3)" },
+	};
+}
+
+function detectTranslatorRequestFormat(body: JsonObject): string {
+	if (Array.isArray(body.messages)) return "openai";
+	if (Array.isArray(body.contents)) return "gemini";
+	if (Array.isArray(body.input)) return "openai-responses";
+	return "openai";
+}
+
+function translatorTargetFormat(provider: string): string {
+	const normalized = provider.toLowerCase();
+	if (normalized === "anthropic" || normalized === "claude") return "anthropic";
+	if (normalized === "gemini") return "gemini";
+	return "openai";
 }
 
 function parseProviderNodeBody(value: unknown): Partial<RouterProviderNode> {
