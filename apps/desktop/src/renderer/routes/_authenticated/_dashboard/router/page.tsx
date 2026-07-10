@@ -479,7 +479,7 @@ function QuickStartTab({
 			keyProvider: "gemini",
 			label: "Google",
 			models: "Gemini 3.5 Flash",
-			note: "Research and large context",
+			note: "Research and large context. Sign-in is managed by Gemini CLI.",
 		},
 	];
 	const recommendedCombos = data.combos.filter((combo) =>
@@ -534,12 +534,26 @@ function QuickStartTab({
 								</p>
 								<button
 									type="button"
-									onClick={() => beginOAuth(provider.id)}
+									onClick={() => {
+										if (provider.id === "gemini") {
+											window.open(
+												"https://github.com/google-gemini/gemini-cli",
+												"_blank",
+												"noopener,noreferrer",
+											);
+											return;
+										}
+										beginOAuth(provider.id);
+									}}
 									disabled={isOAuthBusy}
 									className="mt-4 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium enabled:hover:bg-muted disabled:opacity-50"
 								>
 									<LuExternalLink className="size-3.5" />
-									{connected ? "Reconnect" : "Connect"}
+									{connected
+										? "Reconnect"
+										: provider.id === "gemini"
+											? "Set up Gemini CLI"
+											: "Connect"}
 								</button>
 							</div>
 						);
