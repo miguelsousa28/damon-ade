@@ -14,8 +14,11 @@ import {
 	updateRouterProviderAccount,
 } from "main/lib/agent-router-accounts";
 import {
+	beginRouterOAuthAuthorization,
+	completeRouterOAuthAuthorization,
 	discoverRouterProviderNodeModels,
 	getAgentRouterGatewayStatus,
+	getRouterSubscriptionStatuses,
 	refreshRouterProviderAccount,
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
@@ -124,6 +127,10 @@ export const createAgentRouterRouter = () => {
 
 		gatewayStatus: publicProcedure.query(() => getAgentRouterGatewayStatus()),
 
+		subscriptionStatuses: publicProcedure.query(() =>
+			getRouterSubscriptionStatuses(),
+		),
+
 		startGateway: publicProcedure.mutation(() => startAgentRouterGateway()),
 
 		stopGateway: publicProcedure.mutation(async () => {
@@ -139,6 +146,22 @@ export const createAgentRouterRouter = () => {
 		providerAccounts: publicProcedure
 			.input(z.object({ provider: providerKeySchema.optional() }).optional())
 			.query(({ input }) => listRouterProviderAccountViews(input?.provider)),
+
+		beginOAuth: publicProcedure
+			.input(z.object({ providerId: z.enum(["claude", "codex", "gemini"]) }))
+			.mutation(({ input }) => beginRouterOAuthAuthorization(input.providerId)),
+
+		completeOAuth: publicProcedure
+			.input(
+				z.object({
+					providerId: z.enum(["claude", "codex", "gemini"]),
+					rawCode: z.string().min(1),
+					codeVerifier: z.string().nullable().optional(),
+					redirectUri: z.string().url(),
+					expectedState: z.string().min(1),
+				}),
+			)
+			.mutation(({ input }) => completeRouterOAuthAuthorization(input)),
 
 		createProviderAccount: publicProcedure
 			.input(

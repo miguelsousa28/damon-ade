@@ -42,7 +42,7 @@ describe("buildAgentPromptCommand", () => {
 			agent: "orchestrator",
 		});
 
-		expect(command).toStartWith("codex --model gpt-5.5");
+		expect(command).toStartWith("claude --model claude-fable-5");
 		expect(command).toContain("You are ADE Orchestrator");
 		expect(command).toContain("Primary specialist");
 		expect(command).toContain("Smart Routing Plan");

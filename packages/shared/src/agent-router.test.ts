@@ -20,7 +20,7 @@ const task = {
 describe("agent-router", () => {
 	it("chooses fusion review for architecture work", () => {
 		const combo = chooseComboForIntent("architecture");
-		expect(combo.name).toBe("fusion-review");
+		expect(combo.name).toBe("fable-orchestrated");
 		expect(combo.strategy).toBe("fusion");
 		expect(combo.judge).toBe("claude");
 	});

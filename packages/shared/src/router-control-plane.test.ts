@@ -187,6 +187,21 @@ describe("router control plane", () => {
 		expect(info?.name).toBe("Local Embedder");
 	});
 
+	it("catalogues current frontier and image models with the correct kind", () => {
+		const all = buildOpenAIModelList();
+		const images = buildOpenAIModelList({ kindFilter: ["image"] });
+		const allIds = all.data.map((model) => model.id);
+		const imageIds = images.data.map((model) => model.id);
+
+		expect(allIds).toContain("anthropic/claude-fable-5");
+		expect(allIds).toContain("xai/grok-4.5");
+		expect(allIds).toContain("gemini-cli/gemini-3.5-flash");
+		expect(imageIds).toContain("openai/gpt-image-2");
+		expect(imageIds).toContain("xai/grok-imagine-image");
+		expect(imageIds).toContain("reve/reve-2.0");
+		expect(imageIds).not.toContain("openai/gpt-5.5");
+	});
+
 	it("exports Gemini-compatible model list entries", () => {
 		const list = buildGeminiModelList({
 			customModels: [

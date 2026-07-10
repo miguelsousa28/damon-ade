@@ -14,7 +14,7 @@ export type AgentBinary = "claude" | "codex" | "opencode" | "gemini" | "git";
  * command-parsing logic in AGENT_PRESET_COMMANDS.
  */
 export const RUNTIME_BINARY: Record<AgentType, AgentBinary> = {
-	orchestrator: "codex",
+	orchestrator: "claude",
 	claude: "claude",
 	codex: "codex",
 	gemini: "gemini",

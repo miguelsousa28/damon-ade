@@ -26,17 +26,16 @@ import {
 	LuActivity,
 	LuAudioLines,
 	LuBadgeCheck,
-	LuBrainCircuit,
+	LuChevronDown,
+	LuExternalLink,
 	LuGauge,
 	LuImage,
 	LuKeyRound,
 	LuNetwork,
-	LuPlugZap,
 	LuRoute,
 	LuSearch,
+	LuSettings2,
 	LuShieldAlert,
-	LuSparkles,
-	LuWorkflow,
 } from "react-icons/lu";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 
@@ -98,20 +97,39 @@ type ProviderNodeDiscoveryState = {
 	models: Array<{ id: string; name: string }>;
 } | null;
 
-const TABS: { id: TabId; label: string }[] = [
-	{ id: "overview", label: "Overview" },
-	{ id: "providers", label: "Providers" },
+const SIMPLE_TABS: { id: TabId; label: string }[] = [
+	{ id: "overview", label: "Start" },
+	{ id: "providers", label: "Accounts" },
+	{ id: "combos", label: "Agent teams" },
+	{ id: "usage", label: "Usage" },
+];
+
+const ADVANCED_TABS: { id: TabId; label: string }[] = [
 	{ id: "nodes", label: "Nodes" },
 	{ id: "models", label: "Models" },
 	{ id: "pricing", label: "Pricing" },
 	{ id: "proxies", label: "Proxies" },
-	{ id: "combos", label: "Combos" },
 	{ id: "endpoints", label: "Endpoints" },
 	{ id: "token-savers", label: "Token Saver" },
 	{ id: "fallback", label: "Fallback" },
-	{ id: "usage", label: "Usage" },
 	{ id: "aliases", label: "Aliases" },
 ];
+
+type OAuthProviderId = "claude" | "codex" | "gemini";
+type OAuthSession = {
+	providerId: OAuthProviderId;
+	providerLabel: string;
+	authUrl: string;
+	codeVerifier: string | null;
+	redirectUri: string;
+	state: string;
+	instructions: string;
+};
+type SubscriptionStatus = {
+	installed: boolean;
+	authenticated: boolean;
+	plan: string | null;
+};
 
 const SAMPLE_TOKEN_INPUT = [
 	"Sure, here is the build output:",
@@ -129,6 +147,10 @@ const SAMPLE_TOKEN_INPUT = [
 
 function RouterDashboardPage() {
 	const [activeTab, setActiveTab] = useState<TabId>("overview");
+	const [showAdvanced, setShowAdvanced] = useState(false);
+	const [oauthSession, setOAuthSession] = useState<OAuthSession | null>(null);
+	const [oauthCode, setOAuthCode] = useState("");
+	const [oauthError, setOAuthError] = useState<string | null>(null);
 	const utils = electronTrpc.useUtils();
 	const { data, isLoading, error } =
 		electronTrpc.agentRouter.dashboard.useQuery(undefined, {
@@ -140,6 +162,8 @@ function RouterDashboardPage() {
 			refetchInterval: 15_000,
 		},
 	);
+	const subscriptionStatuses =
+		electronTrpc.agentRouter.subscriptionStatuses.useQuery();
 	const invalidateRouter = () => {
 		utils.agentRouter.dashboard.invalidate();
 		utils.agentRouter.providerAccounts.invalidate();
@@ -178,6 +202,40 @@ function RouterDashboardPage() {
 		electronTrpc.agentRouter.deleteProviderAccount.useMutation({
 			onSuccess: invalidateRouter,
 		});
+	const beginOAuth = electronTrpc.agentRouter.beginOAuth.useMutation();
+	const completeOAuth = electronTrpc.agentRouter.completeOAuth.useMutation({
+		onSuccess: invalidateRouter,
+	});
+
+	const startOAuth = async (providerId: OAuthProviderId) => {
+		setOAuthError(null);
+		try {
+			const session = await beginOAuth.mutateAsync({ providerId });
+			setOAuthSession(session);
+			setOAuthCode("");
+			window.open(session.authUrl, "_blank", "noopener,noreferrer");
+		} catch (oauthStartError) {
+			setOAuthError(errorMessage(oauthStartError));
+		}
+	};
+
+	const finishOAuth = async () => {
+		if (!oauthSession || !oauthCode.trim()) return;
+		setOAuthError(null);
+		try {
+			await completeOAuth.mutateAsync({
+				providerId: oauthSession.providerId,
+				rawCode: oauthCode.trim(),
+				codeVerifier: oauthSession.codeVerifier,
+				redirectUri: oauthSession.redirectUri,
+				expectedState: oauthSession.state,
+			});
+			setOAuthSession(null);
+			setOAuthCode("");
+		} catch (oauthCompletionError) {
+			setOAuthError(errorMessage(oauthCompletionError));
+		}
+	};
 
 	if (isLoading) {
 		return (
@@ -201,19 +259,19 @@ function RouterDashboardPage() {
 
 	return (
 		<main className="flex-1 overflow-y-auto bg-background">
-			<div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-5">
+			<div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-6 py-5">
 				<header className="flex flex-wrap items-start justify-between gap-4">
 					<div className="min-w-0">
 						<div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 							<LuRoute className="size-4" />
-							9router native control plane
+							ADE smart router
 						</div>
 						<h1 className="mt-2 text-2xl font-semibold tracking-tight">
-							Orchestrator Router
+							AI team
 						</h1>
 						<p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-							Providers, combos, token savers, endpoints, and fallback policy
-							now live inside ADE. No localhost dashboard needed.
+							Connect your subscriptions once. Fable 5 coordinates the best
+							specialist for each job and falls back automatically.
 						</p>
 					</div>
 					<div className="flex min-w-72 flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-xs">
@@ -267,25 +325,63 @@ function RouterDashboardPage() {
 					</div>
 				</header>
 
-				<nav className="flex flex-wrap gap-2 border-b pb-3">
-					{TABS.map((tab) => (
-						<button
-							key={tab.id}
-							type="button"
-							onClick={() => setActiveTab(tab.id)}
+				<nav className="flex flex-wrap items-center gap-2 border-b pb-3">
+					{[...SIMPLE_TABS, ...(showAdvanced ? ADVANCED_TABS : [])].map(
+						(tab) => (
+							<button
+								key={tab.id}
+								type="button"
+								onClick={() => setActiveTab(tab.id)}
+								className={cn(
+									"rounded-md px-3 py-1.5 text-sm transition-colors",
+									activeTab === tab.id
+										? "bg-foreground text-background"
+										: "text-muted-foreground hover:bg-muted hover:text-foreground",
+								)}
+							>
+								{tab.label}
+							</button>
+						),
+					)}
+					<button
+						type="button"
+						onClick={() => {
+							setShowAdvanced((current) => !current);
+							if (
+								showAdvanced &&
+								ADVANCED_TABS.some((tab) => tab.id === activeTab)
+							) {
+								setActiveTab("overview");
+							}
+						}}
+						className="ml-auto inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+					>
+						<LuSettings2 className="size-4" />
+						Advanced
+						<LuChevronDown
 							className={cn(
-								"rounded-md px-3 py-1.5 text-sm transition-colors",
-								activeTab === tab.id
-									? "bg-foreground text-background"
-									: "text-muted-foreground hover:bg-muted hover:text-foreground",
+								"size-3.5 transition-transform",
+								showAdvanced && "rotate-180",
 							)}
-						>
-							{tab.label}
-						</button>
-					))}
+						/>
+					</button>
 				</nav>
 
-				{activeTab === "overview" && <OverviewTab data={data} />}
+				{activeTab === "overview" && (
+					<QuickStartTab
+						accounts={providerAccounts.data ?? []}
+						beginOAuth={startOAuth}
+						completeOAuth={finishOAuth}
+						data={data}
+						isOAuthBusy={beginOAuth.isPending || completeOAuth.isPending}
+						oauthCode={oauthCode}
+						oauthError={oauthError}
+						oauthSession={oauthSession}
+						openAccounts={() => setActiveTab("providers")}
+						setOAuthCode={setOAuthCode}
+						subscriptionStatuses={subscriptionStatuses.data}
+					/>
+				)}
 				{activeTab === "providers" && (
 					<ProvidersTab
 						data={data}
@@ -332,87 +428,219 @@ function RouterDashboardPage() {
 	);
 }
 
-function OverviewTab({ data }: { data: RouterDashboardSnapshot }) {
-	const activeProviders = data.providers.filter(
-		(provider) => provider.status === "native" || provider.keyConfigured,
+function QuickStartTab({
+	accounts,
+	beginOAuth,
+	completeOAuth,
+	data,
+	isOAuthBusy,
+	oauthCode,
+	oauthError,
+	oauthSession,
+	openAccounts,
+	setOAuthCode,
+	subscriptionStatuses,
+}: {
+	accounts: ProviderAccountView[];
+	beginOAuth: (providerId: OAuthProviderId) => Promise<void>;
+	completeOAuth: () => Promise<void>;
+	data: RouterDashboardSnapshot;
+	isOAuthBusy: boolean;
+	oauthCode: string;
+	oauthError: string | null;
+	oauthSession: OAuthSession | null;
+	openAccounts: () => void;
+	setOAuthCode: (value: string) => void;
+	subscriptionStatuses?: Record<OAuthProviderId, SubscriptionStatus>;
+}) {
+	const providers: Array<{
+		id: OAuthProviderId;
+		keyProvider: RouterProviderKeyId;
+		label: string;
+		models: string;
+		note: string;
+	}> = [
+		{
+			id: "claude",
+			keyProvider: "anthropic",
+			label: "Claude",
+			models: "Fable 5 + Sonnet 5",
+			note: "Coordinator and final judge",
+		},
+		{
+			id: "codex",
+			keyProvider: "openai",
+			label: "ChatGPT / Codex",
+			models: "GPT-5.5 + GPT-5.4 mini",
+			note: "Implementation and debugging",
+		},
+		{
+			id: "gemini",
+			keyProvider: "gemini",
+			label: "Google",
+			models: "Gemini 3.5 Flash",
+			note: "Research and large context",
+		},
+	];
+	const recommendedCombos = data.combos.filter((combo) =>
+		[
+			"fable-orchestrated",
+			"premium-coding",
+			"precision-debug",
+			"deep-research",
+		].includes(combo.name),
 	);
 
 	return (
-		<div className="flex flex-col gap-6">
-			<div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-				<StatCard
-					icon={LuPlugZap}
-					label="Providers"
-					value={data.stats.providers}
-				/>
-				<StatCard
-					icon={LuBrainCircuit}
-					label="Native agents"
-					value={data.stats.nativeAgents}
-				/>
-				<StatCard icon={LuWorkflow} label="Combos" value={data.stats.combos} />
-				<StatCard
-					icon={LuNetwork}
-					label="Endpoints"
-					value={data.stats.endpoints}
-				/>
-				<StatCard
-					icon={LuSparkles}
-					label="Token savers"
-					value={data.stats.tokenSavers}
-				/>
-				<StatCard
-					icon={LuShieldAlert}
-					label="Fallback rules"
-					value={data.stats.fallbackRules}
-				/>
-			</div>
-
-			<section className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-				<div className="rounded-lg border bg-card p-4">
-					<h2 className="text-sm font-semibold">Live routing features</h2>
-					<div className="mt-4 grid gap-3 md:grid-cols-2">
-						{data.features.map((feature) => (
-							<div
-								key={feature.id}
-								className="rounded-md border bg-background p-3"
-							>
-								<div className="flex items-center justify-between gap-2">
-									<span className="text-sm font-medium">{feature.label}</span>
-									<StatusBadge status={feature.status} />
+		<div className="grid gap-5">
+			<section>
+				<div className="mb-3 flex items-center gap-2">
+					<span className="flex size-6 items-center justify-center rounded bg-foreground text-xs font-semibold text-background">
+						1
+					</span>
+					<h2 className="text-sm font-semibold">Connect subscriptions</h2>
+				</div>
+				<div className="grid gap-3 md:grid-cols-3">
+					{providers.map((provider) => {
+						const nativeStatus = subscriptionStatuses?.[provider.id];
+						const connected =
+							nativeStatus?.authenticated === true ||
+							accounts.some(
+								(account) =>
+									account.provider === provider.keyProvider && account.isActive,
+							);
+						return (
+							<div key={provider.id} className="rounded-lg border bg-card p-4">
+								<div className="flex items-start justify-between gap-3">
+									<div>
+										<div className="text-sm font-semibold">
+											{provider.label}
+										</div>
+										<div className="mt-1 text-xs text-muted-foreground">
+											{provider.models}
+										</div>
+									</div>
+									{connected && (
+										<span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+											<LuBadgeCheck className="size-3.5" />
+											{nativeStatus?.plan
+												? `${nativeStatus.plan} connected`
+												: "Connected"}
+										</span>
+									)}
 								</div>
-								<p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-									{feature.description}
+								<p className="mt-3 text-xs text-muted-foreground">
+									{provider.note}
 								</p>
+								<button
+									type="button"
+									onClick={() => beginOAuth(provider.id)}
+									disabled={isOAuthBusy}
+									className="mt-4 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium enabled:hover:bg-muted disabled:opacity-50"
+								>
+									<LuExternalLink className="size-3.5" />
+									{connected ? "Reconnect" : "Connect"}
+								</button>
 							</div>
-						))}
-					</div>
+						);
+					})}
 				</div>
 
-				<div className="rounded-lg border bg-card p-4">
-					<h2 className="text-sm font-semibold">Active provider surface</h2>
-					<div className="mt-4 flex flex-col gap-3">
-						{activeProviders.slice(0, 8).map((provider) => (
-							<div
-								key={provider.id}
-								className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2"
+				{oauthSession && (
+					<div className="mt-3 rounded-lg border bg-card p-4">
+						<div className="text-sm font-semibold">
+							Finish {oauthSession.providerLabel} login
+						</div>
+						<p className="mt-1 text-xs text-muted-foreground">
+							{oauthSession.instructions}
+						</p>
+						<div className="mt-3 flex flex-col gap-2 sm:flex-row">
+							<input
+								value={oauthCode}
+								onChange={(event) => setOAuthCode(event.target.value)}
+								placeholder="Paste code or callback URL"
+								className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+							/>
+							<button
+								type="button"
+								onClick={completeOAuth}
+								disabled={isOAuthBusy || !oauthCode.trim()}
+								className="rounded-md bg-foreground px-4 py-2 text-sm text-background disabled:opacity-50"
 							>
-								<div className="min-w-0">
-									<div className="truncate text-sm font-medium">
-										{provider.label}
-									</div>
-									<div className="truncate text-xs text-muted-foreground">
-										{provider.defaultModels.join(", ")}
-									</div>
-								</div>
-								<TierBadge tier={provider.tier} />
-							</div>
-						))}
+								Finish login
+							</button>
+						</div>
 					</div>
+				)}
+				{oauthError && (
+					<div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+						{oauthError}
+					</div>
+				)}
+			</section>
+
+			<section>
+				<div className="mb-3 flex items-center gap-2">
+					<span className="flex size-6 items-center justify-center rounded bg-foreground text-xs font-semibold text-background">
+						2
+					</span>
+					<h2 className="text-sm font-semibold">Describe the job</h2>
+				</div>
+				<div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+					{recommendedCombos.map((combo) => (
+						<div key={combo.name} className="rounded-lg border bg-card p-4">
+							<div className="text-sm font-semibold">
+								{simpleComboLabel(combo.name)}
+							</div>
+							<p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+								{combo.description}
+							</p>
+							<div className="mt-3 flex flex-wrap gap-1.5">
+								{combo.agents.map((agent) => (
+									<Pill key={`${combo.name}-${agent}`}>{agent}</Pill>
+								))}
+							</div>
+						</div>
+					))}
+				</div>
+			</section>
+
+			<section className="rounded-lg border bg-card p-4">
+				<div className="flex flex-wrap items-center justify-between gap-4">
+					<div>
+						<div className="flex items-center gap-2">
+							<span className="flex size-6 items-center justify-center rounded bg-foreground text-xs font-semibold text-background">
+								3
+							</span>
+							<h2 className="text-sm font-semibold">
+								Use the Orchestrator agent
+							</h2>
+						</div>
+						<p className="mt-2 text-xs text-muted-foreground">
+							Create or open a task and choose Orchestrator. Fable 5 detects the
+							intent, loads matching skills, delegates, verifies, and falls back
+							automatically.
+						</p>
+					</div>
+					<button
+						type="button"
+						onClick={openAccounts}
+						className="rounded-md border px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+					>
+						Manage keys and accounts
+					</button>
 				</div>
 			</section>
 		</div>
 	);
+}
+
+function simpleComboLabel(name: string): string {
+	if (name === "fable-orchestrated") return "Complex project";
+	if (name === "premium-coding") return "Build a feature";
+	if (name === "precision-debug") return "Find and fix a bug";
+	if (name === "deep-research") return "Research and decide";
+	return name;
 }
 
 function ProvidersTab({
@@ -2779,15 +3007,6 @@ function TierBadge({ tier }: { tier: string }) {
 			)}
 		>
 			{tier}
-		</span>
-	);
-}
-
-function StatusBadge({ status }: { status: string }) {
-	return (
-		<span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-			<LuBadgeCheck className="size-3" />
-			{status}
 		</span>
 	);
 }

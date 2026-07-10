@@ -38,6 +38,8 @@ export const ROUTER_PROVIDER_KEY_IDS = [
 	"openai",
 	"anthropic",
 	"gemini",
+	"xai",
+	"reve",
 	"perplexity",
 	"brave-search",
 	"elevenlabs",
@@ -387,8 +389,9 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		status: "native",
 		auth: "built-in",
 		capabilities: ["coding", "architecture", "review"],
-		defaultModels: ["claude-code"],
-		notes: "Primary subscription runtime for careful design and review work.",
+		defaultModels: ["claude-fable-5", "claude-sonnet-5"],
+		notes:
+			"Fable 5 coordinates ambitious work; Sonnet 5 handles faster agentic execution.",
 	},
 	{
 		id: "codex-cli",
@@ -398,7 +401,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		status: "native",
 		auth: "built-in",
 		capabilities: ["coding", "debugging", "windows", "frontend"],
-		defaultModels: ["gpt-5.5-codex"],
+		defaultModels: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
 		notes: "Hands-on executor for repo edits, shell work, and verification.",
 	},
 	{
@@ -409,7 +412,12 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		status: "native",
 		auth: "built-in",
 		capabilities: ["large-context", "research", "review"],
-		defaultModels: ["gemini-cli"],
+		defaultModels: [
+			"gemini-3.5-flash",
+			"gemini-3.1-flash-lite",
+			"gemini-3.1-flash-image",
+			"gemini-3-pro-image",
+		],
 		notes: "Broad context scanner for large repositories and docs.",
 	},
 	{
@@ -470,7 +478,7 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		auth: "api-key",
 		keyProvider: "anthropic",
 		capabilities: ["chat", "messages", "tool-use", "vision"],
-		defaultModels: ["claude-sonnet-4.5", "claude-opus-4.5"],
+		defaultModels: ["claude-fable-5", "claude-sonnet-5", "claude-opus-4.8"],
 		notes: "Catalogued for the OpenAI/Anthropic translator layer.",
 	},
 	{
@@ -482,8 +490,47 @@ export const ROUTER_PROVIDER_CATALOG: RouterProviderCatalogItem[] = [
 		auth: "api-key",
 		keyProvider: "openai",
 		capabilities: ["responses", "chat", "images", "audio", "embeddings"],
-		defaultModels: ["gpt-5.2", "gpt-5.2-codex"],
+		defaultModels: [
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-pro",
+			"gpt-5.4-mini",
+			"gpt-5.4-nano",
+			"gpt-image-2",
+		],
 		notes: "Catalogued for Responses and Chat Completions compatibility.",
+	},
+	{
+		id: "xai",
+		label: "SpaceXAI / Grok",
+		tier: "subscription",
+		connection: "openai-compatible",
+		status: "key-ready",
+		auth: "api-key",
+		keyProvider: "xai",
+		capabilities: ["chat", "coding", "agents", "image-generation", "video"],
+		defaultModels: [
+			"grok-4.5",
+			"grok-build-0.1",
+			"grok-imagine-image",
+			"grok-imagine-image-quality",
+			"grok-imagine-video",
+		],
+		notes:
+			"Grok 4.5 for coding and agentic work; Imagine models for image and video.",
+	},
+	{
+		id: "reve",
+		label: "Reve",
+		tier: "media",
+		connection: "media",
+		status: "key-ready",
+		auth: "api-key",
+		keyProvider: "reve",
+		capabilities: ["image-generation", "image-editing", "remix", "upscale"],
+		defaultModels: ["reve-create", "reve-edit", "reve-remix", "reve-2.0"],
+		notes:
+			"Official Reve API surface. Reve 2.1 is not listed publicly, so ADE discovers newer IDs from the provider instead of inventing one.",
 	},
 	{
 		id: "ollama",
@@ -981,10 +1028,11 @@ export function buildOpenAIModelList({
 	}
 
 	for (const provider of ROUTER_PROVIDER_CATALOG) {
-		const kind = inferCatalogProviderModelKind(provider);
 		for (const model of provider.defaultModels) {
 			if (isRouterModelDisabled(disabledModels, provider.id, model)) continue;
-			add(`${provider.id}/${model}`, provider.id, { kind });
+			add(`${provider.id}/${model}`, provider.id, {
+				kind: inferCatalogModelKind(provider, model),
+			});
 		}
 	}
 
@@ -1110,21 +1158,32 @@ function routerModelKindMatches(
 	return kindFilter.includes(kind);
 }
 
-function inferCatalogProviderModelKind(
+function inferCatalogModelKind(
 	provider: RouterProviderCatalogItem,
+	model: string,
 ): RouterModelKind {
+	const normalizedModel = model.toLowerCase();
+	if (normalizedModel.includes("embedding")) return "embedding";
+	if (normalizedModel.includes("image")) return "image";
+	if (normalizedModel.includes("video")) return "video";
+	if (normalizedModel.includes("tts")) return "tts";
+	if (normalizedModel.includes("transcri") || normalizedModel.includes("stt")) {
+		return "stt";
+	}
+	if (provider.id === "reve") return "image";
 	if (provider.id === "brave-search") return "webSearch";
 	if (provider.id === "perplexity") return "webSearch";
-	if (provider.capabilities.includes("embeddings")) return "embedding";
 	if (
 		provider.capabilities.includes("tts") ||
-		provider.capabilities.includes("speech")
+		(provider.capabilities.includes("speech") &&
+			!provider.capabilities.includes("chat"))
 	) {
 		return "tts";
 	}
 	if (
-		provider.capabilities.includes("image-generation") ||
-		provider.capabilities.includes("image")
+		(provider.capabilities.includes("image-generation") ||
+			provider.capabilities.includes("image")) &&
+		!provider.capabilities.includes("chat")
 	) {
 		return "image";
 	}

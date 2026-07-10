@@ -21,8 +21,8 @@ describe("agent-binaries", () => {
 		expect(RUNTIME_BINARY.glm).toBe("claude");
 	});
 
-	it("runs the orchestrator through Codex", () => {
-		expect(RUNTIME_BINARY.orchestrator).toBe("codex");
+	it("runs the Fable orchestrator through Claude Code", () => {
+		expect(RUNTIME_BINARY.orchestrator).toBe("claude");
 	});
 
 	it("gives every checked binary a copy-pasteable command and URL", () => {

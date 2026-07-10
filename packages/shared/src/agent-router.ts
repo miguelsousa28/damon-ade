@@ -4,8 +4,13 @@ import type { AgentTaskIntent, SpecialistAgentType } from "./agent-routing";
 export type AgentRoutingTier = "subscription" | "cheap" | "free";
 export type AgentComboStrategy = "fallback" | "round-robin" | "fusion";
 export type AgentComboName =
+	| "fable-orchestrated"
 	| "premium-coding"
 	| "quality-first"
+	| "precision-debug"
+	| "frontend-studio"
+	| "deep-research"
+	| "fast-tasks"
 	| "budget-coding"
 	| "free-coding"
 	| "large-context"
@@ -88,18 +93,18 @@ export const AGENT_ROUTER_PROFILES: Record<
 	claude: {
 		agent: "claude",
 		tier: "subscription",
-		modelId: "claude-code",
-		provider: "Claude Code",
+		modelId: "claude-fable-5",
+		provider: "Claude Code / Fable 5",
 		quotaWindow: "rolling-5h",
 		quotaHint:
 			"Use paid subscription quota first; watch for rolling window exhaustion.",
 		pricing: null,
-		contextWindow: 200_000,
+		contextWindow: 1_000_000,
 	},
 	codex: {
 		agent: "codex",
 		tier: "subscription",
-		modelId: "gpt-5.5-codex",
+		modelId: "gpt-5.5",
 		provider: "Codex CLI",
 		quotaWindow: "rolling-5h",
 		quotaHint: "Use OpenAI subscription quota for implementation-heavy work.",
@@ -109,7 +114,7 @@ export const AGENT_ROUTER_PROFILES: Record<
 	gemini: {
 		agent: "gemini",
 		tier: "subscription",
-		modelId: "gemini-cli",
+		modelId: "gemini-3.5-flash",
 		provider: "Gemini CLI",
 		quotaWindow: "monthly",
 		quotaHint: "Good for broad context reads; track daily/monthly free quota.",
@@ -185,6 +190,14 @@ export const AGENT_TIER_ORDER: AgentRoutingTier[] = [
 ];
 
 export const AGENT_COMBOS: Record<AgentComboName, AgentCombo> = {
+	"fable-orchestrated": {
+		name: "fable-orchestrated",
+		description:
+			"Fable 5 coordinates the job, delegates execution, and judges the final result.",
+		strategy: "fusion",
+		agents: ["claude", "codex", "gemini"],
+		judge: "claude",
+	},
 	"premium-coding": {
 		name: "premium-coding",
 		description: "Subscription first, cheap backup, free emergency.",
@@ -196,6 +209,37 @@ export const AGENT_COMBOS: Record<AgentComboName, AgentCombo> = {
 		description: "Best quality agents first; no cheap model until needed.",
 		strategy: "fallback",
 		agents: ["claude", "codex", "gemini"],
+	},
+	"precision-debug": {
+		name: "precision-debug",
+		description:
+			"Codex reproduces and fixes, Claude reviews root cause, then Gemini checks broad regressions.",
+		strategy: "fusion",
+		agents: ["codex", "claude", "gemini"],
+		judge: "claude",
+	},
+	"frontend-studio": {
+		name: "frontend-studio",
+		description:
+			"Codex implements the interface while Claude and Cursor review design and interaction quality.",
+		strategy: "fusion",
+		agents: ["codex", "claude", "cursor-agent"],
+		judge: "claude",
+	},
+	"deep-research": {
+		name: "deep-research",
+		description:
+			"Gemini scans broad sources, Claude synthesizes, and Codex turns findings into working changes.",
+		strategy: "fusion",
+		agents: ["gemini", "claude", "codex"],
+		judge: "claude",
+	},
+	"fast-tasks": {
+		name: "fast-tasks",
+		description:
+			"Fast subscription agents first, then low-cost implementation fallbacks.",
+		strategy: "fallback",
+		agents: ["codex", "gemini", "glm", "minimax"],
 	},
 	"budget-coding": {
 		name: "budget-coding",
@@ -321,14 +365,17 @@ export function buildSmartRoutingPlan({
 export function chooseComboForIntent(intent: AgentTaskIntent): AgentCombo {
 	switch (intent) {
 		case "architecture":
-			return getCombo("fusion-review");
+			return getCombo("fable-orchestrated");
 		case "research":
+			return getCombo("deep-research");
 		case "large-context":
 			return getCombo("large-context");
 		case "debugging":
+			return getCombo("precision-debug");
 		case "windows":
-		case "frontend":
 			return getCombo("premium-coding");
+		case "frontend":
+			return getCombo("frontend-studio");
 		case "implementation":
 			return getCombo("premium-coding");
 	}

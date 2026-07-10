@@ -272,13 +272,13 @@ const OAUTH_REFRESH_CONFIGS: Record<
 		authorizeUrl: "https://claude.ai/oauth/authorize",
 		clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
 		codeChallengeMethod: "S256",
-		defaultRedirectUri: "http://localhost:8080/callback",
+		defaultRedirectUri: "https://console.anthropic.com/oauth/code/callback",
 		encoding: "json",
 		exchangeEncoding: "json",
 		keyProvider: "anthropic",
 		leadMs: 4 * 60 * 60 * 1000,
 		scopes: ["org:create_api_key", "user:profile", "user:inference"],
-		tokenUrl: "https://api.anthropic.com/v1/oauth/token",
+		tokenUrl: "https://console.anthropic.com/v1/oauth/token",
 	},
 	codex: {
 		id: "codex",
@@ -367,6 +367,157 @@ export interface RouterProviderNodeDiscoveryResult {
 	status?: number;
 	models: RouterDiscoveredProviderNodeModel[];
 	applied?: boolean;
+}
+
+export interface RouterOAuthAuthorizationSession {
+	providerId: "claude" | "codex" | "gemini";
+	providerLabel: string;
+	authUrl: string;
+	codeVerifier: string | null;
+	redirectUri: string;
+	state: string;
+	instructions: string;
+}
+
+export interface RouterOAuthCompletionResult {
+	success: true;
+	providerId: "claude" | "codex" | "gemini";
+}
+
+export interface RouterSubscriptionStatus {
+	installed: boolean;
+	authenticated: boolean;
+	plan: string | null;
+}
+
+export type RouterSubscriptionStatuses = Record<
+	"claude" | "codex" | "gemini",
+	RouterSubscriptionStatus
+>;
+
+export function getRouterSubscriptionStatuses(): RouterSubscriptionStatuses {
+	return {
+		claude: claudeSubscriptionStatus(),
+		codex: {
+			installed: commandExists("codex") || existsSync(codexConfigPath()),
+			authenticated: existsSync(codexAuthPath()),
+			plan: null,
+		},
+		gemini: {
+			installed: commandExists("gemini"),
+			authenticated: existsSync(join(homedir(), ".gemini", "oauth_creds.json")),
+			plan: null,
+		},
+	};
+}
+
+function claudeSubscriptionStatus(): RouterSubscriptionStatus {
+	const installed = commandExists("claude") || existsSync(claudeSettingsPath());
+	if (!installed) return { installed: false, authenticated: false, plan: null };
+	try {
+		const raw = execFileSync("claude", ["auth", "status"], {
+			encoding: "utf8",
+			timeout: 8_000,
+			windowsHide: true,
+		});
+		const status = toJsonObject(JSON.parse(raw));
+		return {
+			installed: true,
+			authenticated: status.loggedIn === true,
+			plan: stringValue(status.subscriptionType) ?? null,
+		};
+	} catch {
+		return { installed: true, authenticated: false, plan: null };
+	}
+}
+
+export function beginRouterOAuthAuthorization(
+	providerId: string,
+): RouterOAuthAuthorizationSession {
+	const result = buildOAuthAuthorizeResponse(providerId, {});
+	if (result.status >= 400) {
+		throw new Error(stringValue(result.body.error) ?? "Could not start OAuth");
+	}
+	const provider = jsonObjectValue(result.body.provider);
+	const resolvedProviderId = stringValue(provider.id);
+	if (
+		resolvedProviderId !== "claude" &&
+		resolvedProviderId !== "codex" &&
+		resolvedProviderId !== "gemini"
+	) {
+		throw new Error("OAuth provider is not supported");
+	}
+	return {
+		providerId: resolvedProviderId,
+		providerLabel: stringValue(provider.label) ?? resolvedProviderId,
+		authUrl: stringValue(result.body.authUrl) ?? "",
+		codeVerifier: stringValue(result.body.codeVerifier) ?? null,
+		redirectUri: stringValue(result.body.redirectUri) ?? "",
+		state: stringValue(result.body.state) ?? "",
+		instructions:
+			resolvedProviderId === "claude"
+				? "Sign in with your Claude subscription, then paste the code or complete callback URL shown by Anthropic."
+				: resolvedProviderId === "codex"
+					? "Sign in with ChatGPT, then paste the code or the localhost callback URL from the browser."
+					: "Sign in with Google, then paste the code or callback URL.",
+	};
+}
+
+export async function completeRouterOAuthAuthorization(input: {
+	providerId: string;
+	rawCode: string;
+	codeVerifier?: string | null;
+	redirectUri: string;
+	expectedState: string;
+}): Promise<RouterOAuthCompletionResult> {
+	const parsed = parseRouterOAuthCode(input.rawCode, input.expectedState);
+	if (parsed.state && parsed.state !== input.expectedState) {
+		throw new Error("OAuth state mismatch. Start the login again.");
+	}
+	const result = await exchangeOAuthCodeConnection(input.providerId, {
+		code: parsed.code,
+		codeVerifier: input.codeVerifier ?? undefined,
+		redirectUri: input.redirectUri,
+		state: parsed.state ?? input.expectedState,
+	});
+	if (result.status >= 400 || result.body.success === false) {
+		throw new Error(
+			stringValue(result.body.error) ?? "OAuth login could not be completed",
+		);
+	}
+	const provider = resolveOAuthProvider(input.providerId);
+	if (!provider) throw new Error("OAuth provider is not supported");
+	if (
+		provider.id !== "claude" &&
+		provider.id !== "codex" &&
+		provider.id !== "gemini"
+	) {
+		throw new Error("OAuth provider is not supported");
+	}
+	return { success: true, providerId: provider.id };
+}
+
+function parseRouterOAuthCode(
+	rawCode: string,
+	fallbackState: string,
+): { code: string; state: string | null } {
+	const trimmed = rawCode.trim();
+	if (!trimmed) throw new Error("Authorization code is required");
+	try {
+		const callback = new URL(trimmed);
+		const code = callback.searchParams.get("code")?.trim();
+		if (!code) throw new Error("Callback URL does not contain a code");
+		return {
+			code,
+			state: callback.searchParams.get("state")?.trim() || fallbackState,
+		};
+	} catch (error) {
+		if (error instanceof Error && error.message.includes("does not contain")) {
+			throw error;
+		}
+	}
+	const [code, state] = trimmed.split("#", 2);
+	return { code: code.trim(), state: state?.trim() || fallbackState };
 }
 
 interface GatewayFailure {
@@ -5157,6 +5308,20 @@ async function fetchProviderValidationProbe(
 			8_000,
 		);
 	}
+	if (provider === "xai") {
+		return fetchWithTimeout(
+			"https://api.x.ai/v1/models",
+			{ headers: { Authorization: `Bearer ${apiKey}` } },
+			8_000,
+		);
+	}
+	if (provider === "reve") {
+		return fetchWithTimeout(
+			"https://api.reve.com/v1/",
+			{ headers: { Authorization: `Bearer ${apiKey}` } },
+			8_000,
+		);
+	}
 	if (provider === "perplexity") {
 		return fetchWithTimeout(
 			PERPLEXITY_CHAT_COMPLETIONS_URL,
@@ -5203,7 +5368,11 @@ function isProviderValidationSuccess(
 	provider: RouterProviderKeyId,
 	response: globalThis.Response,
 ): boolean {
-	if (provider === "anthropic" || provider === "perplexity") {
+	if (
+		provider === "anthropic" ||
+		provider === "perplexity" ||
+		provider === "reve"
+	) {
 		return response.status !== 401 && response.status !== 403;
 	}
 	return response.ok;
@@ -5604,7 +5773,7 @@ function buildCodexToolStatus(): JsonObject {
 	const config = readTextOrNull(configPath);
 	return {
 		installed: commandExists("codex") || Boolean(config),
-		config,
+		config: redactSensitiveText(config),
 		has9Router:
 			Boolean(config?.includes('model_provider = "9router"')) ||
 			Boolean(config?.includes("[model_providers.9router]")),
@@ -5620,7 +5789,7 @@ function buildClaudeToolStatus(): JsonObject {
 		stringValue(toJsonObject(settings?.env).ANTHROPIC_BASE_URL) ?? "";
 	return {
 		installed: commandExists("claude") || Boolean(settings),
-		settings,
+		settings: redactSensitiveJson(settings),
 		has9Router:
 			baseUrl.includes("localhost") ||
 			baseUrl.includes("127.0.0.1") ||
@@ -5628,6 +5797,35 @@ function buildClaudeToolStatus(): JsonObject {
 			baseUrl.includes(getAgentRouterGatewayStatus().url),
 		settingsPath,
 	};
+}
+
+function redactSensitiveText(value: string | null): string | null {
+	if (!value) return value;
+	return value
+		.split(/\r?\n/)
+		.map((line) =>
+			/(?:api[_-]?key|token|secret|password|authorization|cookie)\s*=/i.test(
+				line,
+			)
+				? `${line.split("=", 1)[0]?.trim()} = "[REDACTED]"`
+				: line,
+		)
+		.join("\n");
+}
+
+function redactSensitiveJson(value: unknown): unknown {
+	if (value === null || value === undefined) return null;
+	if (Array.isArray(value))
+		return value.map((entry) => redactSensitiveJson(entry));
+	if (typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value).map(([key, entry]) => [
+			key,
+			/(?:api.?key|token|secret|password|authorization|cookie)/i.test(key)
+				? "[REDACTED]"
+				: redactSensitiveJson(entry),
+		]),
+	) as JsonObject;
 }
 
 function buildClineToolStatus(): JsonObject {

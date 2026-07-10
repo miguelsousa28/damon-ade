@@ -35,7 +35,7 @@ export const AGENT_LABELS: Record<AgentType, string> = {
 
 export const AGENT_PRESET_COMMANDS: Record<AgentType, string[]> = {
 	orchestrator: [
-		'codex --model gpt-5.5 -c model_reasoning_effort="high" --ask-for-approval never --sandbox danger-full-access',
+		"claude --model claude-fable-5 --dangerously-skip-permissions",
 	],
 	claude: ["claude --dangerously-skip-permissions"],
 	codex: [
@@ -58,7 +58,7 @@ export const AGENT_PRESET_COMMANDS: Record<AgentType, string[]> = {
 
 export const AGENT_PRESET_DESCRIPTIONS: Record<AgentType, string> = {
 	orchestrator:
-		"9router-style smart routing: tiers, combos, fallback, usage estimates, and token-cut",
+		"Claude Fable 5 coordinator: specialist routing, skills, fallback, usage estimates, and token-cut",
 	claude: "Danger mode: All permissions auto-approved",
 	codex: "Danger mode: All permissions auto-approved",
 	gemini: "Danger mode: All permissions auto-approved",
@@ -154,7 +154,7 @@ ${registry}
 3. Use combo mode exactly like 9router: fallback tries agents in order; fusion fans out to the panel and uses the judge to synthesize the final decision.
 4. Track rough input/output token usage while delegating. Prefer subscription/included agents first, cheap agents second, and free/local emergency agents last.
 5. Delegate only when it improves quality, speed, or coverage. Launch another CLI in a terminal when useful, then reconcile its output before editing.
-6. Prefer Codex for concrete edits and verification, Claude for architecture/review, Gemini for broad context, and Kimi/MiniMax/GLM for long or cost-sensitive context if credentials are available.
+6. You are Claude Fable 5, the coordinator and final judge. Prefer Codex for concrete edits and verification, Sonnet 5/Claude for fast agentic work and review, Gemini for broad context, and Kimi/MiniMax/GLM for long or cost-sensitive context if credentials are available.
 7. Before copying large diffs, logs, search results, or file dumps into another agent, compact them with token-cut style summaries: keep changed/error lines, cap repetitive output, and preserve filenames, line numbers, and commands.
 8. Finish with one coherent implementation and run the relevant validation.
 
@@ -184,7 +184,7 @@ const AGENT_COMMANDS: Record<
 		buildHeredoc(
 			prompt,
 			delimiter,
-			'codex --model gpt-5.5 -c model_reasoning_effort="high" --ask-for-approval never --sandbox danger-full-access --',
+			"claude --model claude-fable-5 --dangerously-skip-permissions",
 		),
 	claude: (prompt, delimiter) =>
 		buildHeredoc(prompt, delimiter, "claude --dangerously-skip-permissions"),
