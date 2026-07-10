@@ -48,5 +48,8 @@ describe("buildAgentPromptCommand", () => {
 		expect(command).toContain("Smart Routing Plan");
 		expect(command).toContain("Tiered Fallback");
 		expect(command).toContain("token-cut");
+		expect(command).toContain("Plan big, execute small");
+		expect(command).toContain("Worker Brief Contract");
+		expect(command).toContain("wait for every expected report");
 	});
 });

@@ -26,16 +26,22 @@ import {
 	LuActivity,
 	LuAudioLines,
 	LuBadgeCheck,
+	LuBookOpen,
+	LuCheck,
 	LuChevronDown,
+	LuCopy,
 	LuExternalLink,
 	LuGauge,
 	LuImage,
 	LuKeyRound,
+	LuListChecks,
 	LuNetwork,
+	LuPlay,
 	LuRoute,
 	LuSearch,
 	LuSettings2,
 	LuShieldAlert,
+	LuSparkles,
 } from "react-icons/lu";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 
@@ -45,6 +51,7 @@ export const Route = createFileRoute("/_authenticated/_dashboard/router/")({
 
 type TabId =
 	| "overview"
+	| "guide"
 	| "providers"
 	| "nodes"
 	| "models"
@@ -99,6 +106,7 @@ type ProviderNodeDiscoveryState = {
 
 const SIMPLE_TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Start" },
+	{ id: "guide", label: "Guia" },
 	{ id: "providers", label: "Accounts" },
 	{ id: "combos", label: "Agent teams" },
 	{ id: "usage", label: "Usage" },
@@ -382,6 +390,13 @@ function RouterDashboardPage() {
 						subscriptionStatuses={subscriptionStatuses.data}
 					/>
 				)}
+				{activeTab === "guide" && (
+					<GuideTab
+						openAccounts={() => setActiveTab("providers")}
+						openStart={() => setActiveTab("overview")}
+						openTeams={() => setActiveTab("combos")}
+					/>
+				)}
 				{activeTab === "providers" && (
 					<ProvidersTab
 						data={data}
@@ -655,6 +670,221 @@ function simpleComboLabel(name: string): string {
 	if (name === "precision-debug") return "Find and fix a bug";
 	if (name === "deep-research") return "Research and decide";
 	return name;
+}
+
+const GUIDE_PROMPTS = [
+	{
+		label: "Construir",
+		prompt:
+			"Implementa [funcionalidade] neste projeto. Mantém os padrões existentes, testa o fluxo completo e mostra-me o resultado final.",
+	},
+	{
+		label: "Corrigir",
+		prompt:
+			"Reproduz [problema], encontra a causa raiz, faz a correção mais pequena e segura, e executa testes de regressão.",
+	},
+	{
+		label: "Investigar",
+		prompt:
+			"Pesquisa [decisão ou tecnologia] em fontes oficiais, compara as opções e implementa a recomendação vencedora.",
+	},
+] as const;
+
+function GuideTab({
+	openAccounts,
+	openStart,
+	openTeams,
+}: {
+	openAccounts: () => void;
+	openStart: () => void;
+	openTeams: () => void;
+}) {
+	const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null);
+
+	const copyPrompt = async (label: string, prompt: string) => {
+		try {
+			await navigator.clipboard.writeText(prompt);
+			setCopiedPrompt(label);
+			window.setTimeout(() => setCopiedPrompt(null), 1600);
+		} catch {
+			setCopiedPrompt(null);
+		}
+	};
+
+	return (
+		<div className="grid gap-6">
+			<section className="rounded-lg border bg-foreground p-5 text-background">
+				<div className="flex flex-wrap items-start justify-between gap-5">
+					<div className="max-w-2xl">
+						<div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-background/70">
+							<LuBookOpen className="size-4" />
+							Guia rápido
+						</div>
+						<h2 className="mt-3 text-xl font-semibold">
+							A tua equipa de IA em 60 segundos
+						</h2>
+						<p className="mt-2 text-sm leading-relaxed text-background/75">
+							Pensa na ADE como um router para agentes: ligas as tuas
+							subscrições uma vez, descreves o resultado e o Coordinator
+							escolhe, delega e verifica por ti.
+						</p>
+					</div>
+					<button
+						type="button"
+						onClick={openStart}
+						className="inline-flex items-center gap-2 rounded-md bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-background/90"
+					>
+						<LuPlay className="size-4" />
+						Começar
+					</button>
+				</div>
+			</section>
+
+			<section>
+				<h2 className="text-sm font-semibold">O fluxo normal</h2>
+				<div className="mt-3 grid gap-3 md:grid-cols-3">
+					{[
+						{
+							icon: LuKeyRound,
+							number: "1",
+							title: "Liga as contas",
+							text: "Claude, Codex e Gemini. A ADE usa primeiro o que já está incluído nas tuas subscrições.",
+						},
+						{
+							icon: LuSparkles,
+							number: "2",
+							title: "Escolhe Orchestrator",
+							text: "Cria ou abre uma tarefa e seleciona Orchestrator. Não precisas escolher modelos manualmente.",
+						},
+						{
+							icon: LuCheck,
+							number: "3",
+							title: "Pede o resultado",
+							text: "Explica o objetivo e as restrições. O Coordinator planeia, distribui trabalho e valida no fim.",
+						},
+					].map(({ icon: Icon, number, text, title }) => (
+						<div key={number} className="rounded-lg border bg-card p-4">
+							<div className="flex items-center justify-between">
+								<span className="flex size-8 items-center justify-center rounded-md bg-muted">
+									<Icon className="size-4" />
+								</span>
+								<span className="text-xs font-semibold text-muted-foreground">
+									PASSO {number}
+								</span>
+							</div>
+							<h3 className="mt-4 text-sm font-semibold">{title}</h3>
+							<p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+								{text}
+							</p>
+						</div>
+					))}
+				</div>
+			</section>
+
+			<section className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+				<div>
+					<div className="flex items-center gap-2">
+						<LuCopy className="size-4 text-muted-foreground" />
+						<h2 className="text-sm font-semibold">Pedidos que funcionam bem</h2>
+					</div>
+					<div className="mt-3 grid gap-2">
+						{GUIDE_PROMPTS.map(({ label, prompt }) => (
+							<div
+								key={label}
+								className="flex items-start gap-3 rounded-lg border bg-card p-3"
+							>
+								<div className="min-w-0 flex-1">
+									<div className="text-xs font-semibold">{label}</div>
+									<p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+										{prompt}
+									</p>
+								</div>
+								<button
+									type="button"
+									onClick={() => copyPrompt(label, prompt)}
+									className="shrink-0 rounded-md border p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
+									title={`Copiar pedido: ${label}`}
+								>
+									{copiedPrompt === label ? (
+										<LuCheck className="size-3.5" />
+									) : (
+										<LuCopy className="size-3.5" />
+									)}
+								</button>
+							</div>
+						))}
+					</div>
+				</div>
+
+				<div className="rounded-lg border bg-card p-4">
+					<div className="flex items-center gap-2">
+						<LuListChecks className="size-4 text-muted-foreground" />
+						<h2 className="text-sm font-semibold">Boas práticas</h2>
+					</div>
+					<div className="mt-4 grid gap-3 text-xs text-muted-foreground">
+						<p>Diz qual é o resultado final, não apenas a ferramenta a usar.</p>
+						<p>
+							Inclui limites importantes: plataforma, prazo, ficheiros ou custo.
+						</p>
+						<p>Pede testes e verificação visual quando existe uma interface.</p>
+						<p>
+							Usa Advanced apenas para routing, APIs ou modelos personalizados.
+						</p>
+					</div>
+					<div className="mt-5 flex flex-wrap gap-2">
+						<button
+							type="button"
+							onClick={openAccounts}
+							className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted"
+						>
+							Ver contas
+						</button>
+						<button
+							type="button"
+							onClick={openTeams}
+							className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted"
+						>
+							Ver equipas
+						</button>
+					</div>
+				</div>
+			</section>
+
+			<section className="border-t pt-5">
+				<div className="flex items-center gap-2">
+					<LuNetwork className="size-4 text-muted-foreground" />
+					<h2 className="text-sm font-semibold">Como o Coordinator trabalha</h2>
+				</div>
+				<div className="mt-3 grid gap-2 md:grid-cols-[1fr_auto_1fr_auto_1fr] md:items-center">
+					<GuideStage
+						title="Planeia grande"
+						text="Fable 5 entende o objetivo, cria o plano e separa tarefas independentes."
+					/>
+					<span className="hidden text-muted-foreground md:block">&gt;</span>
+					<GuideStage
+						title="Executa pequeno"
+						text="Workers especializados recebem apenas um brief curto e trabalham em paralelo."
+					/>
+					<span className="hidden text-muted-foreground md:block">&gt;</span>
+					<GuideStage
+						title="Verifica tudo"
+						text="O Coordinator junta os resultados, resolve conflitos e executa os testes finais."
+					/>
+				</div>
+			</section>
+		</div>
+	);
+}
+
+function GuideStage({ text, title }: { text: string; title: string }) {
+	return (
+		<div className="rounded-lg border bg-muted/25 px-4 py-3">
+			<div className="text-xs font-semibold">{title}</div>
+			<p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+				{text}
+			</p>
+		</div>
+	);
 }
 
 function ProvidersTab({

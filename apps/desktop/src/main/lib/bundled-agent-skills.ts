@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const SOURCE = "https://github.com/davidondrej/skills";
+const ANTHROPIC_COORDINATOR_SOURCE =
+	"https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb";
 
 const BUNDLED_AGENT_SKILLS: Record<string, string> = {
 	"ade-orchestration": `---
@@ -143,6 +145,52 @@ Use before changing a production routing preference based only on launch claims.
 ## Verification
 Results include exact commands or request payloads, model versions, raw artifacts,
 and a routing recommendation tied to measured workload performance.
+`,
+	"plan-big-execute-small": `---
+name: plan-big-execute-small
+description: Plan with a strong coordinator, execute with small workers.
+version: 1.0.0
+metadata:
+  ade:
+    tags: [orchestration, delegation, cost, parallelism]
+    source: ${ANTHROPIC_COORDINATOR_SOURCE}
+---
+
+# Plan Big, Execute Small
+
+Use for complex work with a small amount of planning and judgment plus a large
+amount of reading, searching, checking, or mechanical execution. This is an ADE
+adaptation of Anthropic's MIT-licensed coordinator cookbook.
+
+## Roles
+- The frontier coordinator owns decomposition, worker selection, conflict
+  resolution, synthesis, and the final acceptance decision.
+- Workers own one bounded brief each. Their raw pages, logs, or broad file reads
+  stay in their own context; they return compact findings and evidence.
+
+## Procedure
+1. Inspect enough of the repository to define the global objective and acceptance
+   checks without pulling every raw artifact into the coordinator context.
+2. Split the work into independent, narrowly scoped briefs. Each brief states the
+   objective, minimum context, allowed scope, expected artifact, validation, and
+   stop condition.
+3. Select the cheapest capable worker for each brief. Reserve the strongest model
+   for ambiguous decisions, architecture, reconciliation, and final review.
+4. Run independent workers in parallel. Keep dependent work sequential.
+5. Wait for every expected worker report before concluding. Retry infrastructure
+   failures with a fresh fallback worker; do not treat an error as a finding.
+6. Reconcile reports against source files and tests. Resolve conflicts by evidence,
+   not majority vote.
+7. Produce one coherent result and run the end-to-end acceptance checks.
+
+## Worker Report
+Return only: outcome, evidence with file/line or source references, changed
+artifacts, validation performed, uncertainty, and recommended next action. Never
+paste an entire raw page, log, or repository scan into the coordinator context.
+
+## Verification
+The coordinator can account for every brief, every expected report arrived or was
+retried, conflicts were resolved explicitly, and the final acceptance checks pass.
 `,
 };
 

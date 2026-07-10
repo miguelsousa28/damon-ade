@@ -193,7 +193,7 @@ export const AGENT_COMBOS: Record<AgentComboName, AgentCombo> = {
 	"fable-orchestrated": {
 		name: "fable-orchestrated",
 		description:
-			"Fable 5 coordinates the job, delegates execution, and judges the final result.",
+			"Fable 5 plans globally, delegates small worker briefs, and judges the verified result.",
 		strategy: "fusion",
 		agents: ["claude", "codex", "gemini"],
 		judge: "claude",
