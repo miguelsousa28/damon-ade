@@ -116,6 +116,7 @@ import {
 
 export const DEFAULT_AGENT_ROUTER_GATEWAY_PORT = 20128;
 const GATEWAY_HOST = "127.0.0.1";
+const JSON_BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 const OPENROUTER_CHAT_COMPLETIONS_URL =
 	"https://openrouter.ai/api/v1/chat/completions";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -456,7 +457,7 @@ function createAgentRouterGatewayApp() {
 			}),
 	);
 
-	app.use(express.json({ limit: "50mb" }));
+	app.use(jsonRequestBodyParser);
 	app.use((req, _res, next) => {
 		requestCount++;
 		console.log(`[agent-router-gateway] ${req.method} ${req.path}`);
@@ -924,13 +925,7 @@ function createAgentRouterGatewayApp() {
 		const result = translateRouterDebugRequest(req.body);
 		res.status(result.status).json(result.body);
 	});
-	app.post("/api/translator/send", (_req, res) => {
-		res.status(501).json({
-			success: false,
-			error:
-				"ADE does not bundle the full 9router open-sse executor debugger yet; use the router /v1 endpoints for live provider calls.",
-		});
-	});
+	app.post("/api/translator/send", sendTranslatorDebugRequest);
 	app.get("/api/pricing/defaults", (_req, res) => {
 		res.json(getRouterDefaultPricing());
 	});
@@ -1567,6 +1562,74 @@ function createAgentRouterGatewayApp() {
 	app.use(errorHandler);
 
 	return app;
+}
+
+function jsonRequestBodyParser(
+	req: Request,
+	res: ExpressResponse,
+	next: (error?: unknown) => void,
+) {
+	if (req.body !== undefined || !requestMayHaveBody(req.method)) {
+		next();
+		return;
+	}
+
+	if (!isJsonContentType(req.headers["content-type"])) {
+		next();
+		return;
+	}
+
+	let totalBytes = 0;
+	let responded = false;
+	const chunks: Buffer[] = [];
+	req.on("data", (chunk: Buffer | string) => {
+		if (responded) return;
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		totalBytes += buffer.byteLength;
+		if (totalBytes > JSON_BODY_LIMIT_BYTES) {
+			responded = true;
+			res.status(413).json({
+				error: {
+					message: "JSON body exceeds 50mb limit",
+					type: "request_too_large",
+				},
+			});
+			return;
+		}
+		chunks.push(buffer);
+	});
+	req.on("end", () => {
+		if (responded) return;
+		const raw = Buffer.concat(chunks).toString("utf8").trim();
+		if (!raw) {
+			req.body = {};
+			next();
+			return;
+		}
+		try {
+			req.body = JSON.parse(raw);
+			next();
+		} catch {
+			res.status(400).json({
+				error: {
+					message: "Invalid JSON request body",
+					type: "invalid_request_error",
+				},
+			});
+		}
+	});
+	req.on("error", next);
+}
+
+function requestMayHaveBody(method: string): boolean {
+	return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+}
+
+function isJsonContentType(value: string | string[] | undefined): boolean {
+	const contentType = Array.isArray(value) ? value[0] : value;
+	if (!contentType) return false;
+	const mime = contentType.split(";")[0]?.trim().toLowerCase();
+	return mime === "application/json" || Boolean(mime?.endsWith("+json"));
 }
 
 async function handleChatCompletions(req: Request, res: ExpressResponse) {
@@ -6300,6 +6363,54 @@ function translateRouterDebugRequest(input: unknown): {
 		status: 400,
 		body: { success: false, error: "Invalid step (1-3)" },
 	};
+}
+
+async function sendTranslatorDebugRequest(
+	req: Request,
+	res: ExpressResponse,
+): Promise<void> {
+	const body = toJsonObject(req.body);
+	const provider = stringValue(body.provider);
+	const model = stringValue(body.model);
+	const requestBody = toJsonObject(body.body);
+	if (!provider || !model || !body.body) {
+		res.status(400).json({
+			success: false,
+			error: "provider, model, and body required",
+		});
+		return;
+	}
+
+	appendTranslatorConsoleLine(
+		`[Translator] Sending ${provider}/${model} through ADE router gateway`,
+	);
+	const dispatchBody = withModel(requestBody, model);
+	const originalBody = req.body;
+	try {
+		req.body = dispatchBody;
+		const targetFormat = translatorTargetFormat(provider);
+		if (targetFormat === "anthropic") {
+			await handleAnthropicMessages(req, res);
+			return;
+		}
+		if (
+			Array.isArray(dispatchBody.input) &&
+			!Array.isArray(dispatchBody.messages)
+		) {
+			await handleResponses(req, res);
+			return;
+		}
+		await handleChatCompletions(req, res);
+	} catch (error) {
+		if (!res.headersSent) {
+			res.status(500).json({
+				success: false,
+				error: errorMessage(error),
+			});
+		}
+	} finally {
+		req.body = originalBody;
+	}
 }
 
 function detectTranslatorRequestFormat(body: JsonObject): string {
