@@ -51,6 +51,7 @@ export const Route = createFileRoute("/_authenticated/_dashboard/router/")({
 
 type TabId =
 	| "overview"
+	| "coordinator"
 	| "guide"
 	| "providers"
 	| "nodes"
@@ -106,6 +107,7 @@ type ProviderNodeDiscoveryState = {
 
 const SIMPLE_TABS: { id: TabId; label: string }[] = [
 	{ id: "overview", label: "Start" },
+	{ id: "coordinator", label: "Coordinator" },
 	{ id: "guide", label: "Guia" },
 	{ id: "providers", label: "Accounts" },
 	{ id: "combos", label: "Agent teams" },
@@ -390,6 +392,7 @@ function RouterDashboardPage() {
 						subscriptionStatuses={subscriptionStatuses.data}
 					/>
 				)}
+				{activeTab === "coordinator" && <CoordinatorTab />}
 				{activeTab === "guide" && (
 					<GuideTab
 						openAccounts={() => setActiveTab("providers")}
@@ -670,6 +673,174 @@ function simpleComboLabel(name: string): string {
 	if (name === "precision-debug") return "Find and fix a bug";
 	if (name === "deep-research") return "Research and decide";
 	return name;
+}
+
+function CoordinatorTab() {
+	const [objective, setObjective] = useState("");
+	const utils = electronTrpc.useUtils();
+	const runs = electronTrpc.agentRouter.coordinatorRuns.useQuery(undefined, {
+		refetchInterval: 1000,
+	});
+	const startRun = electronTrpc.agentRouter.startCoordinatorRun.useMutation({
+		onSuccess: () => {
+			setObjective("");
+			utils.agentRouter.coordinatorRuns.invalidate();
+		},
+	});
+	const cancelRun = electronTrpc.agentRouter.cancelCoordinatorRun.useMutation({
+		onSuccess: () => utils.agentRouter.coordinatorRuns.invalidate(),
+	});
+	const removeRun = electronTrpc.agentRouter.removeCoordinatorRun.useMutation({
+		onSuccess: () => utils.agentRouter.coordinatorRuns.invalidate(),
+	});
+	const sortedRuns = [...(runs.data ?? [])].sort(
+		(a, b) => b.createdAt - a.createdAt,
+	);
+
+	const submit = () => {
+		const task = objective.trim();
+		if (!task) return;
+		startRun.mutate({
+			objective: task,
+			metadata: { synthesisModel: "claude-fable-5" },
+			briefs: [
+				{
+					id: "solution",
+					role: "implementation specialist",
+					objective: `Create the strongest concrete solution for: ${task}`,
+					metadata: { model: "claude-sonnet-5" },
+				},
+				{
+					id: "review",
+					role: "critical reviewer",
+					objective: `Find correctness, security, UX, and regression risks for: ${task}`,
+					metadata: { model: "claude-sonnet-5" },
+				},
+				{
+					id: "verification",
+					role: "verification specialist",
+					objective: `Define decisive evidence and end-to-end validation for: ${task}`,
+					metadata: { model: "claude-sonnet-5" },
+				},
+			],
+		});
+	};
+
+	return (
+		<div className="grid gap-5">
+			<section className="rounded-lg border bg-card p-4">
+				<div className="flex items-start gap-3">
+					<span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-foreground text-background">
+						<LuNetwork className="size-4" />
+					</span>
+					<div>
+						<h2 className="text-sm font-semibold">Run a specialist team</h2>
+						<p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+							Three Sonnet 5 workers execute focused briefs in parallel. Fable 5
+							waits for every report, resolves conflicts, and produces the final
+							answer. Your Claude subscription is used first.
+						</p>
+					</div>
+				</div>
+				<textarea
+					value={objective}
+					onChange={(event) => setObjective(event.target.value)}
+					placeholder="Describe the outcome, constraints, and how success should be verified..."
+					className="mt-4 min-h-28 w-full resize-y rounded-md border bg-background p-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<div className="mt-3 flex items-center justify-between gap-3">
+					<span className="text-xs text-muted-foreground">
+						Plan big, execute small, verify once.
+					</span>
+					<button
+						type="button"
+						onClick={submit}
+						disabled={!objective.trim() || startRun.isPending}
+						className="inline-flex items-center gap-2 rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background disabled:opacity-50"
+					>
+						<LuPlay className="size-4" />
+						{startRun.isPending ? "Starting..." : "Start team"}
+					</button>
+				</div>
+				{startRun.error && (
+					<p className="mt-3 text-xs text-destructive">
+						{errorMessage(startRun.error)}
+					</p>
+				)}
+			</section>
+
+			<section>
+				<div className="mb-3 flex items-center justify-between">
+					<h2 className="text-sm font-semibold">Team runs</h2>
+					<span className="text-xs text-muted-foreground">
+						{sortedRuns.length} total
+					</span>
+				</div>
+				{sortedRuns.length === 0 ? (
+					<div className="rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
+						No coordinator runs yet.
+					</div>
+				) : (
+					<div className="grid gap-3">
+						{sortedRuns.map((run) => {
+							const terminal = ["completed", "failed", "cancelled"].includes(
+								run.status,
+							);
+							return (
+								<div key={run.id} className="rounded-lg border bg-card p-4">
+									<div className="flex flex-wrap items-start justify-between gap-3">
+										<div className="min-w-0">
+											<div className="flex items-center gap-2">
+												<h3 className="text-sm font-semibold">
+													{run.objective}
+												</h3>
+												<Pill>{run.status}</Pill>
+											</div>
+											<p className="mt-1 text-xs text-muted-foreground">
+												{run.usage.total.totalTokens.toLocaleString()} tokens
+												across the team
+											</p>
+										</div>
+										<button
+											type="button"
+											onClick={() =>
+												terminal
+													? removeRun.mutate({ id: run.id })
+													: cancelRun.mutate({ id: run.id })
+											}
+											className="rounded-md border px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+										>
+											{terminal ? "Remove" : "Cancel"}
+										</button>
+									</div>
+									<div className="mt-3 flex flex-wrap gap-2">
+										{run.workers.map((worker) => (
+											<span
+												key={worker.brief.id}
+												className="rounded-md border bg-background px-2.5 py-1 text-xs"
+											>
+												{worker.brief.id}: {worker.status}
+											</span>
+										))}
+									</div>
+									{run.output?.text && (
+										<div className="mt-4 whitespace-pre-wrap rounded-md bg-muted/35 p-3 text-xs leading-relaxed">
+											{run.output.text}
+										</div>
+									)}
+									{run.error?.message && (
+										<p className="mt-3 text-xs text-destructive">
+											{run.error.message}
+										</p>
+									)}
+								</div>
+							);
+						})}
+					</div>
+				)}
+			</section>
+		</div>
+	);
 }
 
 const GUIDE_PROMPTS = [
@@ -2697,6 +2868,12 @@ function EndpointsTab({ data }: { data: RouterDashboardSnapshot }) {
 function TokenSaversTab({ data }: { data: RouterDashboardSnapshot }) {
 	const [mode, setMode] = useState<RouterTokenSaverMode>("rtk");
 	const [input, setInput] = useState(SAMPLE_TOKEN_INPUT);
+	const utils = electronTrpc.useUtils();
+	const settings = electronTrpc.agentRouter.tokenSaverSettings.useQuery();
+	const updateSettings =
+		electronTrpc.agentRouter.updateTokenSaverSettings.useMutation({
+			onSuccess: () => utils.agentRouter.tokenSaverSettings.invalidate(),
+		});
 	const preview = useMemo(
 		() => previewRouterTokenSaver({ text: input, mode }),
 		[input, mode],
@@ -2711,7 +2888,110 @@ function TokenSaversTab({ data }: { data: RouterDashboardSnapshot }) {
 	return (
 		<section className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
 			<div className="rounded-lg border bg-card p-4">
-				<h2 className="text-sm font-semibold">Token saver modes</h2>
+				<div className="flex items-center justify-between gap-3">
+					<div>
+						<h2 className="text-sm font-semibold">Live token savers</h2>
+						<p className="mt-1 text-xs text-muted-foreground">
+							Applied automatically before provider routing.
+						</p>
+					</div>
+					{updateSettings.isPending && (
+						<span className="text-xs text-muted-foreground">Saving...</span>
+					)}
+				</div>
+				<div className="mt-4 grid gap-2">
+					{[
+						{
+							key: "rtkEnabled",
+							label: "RTK",
+							note: "Compress tool output",
+						},
+						{
+							key: "headroomEnabled",
+							label: "Headroom",
+							note: "Use local compression proxy",
+						},
+						{
+							key: "cavemanEnabled",
+							label: "Caveman",
+							note: "Terse technical answers",
+						},
+						{
+							key: "ponytailEnabled",
+							label: "Ponytail",
+							note: "Minimal YAGNI-first changes",
+						},
+					].map((item) => {
+						const enabled = Boolean(
+							settings.data?.[
+								item.key as
+									| "rtkEnabled"
+									| "headroomEnabled"
+									| "cavemanEnabled"
+									| "ponytailEnabled"
+							],
+						);
+						return (
+							<label
+								key={item.key}
+								className="flex cursor-pointer items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5"
+							>
+								<span>
+									<span className="block text-xs font-medium">
+										{item.label}
+									</span>
+									<span className="mt-0.5 block text-[11px] text-muted-foreground">
+										{item.note}
+									</span>
+								</span>
+								<input
+									type="checkbox"
+									checked={enabled}
+									onChange={(event) =>
+										updateSettings.mutate({
+											[item.key]: event.target.checked,
+										})
+									}
+									className="size-4 accent-foreground"
+								/>
+							</label>
+						);
+					})}
+				</div>
+
+				{settings.data?.headroomEnabled && (
+					<div className="mt-3 grid gap-2">
+						<label className="grid gap-1 text-xs font-medium">
+							Headroom URL
+							<input
+								defaultValue={settings.data.headroomUrl}
+								onBlur={(event) => {
+									if (event.target.value !== settings.data?.headroomUrl) {
+										updateSettings.mutate({ headroomUrl: event.target.value });
+									}
+								}}
+								className="rounded-md border bg-background px-3 py-2 font-mono text-xs"
+							/>
+						</label>
+						<label className="flex items-center gap-2 text-xs text-muted-foreground">
+							<input
+								type="checkbox"
+								checked={settings.data.headroomCompressUserMessages}
+								onChange={(event) =>
+									updateSettings.mutate({
+										headroomCompressUserMessages: event.target.checked,
+									})
+								}
+								className="size-4 accent-foreground"
+							/>
+							Also compress user messages
+						</label>
+					</div>
+				)}
+
+				<h3 className="mt-6 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+					Preview mode
+				</h3>
 				<div className="mt-4 flex flex-col gap-2">
 					{data.tokenSavers.map((tokenSaver) => (
 						<button

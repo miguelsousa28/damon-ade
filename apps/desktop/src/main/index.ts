@@ -186,8 +186,9 @@ app.on("before-quit", async (event) => {
 	}
 
 	isQuitting = true;
+	event.preventDefault();
 	disposeTray();
-	void stopAgentRouterGateway();
+	await stopAgentRouterGateway();
 	app.exit(0);
 });
 

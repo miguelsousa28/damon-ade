@@ -15,11 +15,17 @@ import {
 } from "main/lib/agent-router-accounts";
 import {
 	beginRouterOAuthAuthorization,
+	cancelAgentCoordinatorRun,
 	completeRouterOAuthAuthorization,
 	discoverRouterProviderNodeModels,
+	getAgentCoordinatorEvents,
+	getAgentCoordinatorRun,
 	getAgentRouterGatewayStatus,
 	getRouterSubscriptionStatuses,
+	listAgentCoordinatorRuns,
 	refreshRouterProviderAccount,
+	removeAgentCoordinatorRun,
+	startAgentCoordinatorRun,
 	startAgentRouterGateway,
 	stopAgentRouterGateway,
 	testRouterModel,
@@ -47,11 +53,13 @@ import {
 	getRouterProviderNodes,
 	getRouterProxyPoolById,
 	getRouterProxyPools,
+	getRouterSettings,
 	getRouterUsageStats,
 	resetRouterPricing,
 	updateRouterPricing,
 	updateRouterProviderNode,
 	updateRouterProxyPool,
+	updateRouterSettings,
 	upsertRouterAlias,
 	upsertRouterCustomCombo,
 	upsertRouterCustomModel,
@@ -115,6 +123,19 @@ const proxyPoolInputSchema = z.object({
 const proxyPoolUpdateSchema = proxyPoolInputSchema.partial().extend({
 	id: z.string().min(1),
 });
+const coordinatorBriefSchema = z.object({
+	id: z.string().min(1),
+	objective: z.string().min(1),
+	role: z.string().optional(),
+	context: z.unknown().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+});
+const coordinatorRunSchema = z.object({
+	id: z.string().min(1).optional(),
+	objective: z.string().min(1),
+	briefs: z.array(coordinatorBriefSchema).max(16),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+});
 
 export const createAgentRouterRouter = () => {
 	return router({
@@ -126,6 +147,39 @@ export const createAgentRouterRouter = () => {
 		),
 
 		gatewayStatus: publicProcedure.query(() => getAgentRouterGatewayStatus()),
+
+		coordinatorRuns: publicProcedure.query(() => listAgentCoordinatorRuns()),
+
+		coordinatorRun: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.query(({ input }) => getAgentCoordinatorRun(input.id) ?? null),
+
+		coordinatorEvents: publicProcedure
+			.input(
+				z.object({
+					id: z.string().min(1),
+					afterSequence: z.number().int().min(0).default(0),
+				}),
+			)
+			.query(({ input }) =>
+				getAgentCoordinatorEvents(input.id, input.afterSequence),
+			),
+
+		startCoordinatorRun: publicProcedure
+			.input(coordinatorRunSchema)
+			.mutation(({ input }) => startAgentCoordinatorRun(input)),
+
+		cancelCoordinatorRun: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.mutation(({ input }) => ({
+				cancelled: cancelAgentCoordinatorRun(input.id),
+			})),
+
+		removeCoordinatorRun: publicProcedure
+			.input(z.object({ id: z.string().min(1) }))
+			.mutation(({ input }) => ({
+				removed: removeAgentCoordinatorRun(input.id),
+			})),
 
 		subscriptionStatuses: publicProcedure.query(() =>
 			getRouterSubscriptionStatuses(),
@@ -418,6 +472,23 @@ export const createAgentRouterRouter = () => {
 					mode: input.mode,
 				}),
 			),
+
+		tokenSaverSettings: publicProcedure.query(() => getRouterSettings()),
+
+		updateTokenSaverSettings: publicProcedure
+			.input(
+				z.object({
+					rtkEnabled: z.boolean().optional(),
+					headroomEnabled: z.boolean().optional(),
+					headroomCompressUserMessages: z.boolean().optional(),
+					headroomUrl: z.string().url().optional(),
+					cavemanEnabled: z.boolean().optional(),
+					cavemanLevel: z.enum(["lite", "full", "ultra"]).optional(),
+					ponytailEnabled: z.boolean().optional(),
+					ponytailLevel: z.enum(["lite", "full", "ultra"]).optional(),
+				}),
+			)
+			.mutation(({ input }) => updateRouterSettings(input)),
 
 		classifyFallback: publicProcedure
 			.input(

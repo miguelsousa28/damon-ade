@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -48,6 +48,19 @@ import express, {
 	type Request,
 } from "express";
 import {
+	AgentCoordinatorRuntime,
+	AgentInfrastructureError,
+	AgentRunCancelledError,
+	type AgentWorkerBrief,
+	type StartAgentRunInput,
+} from "./agent-coordinator-runtime";
+import {
+	type AgentProviderProtocolHint,
+	type NormalizedProviderEvent,
+	ProviderStreamNormalizer,
+	takeAccumulatedArgumentsDelta,
+} from "./agent-provider-executors";
+import {
 	createRouterProviderAccount,
 	deleteRouterProviderAccount,
 	getProviderAccountCredentialById,
@@ -59,6 +72,10 @@ import {
 	type RouterProviderCredential,
 	updateRouterProviderAccount,
 } from "./agent-router-accounts";
+import {
+	createDefaultAgentRouterServiceRegistry,
+	PRIVILEGED_OPERATION_CONTRACT,
+} from "./agent-router-services";
 import {
 	clearRouterUsage,
 	createRouterApiKey,
@@ -113,6 +130,7 @@ import {
 	upsertRouterCustomCombo,
 	upsertRouterCustomModel,
 } from "./agent-router-store";
+import { applyRouterTokenSaversToRequest } from "./agent-router-token-saver";
 
 export const DEFAULT_AGENT_ROUTER_GATEWAY_PORT = 20128;
 const GATEWAY_HOST = "127.0.0.1";
@@ -336,6 +354,23 @@ const elevenLabsVoicesCache = new Map<
 	{ time: number; voices: JsonObject[] }
 >();
 
+export interface RouterCoordinatorWorkerOutput {
+	briefId: string;
+	model: string;
+	text: string;
+}
+
+export interface RouterCoordinatorFinalOutput {
+	model: string;
+	text: string;
+}
+
+let coordinatorRuntime: AgentCoordinatorRuntime<
+	RouterCoordinatorWorkerOutput,
+	RouterCoordinatorFinalOutput
+> | null = null;
+const routerServiceRegistry = createDefaultAgentRouterServiceRegistry();
+
 export interface RouterDiscoveredProviderNodeModel {
 	id: string;
 	name: string;
@@ -558,6 +593,7 @@ export async function stopAgentRouterGateway(): Promise<void> {
 	const currentServer = server;
 	server = null;
 	startedAt = null;
+	await routerServiceRegistry.stopAll();
 
 	if (!currentServer?.listening) return;
 
@@ -580,17 +616,50 @@ export function getAgentRouterGatewayStatus(): RouterGatewayStatus {
 	};
 }
 
+export function startAgentCoordinatorRun(input: StartAgentRunInput) {
+	return getAgentCoordinatorRuntime().startRun(input);
+}
+
+export function listAgentCoordinatorRuns() {
+	return getAgentCoordinatorRuntime().listRuns();
+}
+
+export function getAgentCoordinatorRun(runId: string) {
+	return getAgentCoordinatorRuntime().getRun(runId);
+}
+
+export function getAgentCoordinatorEvents(runId: string, afterSequence = 0) {
+	return getAgentCoordinatorRuntime().getEvents(runId, afterSequence);
+}
+
+export function cancelAgentCoordinatorRun(runId: string) {
+	return getAgentCoordinatorRuntime().cancelRun(runId);
+}
+
+export function removeAgentCoordinatorRun(runId: string) {
+	return getAgentCoordinatorRuntime().removeRun(runId);
+}
+
 function createAgentRouterGatewayApp() {
 	const app = express();
 
 	app.disable("x-powered-by");
 	app.use((req, res, next) => {
-		res.setHeader("Access-Control-Allow-Origin", "*");
+		const origin = req.get("origin");
+		if (origin && !isAllowedGatewayOrigin(origin)) {
+			res.status(403).json({ error: "Gateway origin is not allowed" });
+			return;
+		}
+		if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+		res.setHeader("Vary", "Origin");
 		res.setHeader(
 			"Access-Control-Allow-Methods",
 			"GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		);
-		res.setHeader("Access-Control-Allow-Headers", "*");
+		res.setHeader(
+			"Access-Control-Allow-Headers",
+			"Authorization, Content-Type, X-API-Key, anthropic-version",
+		);
 		if (req.method === "OPTIONS") {
 			res.status(204).end();
 			return;
@@ -642,6 +711,68 @@ function createAgentRouterGatewayApp() {
 			hasUpdate: false,
 			compatibility: "9router",
 		});
+	});
+
+	app.get("/api/coordinator/runs", (_req, res) => {
+		res.json({ runs: listAgentCoordinatorRuns() });
+	});
+	app.post("/api/coordinator/runs", (req, res) => {
+		try {
+			const activeRuns = listAgentCoordinatorRuns().filter(
+				(run) => !["completed", "failed", "cancelled"].includes(run.status),
+			);
+			if (activeRuns.length >= 8) {
+				res.status(429).json({ error: "Coordinator run limit reached" });
+				return;
+			}
+			const run = startAgentCoordinatorRun(parseCoordinatorRunInput(req.body));
+			res.status(202).json({ run });
+		} catch (error) {
+			res.status(400).json({ error: errorMessage(error) });
+		}
+	});
+	app.get("/api/coordinator/runs/:id/events", (req, res) => {
+		const runtime = getAgentCoordinatorRuntime();
+		const run = runtime.getRun(req.params.id);
+		if (!run) {
+			res.status(404).json({ error: "Coordinator run not found" });
+			return;
+		}
+		const after = Math.max(0, Number(req.query.after ?? 0) || 0);
+		res.status(200);
+		res.setHeader("Content-Type", "text/event-stream");
+		res.setHeader("Cache-Control", "no-cache, no-transform");
+		res.setHeader("Connection", "keep-alive");
+		res.flushHeaders();
+		for (const event of runtime.getEvents(req.params.id, after)) {
+			res.write(`data: ${JSON.stringify(event)}\n\n`);
+		}
+		const unsubscribe = runtime.subscribe((event) => {
+			if (event.runId === req.params.id) {
+				res.write(`data: ${JSON.stringify(event)}\n\n`);
+			}
+		});
+		const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 15_000);
+		req.on("close", () => {
+			clearInterval(heartbeat);
+			unsubscribe();
+		});
+	});
+	app.get("/api/coordinator/runs/:id", (req, res) => {
+		const run = getAgentCoordinatorRun(req.params.id);
+		if (!run) {
+			res.status(404).json({ error: "Coordinator run not found" });
+			return;
+		}
+		res.json({ run });
+	});
+	app.post("/api/coordinator/runs/:id/cancel", (req, res) => {
+		const cancelled = cancelAgentCoordinatorRun(req.params.id);
+		res.status(cancelled ? 202 : 409).json({ cancelled });
+	});
+	app.delete("/api/coordinator/runs/:id", (req, res) => {
+		const removed = removeAgentCoordinatorRun(req.params.id);
+		res.status(removed ? 200 : 409).json({ removed });
 	});
 
 	app.post(["/api/shutdown", "/api/version/shutdown"], (_req, res) => {
@@ -814,7 +945,8 @@ function createAgentRouterGatewayApp() {
 		res.json(routerTunnelStatus());
 	});
 
-	app.post("/api/tunnel/disable", (_req, res) => {
+	app.post("/api/tunnel/disable", async (_req, res) => {
+		await routerServiceRegistry.stop("cloudflared");
 		const settings = updateRouterSettings({
 			tailscaleEnabled: false,
 			tunnelEnabled: false,
@@ -822,11 +954,19 @@ function createAgentRouterGatewayApp() {
 		res.json({ success: true, tunnel: routerTunnelStatus(settings).tunnel });
 	});
 
-	app.post("/api/tunnel/enable", (_req, res) => {
-		res.status(501).json({
-			error:
-				"Cloud tunnel lifecycle is not managed by ADE yet. Configure an external tunnel URL in settings.",
-			code: "TUNNEL_NOT_MANAGED",
+	app.post("/api/tunnel/enable", async (req, res) => {
+		const targetUrl =
+			stringValue(req.body?.targetUrl) ?? getAgentRouterGatewayStatus().url;
+		const status = await routerServiceRegistry.start("cloudflared", {
+			targetUrl,
+			tunnelToken: stringValue(req.body?.tunnelToken) ?? undefined,
+			executable: stringValue(req.body?.executable) ?? undefined,
+		});
+		const success = status.state === "running";
+		if (success) updateRouterSettings({ tunnelEnabled: true });
+		res.status(success ? 200 : 503).json({
+			success,
+			service: status,
 			status: routerTunnelStatus(),
 		});
 	});
@@ -835,7 +975,8 @@ function createAgentRouterGatewayApp() {
 		res.json(routerTailscaleCheck());
 	});
 
-	app.post("/api/tunnel/tailscale-disable", (_req, res) => {
+	app.post("/api/tunnel/tailscale-disable", async (_req, res) => {
+		await routerServiceRegistry.stop("tailscale");
 		const settings = updateRouterSettings({ tailscaleEnabled: false });
 		res.json({
 			success: true,
@@ -843,20 +984,27 @@ function createAgentRouterGatewayApp() {
 		});
 	});
 
-	app.post("/api/tunnel/tailscale-enable", (_req, res) => {
-		res.status(501).json({
-			error:
-				"Tailscale lifecycle is not managed by ADE yet. Use the Tailscale app/CLI and store the URL in settings.",
-			code: "TAILSCALE_NOT_MANAGED",
+	app.post("/api/tunnel/tailscale-enable", async (req, res) => {
+		const targetUrl =
+			stringValue(req.body?.targetUrl) ?? getAgentRouterGatewayStatus().url;
+		const status = await routerServiceRegistry.start("tailscale", {
+			targetUrl,
+			executable: stringValue(req.body?.executable) ?? undefined,
+		});
+		const success = status.state === "running";
+		if (success) updateRouterSettings({ tailscaleEnabled: true });
+		res.status(success ? 200 : 503).json({
+			success,
+			service: status,
 			status: routerTunnelStatus(),
 		});
 	});
 
 	app.get("/api/tunnel/tailscale-install", (_req, res) => {
-		res.status(501).json({
-			error: "Tailscale installation is not managed by ADE.",
-			code: "TAILSCALE_INSTALL_NOT_MANAGED",
+		res.json({
 			...routerTailscaleCheck(),
+			installUrl: "https://tailscale.com/download/windows",
+			managedInstall: false,
 		});
 	});
 
@@ -871,17 +1019,18 @@ function createAgentRouterGatewayApp() {
 			res.json({ success: true, ...status });
 			return;
 		}
-		res.status(501).json({
-			error:
-				"Headroom process lifecycle is not bundled with ADE yet. Start Headroom externally and set headroomUrl.",
-			code: "HEADROOM_NOT_MANAGED",
-			...status,
-		});
+		const settings = getRouterSettings();
+		const port = headroomPort(settings.headroomUrl);
+		const service = await routerServiceRegistry.start("headroom", { port });
+		const success = service.state === "running";
+		if (success) updateRouterSettings({ headroomEnabled: true });
+		res.status(success ? 200 : 503).json({ ...status, success, service });
 	});
 
-	app.post("/api/headroom/stop", (_req, res) => {
+	app.post("/api/headroom/stop", async (_req, res) => {
+		const service = await routerServiceRegistry.stop("headroom");
 		updateRouterSettings({ headroomEnabled: false });
-		res.json({ stopped: false, managedPid: null });
+		res.json({ stopped: service.state === "stopped", service });
 	});
 
 	app.get("/v1/models", (_req, res) => {
@@ -1506,18 +1655,20 @@ function createAgentRouterGatewayApp() {
 		res.json(buildMitmStatus());
 	});
 	app.post("/api/cli-tools/antigravity-mitm", (_req, res) => {
-		res.status(501).json({
+		res.status(409).json({
 			error:
-				"MITM server lifecycle is not bundled in the embedded ADE router yet.",
-			code: "mitm_runtime_unavailable",
+				"MITM requires an administrator executor and explicit operation-specific consent.",
+			code: "privileged_consent_required",
+			contract: PRIVILEGED_OPERATION_CONTRACT,
 			...buildMitmStatus(),
 		});
 	});
 	app.patch("/api/cli-tools/antigravity-mitm", (_req, res) => {
-		res.status(501).json({
+		res.status(409).json({
 			error:
-				"MITM DNS/certificate mutation is not bundled in the embedded ADE router yet.",
-			code: "mitm_runtime_unavailable",
+				"DNS and certificate mutation requires an administrator executor and explicit operation-specific consent.",
+			code: "privileged_consent_required",
+			contract: PRIVILEGED_OPERATION_CONTRACT,
 			...buildMitmStatus(),
 		});
 	});
@@ -1715,6 +1866,18 @@ function createAgentRouterGatewayApp() {
 	return app;
 }
 
+function isAllowedGatewayOrigin(origin: string): boolean {
+	try {
+		const url = new URL(origin);
+		return (
+			(url.protocol === "http:" || url.protocol === "https:") &&
+			["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+		);
+	} catch {
+		return false;
+	}
+}
+
 function jsonRequestBodyParser(
 	req: Request,
 	res: ExpressResponse,
@@ -1784,7 +1947,7 @@ function isJsonContentType(value: string | string[] | undefined): boolean {
 }
 
 async function handleChatCompletions(req: Request, res: ExpressResponse) {
-	const body = toJsonObject(req.body);
+	const body = await prepareRouterRequestBody(req.body, res, "openai-chat");
 	const nodeTarget = resolveProviderNodeTarget(body.model, [
 		"openai-compatible",
 		"anthropic-compatible",
@@ -1810,7 +1973,11 @@ async function handleChatCompletions(req: Request, res: ExpressResponse) {
 }
 
 async function handleResponses(req: Request, res: ExpressResponse) {
-	const body = toJsonObject(req.body);
+	const body = await prepareRouterRequestBody(
+		req.body,
+		res,
+		"openai-responses",
+	);
 	const nodeTarget = resolveProviderNodeTarget(body.model, [
 		"openai-compatible",
 		"anthropic-compatible",
@@ -1878,7 +2045,11 @@ async function handleResponses(req: Request, res: ExpressResponse) {
 }
 
 async function handleAnthropicMessages(req: Request, res: ExpressResponse) {
-	const body = toJsonObject(req.body);
+	const body = await prepareRouterRequestBody(
+		req.body,
+		res,
+		"anthropic-messages",
+	);
 	const nodeTarget = resolveProviderNodeTarget(body.model, [
 		"openai-compatible",
 		"anthropic-compatible",
@@ -1927,6 +2098,323 @@ async function handleAnthropicMessages(req: Request, res: ExpressResponse) {
 	});
 }
 
+async function prepareRouterRequestBody(
+	input: unknown,
+	res: ExpressResponse,
+	protocol: "openai-chat" | "openai-responses" | "anthropic-messages",
+): Promise<JsonObject> {
+	const result = await applyRouterTokenSaversToRequest(
+		toJsonObject(input),
+		getRouterSettings(),
+		{ protocol },
+	);
+	if (result.changed) {
+		res.setHeader("X-ADE-Token-Saver", result.modes.join(","));
+		res.setHeader("X-ADE-Token-Saved-Bytes", String(result.savedBytes));
+	}
+	if (result.headroomFailed) {
+		res.setHeader("X-ADE-Headroom", "fail-open");
+	}
+	return result.body as JsonObject;
+}
+
+function getAgentCoordinatorRuntime(): AgentCoordinatorRuntime<
+	RouterCoordinatorWorkerOutput,
+	RouterCoordinatorFinalOutput
+> {
+	coordinatorRuntime ??= new AgentCoordinatorRuntime({
+		maxParallel: 4,
+		retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+		isInfrastructureError: (error) =>
+			error instanceof AgentInfrastructureError ||
+			(error instanceof Error &&
+				/(rate limit|timeout|network|capacity|overload|ECONN|5\d\d)/i.test(
+					error.message,
+				)),
+		executeWorker: async ({ brief, signal }) => {
+			const model = coordinatorModelFromMetadata(
+				brief.metadata,
+				"claude-sonnet-5",
+			);
+			const prompt = [
+				"You are a focused ADE worker. Complete only the assigned brief.",
+				"Return a compact report with outcome, evidence, uncertainty, and recommended next action.",
+				"Do not include raw logs or unrelated context.",
+				JSON.stringify({
+					objective: brief.objective,
+					role: brief.role,
+					context: brief.context,
+				}),
+			].join("\n\n");
+			const subscription = await executeClaudeSubscriptionPrompt({
+				model: claudeCliModel(model, "claude-sonnet-5"),
+				prompt,
+				signal,
+			});
+			if (subscription) {
+				return {
+					output: {
+						briefId: brief.id,
+						model: subscription.model,
+						text: subscription.text,
+					},
+					usage: subscription.usage,
+				};
+			}
+			const result = await fetchOpenRouterWithFallback(
+				{
+					model,
+					stream: false,
+					messages: [
+						{
+							role: "system",
+							content:
+								"You are a focused ADE worker. Complete only the assigned brief. Return a compact report with outcome, evidence, uncertainty, and recommended next action. Do not include raw logs or unrelated context.",
+						},
+						{
+							role: "user",
+							content: prompt,
+						},
+					],
+				},
+				signal,
+			);
+			if (!result.ok) throw coordinatorGatewayError(result);
+			const upstream = await readJson(result.upstream);
+			const usage = extractOpenAIUsage(upstream);
+			return {
+				output: {
+					briefId: brief.id,
+					model: result.model,
+					text: extractAssistantText(upstream),
+				},
+				usage: {
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+				},
+			};
+		},
+		synthesize: async ({ objective, metadata, workers, signal }) => {
+			const model = coordinatorModelFromMetadata(
+				metadata,
+				"claude-fable-5",
+				"synthesisModel",
+			);
+			const prompt = [
+				"You are ADE Fable Coordinator and final judge.",
+				"Reconcile worker reports by evidence, identify unresolved uncertainty, and produce one coherent verified answer to the original objective. Never decide by vote alone.",
+				JSON.stringify({
+					objective,
+					reports: workers.map((worker) => worker.output),
+				}),
+			].join("\n\n");
+			const subscription = await executeClaudeSubscriptionPrompt({
+				model: claudeCliModel(model, "claude-fable-5"),
+				prompt,
+				signal,
+			});
+			if (subscription) {
+				return {
+					output: { model: subscription.model, text: subscription.text },
+					usage: subscription.usage,
+				};
+			}
+			const result = await fetchOpenRouterWithFallback(
+				{
+					model,
+					stream: false,
+					messages: [
+						{
+							role: "system",
+							content:
+								"You are ADE Fable Coordinator and final judge. Reconcile worker reports by evidence, identify unresolved uncertainty, and produce one coherent verified answer to the original objective. Never decide by vote alone.",
+						},
+						{
+							role: "user",
+							content: prompt,
+						},
+					],
+				},
+				signal,
+			);
+			if (!result.ok) throw coordinatorGatewayError(result);
+			const upstream = await readJson(result.upstream);
+			const usage = extractOpenAIUsage(upstream);
+			return {
+				output: { model: result.model, text: extractAssistantText(upstream) },
+				usage: {
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+				},
+			};
+		},
+	});
+	return coordinatorRuntime;
+}
+
+function parseCoordinatorRunInput(input: unknown): StartAgentRunInput {
+	const body = toJsonObject(input);
+	const objective = stringValue(body.objective)?.trim() ?? "";
+	const rawBriefs = Array.isArray(body.briefs) ? body.briefs.slice(0, 16) : [];
+	const briefs: AgentWorkerBrief[] = rawBriefs.map((entry, index) => {
+		const brief = toJsonObject(entry);
+		const metadata = jsonObjectValue(brief.metadata);
+		return {
+			id: stringValue(brief.id)?.trim() || `worker-${index + 1}`,
+			objective: stringValue(brief.objective)?.trim() || objective,
+			role: stringValue(brief.role) ?? undefined,
+			context: brief.context,
+			metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+		};
+	});
+	if (briefs.length === 0 && objective) {
+		briefs.push(
+			{
+				id: "solution",
+				role: "implementation specialist",
+				objective: `Propose the strongest concrete solution for: ${objective}`,
+			},
+			{
+				id: "review",
+				role: "critical reviewer",
+				objective: `Find correctness, security, and regression risks for: ${objective}`,
+			},
+			{
+				id: "verification",
+				role: "verification specialist",
+				objective: `Define evidence and end-to-end validation for: ${objective}`,
+			},
+		);
+	}
+	const metadata = jsonObjectValue(body.metadata);
+	return {
+		id: stringValue(body.id) ?? undefined,
+		objective,
+		briefs,
+		metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+	};
+}
+
+function coordinatorModelFromMetadata(
+	metadata: Record<string, unknown> | undefined,
+	fallback: string,
+	key = "model",
+): string {
+	const value = metadata?.[key];
+	return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function coordinatorGatewayError(result: GatewayFailure): Error {
+	const message =
+		stringValue(toJsonObject(result.body.error).message) ??
+		stringValue(result.body.error) ??
+		`Coordinator provider request failed with HTTP ${result.status}`;
+	if (result.status === 429 || result.status >= 500) {
+		return new AgentInfrastructureError(message, {
+			code: `HTTP_${result.status}`,
+		});
+	}
+	return Object.assign(new Error(message), { code: `HTTP_${result.status}` });
+}
+
+async function executeClaudeSubscriptionPrompt({
+	model,
+	prompt,
+	signal,
+}: {
+	model: string;
+	prompt: string;
+	signal: AbortSignal;
+}): Promise<{
+	model: string;
+	text: string;
+	usage: { inputTokens: number; outputTokens: number };
+} | null> {
+	if (!commandAvailable("claude")) return null;
+	return new Promise((resolve, reject) => {
+		const child = spawn(
+			"claude",
+			[
+				prompt,
+				"--print",
+				"--model",
+				model,
+				"--output-format",
+				"json",
+				"--tools=",
+			],
+			{
+				windowsHide: true,
+				stdio: ["ignore", "pipe", "pipe"],
+				signal,
+			},
+		);
+		let stdout = "";
+		let stderr = "";
+		const timer = setTimeout(() => child.kill(), 10 * 60 * 1000);
+		child.stdout?.on("data", (chunk) => {
+			if (stdout.length < 8 * 1024 * 1024) stdout += String(chunk);
+		});
+		child.stderr?.on("data", (chunk) => {
+			if (stderr.length < 256 * 1024) stderr += String(chunk);
+		});
+		child.on("error", (error) => {
+			clearTimeout(timer);
+			if (signal.aborted) reject(new AgentRunCancelledError());
+			else if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				resolve(null);
+			else resolve(null);
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			if (signal.aborted) {
+				reject(new AgentRunCancelledError());
+				return;
+			}
+			if (code !== 0 || !stdout.trim()) {
+				void stderr;
+				resolve(null);
+				return;
+			}
+			try {
+				const value = JSON.parse(stdout) as JsonObject;
+				const usage = jsonObjectValue(value.usage);
+				const text =
+					stringValue(value.result) ??
+					stringValue(value.output) ??
+					stringValue(value.text) ??
+					stdout.trim();
+				resolve({
+					model,
+					text,
+					usage: {
+						inputTokens: numericValue(usage.input_tokens ?? usage.inputTokens),
+						outputTokens: numericValue(
+							usage.output_tokens ?? usage.outputTokens,
+						),
+					},
+				});
+			} catch {
+				resolve({
+					model,
+					text: stdout.trim(),
+					usage: { inputTokens: 0, outputTokens: 0 },
+				});
+			}
+		});
+	});
+}
+
+function claudeCliModel(model: string, fallback: string): string {
+	if (!model.trim() || model === "budget-coding") return fallback;
+	return model.replace(/^anthropic\//, "");
+}
+
+function numericValue(value: unknown): number {
+	const parsed = Number(value ?? 0);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
 function handleCountTokens(req: Request, res: ExpressResponse) {
 	const body = toJsonObject(req.body);
 	const inputTokens = estimateTokens({
@@ -1973,10 +2461,6 @@ async function handleProviderNodeChat(
 	const { node } = nodeTarget;
 
 	if (node.type === "openai-compatible" && node.apiType === "responses") {
-		if (body.stream === true) {
-			writeStreamingTranslationError(res, "OpenAI Responses provider node");
-			return;
-		}
 		const result = await fetchProviderNodeWithFallback({
 			body: chatBodyToResponsesBody(body, nodeTarget.model),
 			nodeTarget,
@@ -1988,6 +2472,14 @@ async function handleProviderNodeChat(
 			return;
 		}
 		setProviderNodeUsageLocals(res, result);
+		if (body.stream === true) {
+			await pipeNormalizedProviderStream(result.upstream, res, {
+				model: nodeTarget.model,
+				source: "openai-responses",
+				target: "openai-chat",
+			});
+			return;
+		}
 		const upstream = await readJson(result.upstream);
 		res.json(responsesToOpenAiChatResponse(upstream, nodeTarget));
 		return;
@@ -2054,11 +2546,6 @@ async function handleProviderNodeResponses(
 		return;
 	}
 
-	if (body.stream === true) {
-		writeStreamingTranslationError(res, `${node.type} provider node`);
-		return;
-	}
-
 	if (node.type === "openai-compatible") {
 		const result = await fetchProviderNodeWithFallback({
 			body: responsesBodyToChatBody(body, nodeTarget.model),
@@ -2071,6 +2558,14 @@ async function handleProviderNodeResponses(
 			return;
 		}
 		setProviderNodeUsageLocals(res, result);
+		if (body.stream === true) {
+			await pipeNormalizedProviderStream(result.upstream, res, {
+				model: nodeTarget.model,
+				source: "openai-chat",
+				target: "openai-responses",
+			});
+			return;
+		}
 		const upstream = await readJson(result.upstream);
 		res.json(openAiChatToResponsesResponse(upstream, nodeTarget));
 		return;
@@ -2090,6 +2585,14 @@ async function handleProviderNodeResponses(
 		return;
 	}
 	setProviderNodeUsageLocals(res, result);
+	if (body.stream === true) {
+		await pipeNormalizedProviderStream(result.upstream, res, {
+			model: nodeTarget.model,
+			source: "anthropic-messages",
+			target: "openai-responses",
+		});
+		return;
+	}
 	const upstream = await readJson(result.upstream);
 	res.json(anthropicToResponsesResponse(upstream, nodeTarget));
 }
@@ -2119,10 +2622,6 @@ async function handleProviderNodeAnthropicMessages(
 	}
 
 	if (node.apiType === "responses") {
-		if (body.stream === true) {
-			writeStreamingTranslationError(res, "OpenAI Responses provider node");
-			return;
-		}
 		const result = await fetchProviderNodeWithFallback({
 			body: anthropicBodyToResponsesBody(body, nodeTarget.model),
 			nodeTarget,
@@ -2134,6 +2633,14 @@ async function handleProviderNodeAnthropicMessages(
 			return;
 		}
 		setProviderNodeUsageLocals(res, result);
+		if (body.stream === true) {
+			await pipeNormalizedProviderStream(result.upstream, res, {
+				model: nodeTarget.model,
+				source: "openai-responses",
+				target: "anthropic-messages",
+			});
+			return;
+		}
 		const upstream = await readJson(result.upstream);
 		res.json(responsesToAnthropicMessage(upstream, nodeTarget));
 		return;
@@ -4078,6 +4585,39 @@ const OAUTH_PROVIDER_COMPATIBILITY: OAuthProviderCompatibility[] = [
 		notes:
 			"Authorize with configured Google OAuth credentials or import a Gemini token; ADE can rotate refresh tokens automatically.",
 	},
+	{
+		id: "github",
+		aliases: ["github-copilot", "copilot"],
+		keyProvider: "github",
+		label: "GitHub / Copilot",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a GitHub or Copilot credential explicitly; ADE does not embed a private OAuth client.",
+	},
+	{
+		id: "cursor",
+		aliases: ["cursor-agent"],
+		keyProvider: "cursor",
+		label: "Cursor",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a Cursor credential explicitly; browser login stays owned by Cursor.",
+	},
+	{
+		id: "kiro",
+		aliases: ["kiro-ai"],
+		keyProvider: "kiro",
+		label: "Kiro",
+		importToken: true,
+		authorize: false,
+		deviceCode: false,
+		notes:
+			"Import a Kiro credential explicitly; ADE stores it in secure main-process storage.",
+	},
 ];
 
 function resolveOAuthProvider(
@@ -5102,21 +5642,25 @@ function filterSuggestedModels(models: unknown[], type: string) {
 function routerTunnelStatus(settings = getRouterSettings()) {
 	const tunnelUrl = stringValue(settings.tunnelUrl) ?? "";
 	const tailscaleUrl = stringValue(settings.tailscaleUrl) ?? "";
+	const cloudflared = routerServiceRegistry.status("cloudflared");
+	const tailscale = routerServiceRegistry.status("tailscale");
 	return {
 		tunnel: {
 			enabled: settings.tunnelEnabled === true,
 			provider: stringValue(settings.tunnelProvider) ?? "cloudflare",
-			running: false,
-			status: settings.tunnelEnabled === true ? "configured" : "disabled",
+			running: cloudflared.state === "running",
+			status: cloudflared.state,
 			url: tunnelUrl,
+			service: cloudflared,
 		},
 		tailscale: {
 			enabled: settings.tailscaleEnabled === true,
-			installed: false,
-			loggedIn: false,
-			running: false,
-			status: settings.tailscaleEnabled === true ? "external" : "disabled",
+			installed: commandAvailable("tailscale"),
+			loggedIn: tailscale.state === "running",
+			running: tailscale.state === "running",
+			status: tailscale.state,
 			url: tailscaleUrl,
+			service: tailscale,
 		},
 		download: {
 			status: "idle",
@@ -5125,21 +5669,25 @@ function routerTunnelStatus(settings = getRouterSettings()) {
 }
 
 function routerTailscaleCheck() {
+	const installed = commandAvailable("tailscale");
+	const service = routerServiceRegistry.status("tailscale");
 	return {
-		installed: false,
-		loggedIn: false,
+		installed,
+		loggedIn: service.state === "running",
 		platform: process.platform,
-		brewAvailable: false,
-		daemonRunning: false,
-		customDaemonRunning: false,
-		systemDaemonRunning: false,
+		brewAvailable: process.platform === "darwin" && commandAvailable("brew"),
+		daemonRunning: service.state === "running",
+		customDaemonRunning: service.state === "running",
+		systemDaemonRunning: installed,
 		hasCachedPassword: false,
+		service,
 	};
 }
 
 async function routerHeadroomStatus() {
 	const settings = getRouterSettings();
 	const url = stringValue(settings.headroomUrl) ?? "http://localhost:8787";
+	const service = routerServiceRegistry.status("headroom");
 	try {
 		const response = await fetchWithTimeout(url, { method: "GET" }, 1500);
 		return {
@@ -5149,7 +5697,8 @@ async function routerHeadroomStatus() {
 			statusText: response.statusText,
 			url,
 			enabled: settings.headroomEnabled === true,
-			managedPid: null,
+			managedPid: service.pid,
+			service,
 		};
 	} catch (error) {
 		return {
@@ -5158,8 +5707,34 @@ async function routerHeadroomStatus() {
 			error: errorMessage(error),
 			url,
 			enabled: settings.headroomEnabled === true,
-			managedPid: null,
+			managedPid: service.pid,
+			service,
 		};
+	}
+}
+
+function headroomPort(url: string): number {
+	try {
+		const port = Number(new URL(url).port || 8787);
+		return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : 8787;
+	} catch {
+		return 8787;
+	}
+}
+
+function commandAvailable(command: string): boolean {
+	try {
+		execFileSync(
+			process.platform === "win32" ? "where.exe" : "which",
+			[command],
+			{
+				stdio: "ignore",
+				timeout: 2000,
+			},
+		);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -7341,20 +7916,9 @@ function parseStopSequences(value: unknown): string[] | undefined {
 	return undefined;
 }
 
-function writeStreamingTranslationError(
-	res: ExpressResponse,
-	target: string,
-): void {
-	res.status(501).json({
-		error: {
-			message: `Streaming format translation for ${target} is not available yet. Use stream=false or call the provider-native endpoint.`,
-			type: "unsupported_feature",
-		},
-	});
-}
-
 async function fetchOpenRouterWithFallback(
 	body: JsonObject,
+	signal?: AbortSignal,
 ): Promise<OpenRouterSuccess | GatewayFailure> {
 	const target = resolveRouterModelTarget(
 		typeof body.model === "string" ? body.model : undefined,
@@ -7428,6 +7992,7 @@ async function fetchOpenRouterWithFallback(
 					"X-Title": "ADE Orchestrator Router",
 				},
 				body: JSON.stringify(upstreamBody),
+				signal,
 			});
 
 			if (upstream.ok) {
@@ -7530,6 +8095,381 @@ interface OpenAiToAnthropicSseState {
 	thinkingBlockIndex: number | null;
 	toolBlocks: Map<number, number>;
 	usage?: JsonObject;
+}
+
+type NormalizedStreamTarget =
+	| "openai-chat"
+	| "openai-responses"
+	| "anthropic-messages";
+
+interface NormalizedStreamState {
+	id: string;
+	model: string;
+	created: number;
+	target: NormalizedStreamTarget;
+	text: string;
+	textBlockIndex: number | null;
+	thinkingBlockIndex: number | null;
+	toolBlocks: Map<number, number>;
+	toolArgumentLengths: Map<string, number>;
+	nextBlockIndex: number;
+	finishReason: string;
+	usage: {
+		inputTokens: number;
+		outputTokens: number;
+		totalTokens: number;
+	};
+}
+
+async function pipeNormalizedProviderStream(
+	upstream: globalThis.Response,
+	res: ExpressResponse,
+	options: {
+		model: string;
+		source: AgentProviderProtocolHint;
+		target: NormalizedStreamTarget;
+	},
+) {
+	const state: NormalizedStreamState = {
+		id:
+			options.target === "anthropic-messages"
+				? `msg_${cryptoId()}`
+				: options.target === "openai-responses"
+					? `resp_${cryptoId()}`
+					: `chatcmpl_${cryptoId()}`,
+		model: options.model,
+		created: Math.floor(Date.now() / 1000),
+		target: options.target,
+		text: "",
+		textBlockIndex: null,
+		thinkingBlockIndex: null,
+		toolBlocks: new Map(),
+		toolArgumentLengths: new Map(),
+		nextBlockIndex: 0,
+		finishReason: "stop",
+		usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+	};
+	const normalizer = new ProviderStreamNormalizer({
+		protocol: options.source,
+		contentType: upstream.headers.get("content-type") ?? undefined,
+	});
+
+	res.status(upstream.status);
+	res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+	res.setHeader("Cache-Control", "no-cache, no-transform");
+	res.setHeader("Connection", "keep-alive");
+	res.setHeader("X-Accel-Buffering", "no");
+	res.flushHeaders?.();
+	writeNormalizedStreamStart(res, state);
+
+	const writeEvents = (events: NormalizedProviderEvent[]) => {
+		for (const event of events) writeNormalizedProviderEvent(res, state, event);
+	};
+	if (!upstream.body) {
+		writeEvents(normalizer.end(await upstream.text()));
+	} else {
+		const nodeStream = Readable.fromWeb(upstream.body as never);
+		for await (const chunk of nodeStream) {
+			writeEvents(normalizer.push(chunk as Buffer));
+		}
+		writeEvents(normalizer.end());
+	}
+	writeNormalizedStreamFinish(res, state);
+	if (!res.writableEnded) res.end();
+}
+
+function writeNormalizedStreamStart(
+	res: ExpressResponse,
+	state: NormalizedStreamState,
+) {
+	if (state.target === "openai-responses") {
+		writeNamedSse(res, "response.created", {
+			type: "response.created",
+			response: {
+				id: state.id,
+				object: "response",
+				status: "in_progress",
+				model: state.model,
+				output: [],
+			},
+		});
+	} else if (state.target === "anthropic-messages") {
+		writeNamedSse(res, "message_start", {
+			type: "message_start",
+			message: {
+				id: state.id,
+				type: "message",
+				role: "assistant",
+				model: state.model,
+				content: [],
+				stop_reason: null,
+				usage: { input_tokens: 0, output_tokens: 0 },
+			},
+		});
+	}
+}
+
+function writeNormalizedProviderEvent(
+	res: ExpressResponse,
+	state: NormalizedStreamState,
+	event: NormalizedProviderEvent,
+) {
+	if (event.type === "usage") {
+		state.usage = {
+			inputTokens: event.usage.inputTokens,
+			outputTokens: event.usage.outputTokens,
+			totalTokens: event.usage.totalTokens,
+		};
+		return;
+	}
+	if (event.type === "finish") {
+		state.finishReason = event.finishReason;
+		return;
+	}
+	if (event.type === "error") {
+		writeNamedSse(res, "error", { type: "error", error: event.error });
+		state.finishReason = "error";
+		return;
+	}
+	if (event.type === "text-delta" || event.type === "reasoning-delta") {
+		state.text += event.type === "text-delta" ? event.text : "";
+		writeNormalizedTextDelta(
+			res,
+			state,
+			event.text,
+			event.type === "reasoning-delta",
+		);
+		return;
+	}
+	writeNormalizedToolDelta(res, state, event.toolCall);
+}
+
+function writeNormalizedTextDelta(
+	res: ExpressResponse,
+	state: NormalizedStreamState,
+	text: string,
+	reasoning: boolean,
+) {
+	if (state.target === "openai-chat") {
+		res.write(
+			`data: ${JSON.stringify({
+				id: state.id,
+				object: "chat.completion.chunk",
+				created: state.created,
+				model: state.model,
+				choices: [
+					{
+						index: 0,
+						delta: reasoning ? { reasoning_content: text } : { content: text },
+						finish_reason: null,
+					},
+				],
+			})}\n\n`,
+		);
+		return;
+	}
+	if (state.target === "openai-responses") {
+		writeNamedSse(
+			res,
+			reasoning
+				? "response.reasoning_text.delta"
+				: "response.output_text.delta",
+			{
+				type: reasoning
+					? "response.reasoning_text.delta"
+					: "response.output_text.delta",
+				item_id: `${state.id}_message`,
+				output_index: 0,
+				content_index: 0,
+				delta: text,
+			},
+		);
+		return;
+	}
+	const existingBlockIndex = reasoning
+		? state.thinkingBlockIndex
+		: state.textBlockIndex;
+	let blockIndex = existingBlockIndex;
+	if (blockIndex === null) {
+		blockIndex = state.nextBlockIndex++;
+		if (reasoning) state.thinkingBlockIndex = blockIndex;
+		else state.textBlockIndex = blockIndex;
+		writeNamedSse(res, "content_block_start", {
+			type: "content_block_start",
+			index: blockIndex,
+			content_block: reasoning
+				? { type: "thinking", thinking: "" }
+				: { type: "text", text: "" },
+		});
+	}
+	writeNamedSse(res, "content_block_delta", {
+		type: "content_block_delta",
+		index: blockIndex,
+		delta: {
+			type: reasoning ? "thinking_delta" : "text_delta",
+			[reasoning ? "thinking" : "text"]: text,
+		},
+	});
+}
+
+function writeNormalizedToolDelta(
+	res: ExpressResponse,
+	state: NormalizedStreamState,
+	toolCall: { id: string; index: number; name: string; arguments: string },
+) {
+	const previousLength = state.toolArgumentLengths.get(toolCall.id) ?? 0;
+	const nextArguments = takeAccumulatedArgumentsDelta(
+		toolCall.arguments,
+		previousLength,
+	);
+	const argumentsDelta = nextArguments.delta;
+	state.toolArgumentLengths.set(toolCall.id, nextArguments.emittedLength);
+	if (state.target === "openai-chat") {
+		if (argumentsDelta.length === 0 && previousLength > 0) return;
+		res.write(
+			`data: ${JSON.stringify({
+				id: state.id,
+				object: "chat.completion.chunk",
+				created: state.created,
+				model: state.model,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{
+									index: toolCall.index,
+									id: toolCall.id,
+									type: "function",
+									function: {
+										name: toolCall.name,
+										arguments: argumentsDelta,
+									},
+								},
+							],
+						},
+						finish_reason: null,
+					},
+				],
+			})}\n\n`,
+		);
+		return;
+	}
+	if (state.target === "openai-responses") {
+		if (argumentsDelta.length === 0 && previousLength > 0) return;
+		writeNamedSse(res, "response.function_call_arguments.delta", {
+			type: "response.function_call_arguments.delta",
+			item_id: toolCall.id,
+			output_index: toolCall.index,
+			delta: argumentsDelta,
+		});
+		return;
+	}
+	let blockIndex = state.toolBlocks.get(toolCall.index);
+	if (blockIndex === undefined) {
+		blockIndex = state.nextBlockIndex++;
+		state.toolBlocks.set(toolCall.index, blockIndex);
+		writeNamedSse(res, "content_block_start", {
+			type: "content_block_start",
+			index: blockIndex,
+			content_block: {
+				type: "tool_use",
+				id: toolCall.id,
+				name: toolCall.name,
+				input: {},
+			},
+		});
+	}
+	if (argumentsDelta.length === 0) return;
+	writeNamedSse(res, "content_block_delta", {
+		type: "content_block_delta",
+		index: blockIndex,
+		delta: { type: "input_json_delta", partial_json: argumentsDelta },
+	});
+}
+
+function writeNormalizedStreamFinish(
+	res: ExpressResponse,
+	state: NormalizedStreamState,
+) {
+	if (state.target === "openai-chat") {
+		res.write(
+			`data: ${JSON.stringify({
+				id: state.id,
+				object: "chat.completion.chunk",
+				created: state.created,
+				model: state.model,
+				choices: [
+					{
+						index: 0,
+						delta: {},
+						finish_reason: openAiFinishReason(state.finishReason),
+					},
+				],
+				usage: {
+					prompt_tokens: state.usage.inputTokens,
+					completion_tokens: state.usage.outputTokens,
+					total_tokens: state.usage.totalTokens,
+				},
+			})}\n\ndata: [DONE]\n\n`,
+		);
+		return;
+	}
+	if (state.target === "openai-responses") {
+		writeNamedSse(res, "response.completed", {
+			type: "response.completed",
+			response: {
+				id: state.id,
+				object: "response",
+				status: state.finishReason === "error" ? "failed" : "completed",
+				model: state.model,
+				output_text: state.text,
+				output: [],
+				usage: {
+					input_tokens: state.usage.inputTokens,
+					output_tokens: state.usage.outputTokens,
+					total_tokens: state.usage.totalTokens,
+				},
+			},
+		});
+		return;
+	}
+	for (const blockIndex of [state.thinkingBlockIndex, state.textBlockIndex]) {
+		if (blockIndex === null) continue;
+		writeNamedSse(res, "content_block_stop", {
+			type: "content_block_stop",
+			index: blockIndex,
+		});
+	}
+	for (const blockIndex of state.toolBlocks.values()) {
+		writeNamedSse(res, "content_block_stop", {
+			type: "content_block_stop",
+			index: blockIndex,
+		});
+	}
+	writeNamedSse(res, "message_delta", {
+		type: "message_delta",
+		delta: { stop_reason: anthropicFinishReason(state.finishReason) },
+		usage: { output_tokens: state.usage.outputTokens },
+	});
+	writeNamedSse(res, "message_stop", { type: "message_stop" });
+}
+
+function writeNamedSse(res: ExpressResponse, event: string, payload: unknown) {
+	res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function openAiFinishReason(reason: string): string {
+	if (reason === "tool-calls") return "tool_calls";
+	if (reason === "length") return "length";
+	if (reason === "content-filter") return "content_filter";
+	return "stop";
+}
+
+function anthropicFinishReason(reason: string): string {
+	if (reason === "tool-calls") return "tool_use";
+	if (reason === "length") return "max_tokens";
+	return "end_turn";
 }
 
 async function pipeAnthropicStreamAsOpenAiChat(

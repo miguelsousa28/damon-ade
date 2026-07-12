@@ -12,12 +12,53 @@ const currentYear = new Date().getFullYear();
 const author = pkg.author?.name ?? pkg.author;
 const productName = pkg.productName;
 
-// Release repo — single source of truth for where artifacts + update manifests
-// are published. TODO(release): confirm GitHub owner/org and set the public repo
-// name before publishing. Must stay in sync with RELEASE_REPO_* in
-// src/main/lib/auto-updater.ts.
-const RELEASE_REPO_OWNER = "per-simmons"; // TODO(release): confirm GitHub owner/org
-const RELEASE_REPO_NAME = "damon-ade"; // TODO(release): set public repo name
+function env(name: string): string | undefined {
+	const value = process.env[name]?.trim();
+	return value ? value : undefined;
+}
+
+function envFlag(name: string): boolean {
+	const value = env(name);
+	if (value === undefined || value === "false") return false;
+	if (value === "true") return true;
+	throw new Error(`${name} must be either "true" or "false".`);
+}
+
+const windowsSigningEnabled = envFlag("ADE_WINDOWS_SIGN");
+const windowsCertificateLink = env("WIN_CSC_LINK") ?? env("CSC_LINK");
+const windowsCertificateName = env("WIN_CSC_NAME") ?? env("CSC_NAME");
+const windowsCertificatePassword =
+	env("WIN_CSC_KEY_PASSWORD") ?? env("CSC_KEY_PASSWORD");
+
+if (windowsSigningEnabled) {
+	if (!windowsCertificateLink && !windowsCertificateName) {
+		throw new Error(
+			"ADE_WINDOWS_SIGN=true requires WIN_CSC_LINK (preferred), CSC_LINK, WIN_CSC_NAME, or CSC_NAME.",
+		);
+	}
+
+	if (windowsCertificateLink && !windowsCertificatePassword) {
+		throw new Error(
+			"Certificate-file signing requires WIN_CSC_KEY_PASSWORD or CSC_KEY_PASSWORD.",
+		);
+	}
+}
+
+const publishEnabled = envFlag("ADE_PUBLISH");
+const publishOwner = env("ADE_PUBLISH_OWNER");
+const publishRepo = env("ADE_PUBLISH_REPO");
+const publishToken = env("GH_TOKEN") ?? env("GITHUB_TOKEN");
+const windowsPublisherName = env("ADE_WINDOWS_PUBLISHER_NAME");
+
+if (publishEnabled && (!publishOwner || !publishRepo || !publishToken)) {
+	throw new Error(
+		"ADE_PUBLISH=true requires ADE_PUBLISH_OWNER, ADE_PUBLISH_REPO, and GH_TOKEN (or GITHUB_TOKEN).",
+	);
+}
+const publishConfig: Configuration["publish"] =
+	publishEnabled && publishOwner && publishRepo
+		? { provider: "github", owner: publishOwner, repo: publishRepo }
+		: null;
 
 // Notarize only when Apple credentials are present in the environment
 // (CI signing job, or a local signed build). electron-builder reads the
@@ -25,15 +66,6 @@ const RELEASE_REPO_NAME = "damon-ade"; // TODO(release): set public repo name
 // notarytool. Unsigned local smoke-test builds leave APPLE_TEAM_ID unset and
 // skip notarization automatically.
 const notarize = Boolean(process.env.APPLE_TEAM_ID);
-const hasWindowsSigningConfig = Boolean(
-	process.env.WIN_CSC_LINK ||
-		process.env.CSC_LINK ||
-		process.env.WIN_CSC_NAME ||
-		process.env.CSC_NAME ||
-		process.env.AZURE_TENANT_ID,
-);
-const shouldSignAndEditWindowsExecutable =
-	hasWindowsSigningConfig || process.env.ADE_WIN_EDIT_EXECUTABLE === "true";
 const macIconPath = join(pkg.resources, "build/icons/icon.icns");
 const linuxIconPath = join(pkg.resources, "build/icons");
 const winIconPath = join(pkg.resources, "build/icons/icon.ico");
@@ -41,21 +73,14 @@ const winIconPath = join(pkg.resources, "build/icons/icon.ico");
 const config: Configuration = {
 	appId: "studio.persimmons.ade",
 	productName,
-	copyright: `Copyright © ${currentYear} — ${author}`,
+	copyright: `Copyright (c) ${currentYear} - ${author}`,
 	electronVersion: pkg.devDependencies.electron.replace(/^\^/, ""),
 
-	// Generate update manifests for all channels (latest.yml, canary.yml, etc.)
-	// This enables proper channel-based auto-updates following electron-builder conventions
-	generateUpdatesFilesForAllChannels: true,
-
-	// Publish target for update manifests (latest-mac.yml, etc.). The release
-	// workflow uploads artifacts itself (--publish never), but this makes the
-	// generated manifests reference the correct public repo.
-	publish: {
-		provider: "github",
-		owner: RELEASE_REPO_OWNER,
-		repo: RELEASE_REPO_NAME,
-	},
+	// Update metadata and a publication destination are configured only in an
+	// explicit release environment. Local builds remain offline and unsigned.
+	generateUpdatesFilesForAllChannels: publishEnabled,
+	publish: publishConfig,
+	forceCodeSigning: windowsSigningEnabled,
 
 	// Directories
 	directories: {
@@ -222,20 +247,27 @@ const config: Configuration = {
 	// Windows
 	win: {
 		...(existsSync(winIconPath) ? { icon: winIconPath } : {}),
-		signAndEditExecutable: shouldSignAndEditWindowsExecutable,
+		signAndEditExecutable: windowsSigningEnabled,
+		...(windowsPublisherName ? { publisherName: windowsPublisherName } : {}),
 		target: [
 			{
 				target: "nsis",
 				arch: ["x64"],
 			},
 		],
-		artifactName: `${productName}-${pkg.version}-\${arch}.\${ext}`,
+		artifactName: `${productName}-Setup-\${version}-\${arch}.\${ext}`,
 	},
 
 	// NSIS installer (Windows)
 	nsis: {
 		oneClick: false,
+		perMachine: false,
 		allowToChangeInstallationDirectory: true,
+		createDesktopShortcut: true,
+		createStartMenuShortcut: true,
+		shortcutName: productName,
+		uninstallDisplayName: `${productName} \${version}`,
+		deleteAppDataOnUninstall: false,
 	},
 };
 
